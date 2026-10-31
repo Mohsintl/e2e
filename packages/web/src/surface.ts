@@ -54,6 +54,7 @@ import { maskOptions, secureFieldMasks } from './observe.ts';
 import { withHiddenCaret } from './screenshot-caret.ts';
 import { connectionAbort, withOperationDeadline, type OperationBound } from './operation-budget.ts';
 import { CLOSED_SHADOW_ROOTS_INIT_SCRIPT, CLOSED_SHADOW_ROOTS_KEY } from './closed-shadow.ts';
+import { focusTakesKeys } from './focus.ts';
 import { ConfiguredInitScripts, type WebInitScript } from './init-scripts.ts';
 import type { WebMedia } from './media.ts';
 import { SECURE_FIELD_SELECTOR, type RawNodeData } from './read-node.ts';
@@ -256,7 +257,21 @@ export interface WebOptions {
    * function, which cannot close over test variables.
    */
   readonly initScripts?: readonly WebInitScript[];
+  /**
+   * The automation protocol that drives the browser: `playwright` (the
+   * default) or `bidi`, WebDriver BiDi, for chromium and firefox. When unset,
+   * the `E2E_WEB_DRIVER` environment variable picks it. The BiDi driver is
+   * experimental: it serves observation, locators, actions, the keyboard,
+   * navigation, and screenshots, and refuses the options and capabilities it
+   * does not implement yet (the `browser` fixture, video, saved sessions,
+   * request headers, basic auth, emulation, permissions, `connect`, and
+   * browser providers).
+   */
+  readonly driver?: WebDriverName;
 }
+
+/** The automation protocols `web()` drives a browser with. */
+export type WebDriverName = 'playwright' | 'bidi';
 
 /** The test-id attribute when the options name none. */
 const DEFAULT_TEST_ID_ATTRIBUTE = 'data-testid';
@@ -934,26 +949,7 @@ export class PlaywrightSurface {
     const editable = await Promise.all(
       page.frames().map((frame) =>
         frame
-          .evaluate((key) => {
-            const recorded: WeakMap<Element, ShadowRoot> | undefined = Reflect.get(globalThis, Symbol.for(key));
-            let active = document.activeElement;
-            while (active !== null) {
-              const root = active.shadowRoot ?? recorded?.get(active);
-              const leaf = root?.activeElement;
-              if (leaf === undefined || leaf === null) break;
-              active = leaf;
-            }
-            if (active === null || active === document.body || active === document.documentElement) return false;
-            if (active instanceof HTMLInputElement) {
-              return !active.disabled && !active.readOnly && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'range', 'color'].includes(active.type);
-            }
-            if (active instanceof HTMLTextAreaElement) return !active.disabled && !active.readOnly;
-            if (active instanceof HTMLSelectElement || active instanceof HTMLButtonElement || active instanceof HTMLAnchorElement ||
-                active instanceof HTMLIFrameElement || active instanceof HTMLFrameElement) {
-              return false;
-            }
-            return true;
-          }, CLOSED_SHADOW_ROOTS_KEY)
+          .evaluate(focusTakesKeys, CLOSED_SHADOW_ROOTS_KEY)
           .catch(() => false),
       ),
     );

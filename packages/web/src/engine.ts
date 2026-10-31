@@ -20,9 +20,13 @@ import {
 } from 'e2e/engine';
 import { createRequire } from 'node:module';
 import { asBrowserProvider } from './provider.ts';
-import { PlaywrightSurface, type WebOptions } from './surface.ts';
+import { PlaywrightSurface, type WebDriverName, type WebOptions } from './surface.ts';
+import { BidiSurface } from './bidi/surface.ts';
+import { createBidiBrowserFixture } from './bidi/browser.ts';
+import { ConfiguredInitScripts } from './init-scripts.ts';
 import { createBrowserFixture } from './browser.ts';
 import { validateInitScripts } from './init-scripts.ts';
+import { DEFAULT_VIEWPORT } from './support.ts';
 import { MEDIA_KEYS, mediaProblem } from './media.ts';
 import { FIELD_VALUE_CONTROL, headerProblem } from './protected-app.ts';
 import { validatePermissions } from './permissions.ts';
@@ -68,6 +72,7 @@ export function web(options: WebOptions = {}): EngineHandle {
     );
   }
   rejectUnknownKeys('web()', options, WEB_OPTION_KEYS);
+  if (driverOf(options) === 'bidi') return bidiWeb(options);
   const provider = typeof options.browser === 'object' && options.browser !== null ? asBrowserProvider(options.browser) : undefined;
   if (provider !== undefined && options.connect !== undefined) {
     throw new ConfigurationError(
@@ -159,6 +164,101 @@ export function web(options: WebOptions = {}): EngineHandle {
   return handle;
 }
 
+/**
+ * The driver `options` select: `options.driver`, else `E2E_WEB_DRIVER`, else
+ * Playwright. Read at config load, so every worker of a run drives alike.
+ */
+function driverOf(options: WebOptions): WebDriverName {
+  const chosen = options.driver ?? process.env['E2E_WEB_DRIVER'] ?? 'playwright';
+  if (chosen !== 'playwright' && chosen !== 'bidi') {
+    const source = options.driver === undefined ? 'E2E_WEB_DRIVER' : 'web({ driver })';
+    throw new ConfigurationError('INVALID_CONFIG', `${source} must be "playwright" or "bidi", got ${JSON.stringify(chosen)}`);
+  }
+  return chosen;
+}
+
+/** Options the BiDi driver does not implement yet; each is refused at config load rather than ignored. */
+const BIDI_UNSUPPORTED_OPTIONS = [
+  'connect',
+  'screencast',
+  'headers',
+  'basicAuth',
+  'userAgent',
+  'locale',
+  'timezoneId',
+  'colorScheme',
+  'reducedMotion',
+] as const satisfies readonly (keyof WebOptions)[];
+
+/**
+ * The `web()` engine on the WebDriver BiDi driver: the same contract hooks
+ * as the Playwright engine, over `BidiSurface`. Its version carries the
+ * driver, so neither driver replays traces the other recorded.
+ */
+function bidiWeb(options: WebOptions): EngineHandle {
+  const browser = options.browser ?? 'chromium';
+  if (browser !== 'chromium' && browser !== 'firefox') {
+    const named = typeof browser === 'string' ? `"${browser}"` : `browser provider "${asBrowserProvider(browser).name}"`;
+    throw new ConfigurationError('INVALID_CONFIG', `web({ driver: 'bidi' }) drives chromium and firefox, got ${named}`);
+  }
+  const unsupported = BIDI_UNSUPPORTED_OPTIONS.filter((key) => options[key] !== undefined);
+  if (unsupported.length > 0) {
+    throw new ConfigurationError('INVALID_CONFIG', `web({ driver: 'bidi' }) does not support ${unsupported.join(', ')} yet; remove ${unsupported.length === 1 ? 'it' : 'them'} or use the playwright driver`);
+  }
+  if (options.testIdAttribute !== undefined) validateTestIdAttribute(options.testIdAttribute);
+  if (options.initScripts !== undefined) validateInitScripts(options.initScripts);
+  const surface = new BidiSurface({
+    browser,
+    viewport: options.viewport === undefined ? DEFAULT_VIEWPORT : options.viewport,
+    testIdAttribute: options.testIdAttribute ?? 'data-testid',
+    initScripts: new ConfiguredInitScripts(options.initScripts ?? []),
+  });
+  return defineEngine({
+    name: 'web',
+    version: `${ownVersion()}+bidi`,
+    spiVersion: 1,
+    platform: 'web',
+    prepare: (info) => surface.prepare(info),
+    init: (info) => surface.init(info),
+    startAttempt: (context) => surface.startAttempt(context),
+    endAttempt: (context) => surface.endAttempt(context),
+    dispose: (context) => surface.dispose(context),
+    observe: (operation, observeOptions) => surface.observe(operation, observeOptions),
+    locate: (expression, operation) => surface.locate(expression, operation),
+    perform: (ref, action, operation) => surface.perform(ref, action, operation),
+    actions: LOCATOR_ACTION_KINDS,
+    tapModifiers: true,
+    performAt: (point, action, operation) => surface.performAt(point, action, operation),
+    pointerActions: POINTER_ACTION_KINDS,
+    keyboard: {
+      type: (text, keyboardOptions, operation) => surface.typeText(text, keyboardOptions, operation),
+      press: (key, operation) => surface.pressKey(key, operation),
+    },
+    validateApp: (app, info) => {
+      if (app.permissions !== undefined) {
+        throw new ConfigurationError('INVALID_CONFIG', `target "${info.targetName}" declares app.permissions, which web({ driver: 'bidi' }) does not grant yet`);
+      }
+      validateApp(app, info, browser);
+    },
+    session: {
+      open: (url, operation) => surface.open(url, operation),
+      back: (operation) => surface.back(operation),
+      restart: (operation) => surface.restart(operation),
+      reset: (operation) => surface.reset(operation),
+    },
+    artifacts: {
+      screenshot: (label, operation) => surface.screenshot(label, operation),
+    },
+    state: {
+      capture: (operation) => surface.captureState(operation),
+      restore: (state, operation) => surface.restoreState(state, operation),
+    },
+    fixtures: {
+      browser: (context) => createBidiBrowserFixture(surface, context),
+    },
+  });
+}
+
 /** Every option `web()` takes, kept equal to `WebOptions` by the compiler. */
 const WEB_OPTION_KEYS: readonly string[] = Object.keys({
   browser: true,
@@ -174,6 +274,7 @@ const WEB_OPTION_KEYS: readonly string[] = Object.keys({
   colorScheme: true,
   reducedMotion: true,
   initScripts: true,
+  driver: true,
 } satisfies Record<keyof WebOptions, true>);
 
 /** The options applied when the engine creates a browser context, which a persistent context never is. */

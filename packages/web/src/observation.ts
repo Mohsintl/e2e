@@ -277,7 +277,7 @@ async function collectElementHandles(
  * always follow their parent, so children are complete before a parent is
  * built. Captured child documents attach under their iframe boundary nodes.
  */
-function assembleTree(
+export function assembleTree(
   nodes: readonly RawObservedNode[],
   ids: readonly string[],
   framePath: readonly string[],

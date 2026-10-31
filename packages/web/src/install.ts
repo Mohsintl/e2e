@@ -35,11 +35,28 @@ function isBrowserInstalled(name: BrowserName, env: NodeJS.ProcessEnv, headed: b
 
 /** Whether the shell beside `executable`'s full build is installed. */
 function headlessShellAt(executable: string): boolean {
+  return headlessShellExecutable(executable) !== undefined;
+}
+
+/**
+ * The headless shell installed beside `executable`'s full Chromium build, the
+ * binary Playwright launches for headless chromium; undefined when it is not
+ * installed. The BiDi driver launches the same binary.
+ */
+export function headlessShellExecutable(executable: string): string | undefined {
   const marker = `${path.sep}chromium-`;
   const at = executable.lastIndexOf(marker);
-  if (at === -1) return false;
+  if (at === -1) return undefined;
   const revision = executable.slice(at + marker.length).split(path.sep)[0] ?? '';
-  return revision !== '' && headlessShellInstalled(executable.slice(0, at), revision);
+  if (revision === '') return undefined;
+  const browsersPath = executable.slice(0, at);
+  if (!headlessShellInstalled(browsersPath, revision)) return undefined;
+  const shellRoot = path.join(browsersPath, `chromium_headless_shell-${revision}`);
+  const name = process.platform === 'win32' ? 'chrome-headless-shell.exe' : 'chrome-headless-shell';
+  const folder = readdirSync(shellRoot, { withFileTypes: true }).find(
+    (entry) => entry.isDirectory() && existsSync(path.join(shellRoot, entry.name, name)),
+  );
+  return folder === undefined ? undefined : path.join(shellRoot, folder.name, name);
 }
 
 /** The `node` arguments that run the pinned `playwright-core` CLI with `args`. */

@@ -1,0 +1,144 @@
+/** A thin WebDriver BiDi client: typed commands and events over one message transport. */
+
+import type { Commands, Event as BidiEvent, Message } from 'webdriver-bidi-protocol';
+import { EngineError } from 'e2e/engine';
+
+/** A text transport carrying BiDi messages: a WebSocket, or the in-process Chromium mapper. */
+export interface BidiTransport {
+  send(message: string): void;
+  onMessage(handler: (message: string) => void): void;
+  onClose(handler: () => void): void;
+  close(): void;
+}
+
+export type BidiMethod = keyof Commands;
+export type BidiParams<M extends BidiMethod> = Commands[M]['params'];
+export type BidiResult<M extends BidiMethod> = Commands[M]['returnType'];
+export type BidiEventName = BidiEvent['method'];
+export type BidiEventParams<E extends BidiEventName> = Extract<BidiEvent, { method: E }>['params'];
+
+interface Pending {
+  readonly method: string;
+  readonly resolve: (result: unknown) => void;
+  readonly reject: (cause: Error) => void;
+}
+
+/** A BiDi error response, with the protocol's error code kept for classification. */
+export class BidiError extends Error {
+  constructor(
+    readonly method: string,
+    readonly error: string,
+    text: string,
+  ) {
+    super(`${method}: ${error}${text === '' ? '' : `: ${text}`}`);
+    this.name = 'BidiError';
+  }
+}
+
+export class BidiConnection {
+  private nextId = 0;
+  private closed = false;
+  private readonly pending = new Map<number, Pending>();
+  private readonly listeners = new Map<string, Set<(params: unknown) => void>>();
+  private readonly closeHandlers = new Set<() => void>();
+
+  constructor(private readonly transport: BidiTransport) {
+    transport.onMessage((raw) => this.receive(raw));
+    transport.onClose(() => this.drop());
+  }
+
+  /** Whether the transport is gone; every later command rejects. */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** Sends one command and resolves with its result; rejects with `BidiError` on an error response. */
+  send<M extends BidiMethod>(method: M, params: BidiParams<M>): Promise<BidiResult<M>> {
+    if (this.closed) return Promise.reject(disconnected(method));
+    this.nextId += 1;
+    const id = this.nextId;
+    return new Promise<BidiResult<M>>((resolve, reject) => {
+      this.pending.set(id, { method, resolve: resolve as (result: unknown) => void, reject });
+      this.transport.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  /** Listens for one event; returns the unsubscribe. The session must subscribe to it too (`session.subscribe`). */
+  on<E extends BidiEventName>(event: E, handler: (params: BidiEventParams<E>) => void): () => void {
+    let set = this.listeners.get(event);
+    if (set === undefined) {
+      set = new Set();
+      this.listeners.set(event, set);
+    }
+    const listener = handler as (params: unknown) => void;
+    set.add(listener);
+    return () => set.delete(listener);
+  }
+
+  /** Runs `handler` once when the transport closes. */
+  onClose(handler: () => void): void {
+    this.closeHandlers.add(handler);
+  }
+
+  close(): void {
+    this.transport.close();
+    this.drop();
+  }
+
+  private receive(raw: string): void {
+    // oxlint-disable-next-line e2e/no-unchecked-json -- protocol messages from the browser the engine launched
+    const message = JSON.parse(raw) as Message;
+    if (message.type === 'event') {
+      for (const listener of this.listeners.get(message.method) ?? []) listener(message.params);
+      return;
+    }
+    const id = message.id;
+    if (id === null || id === undefined) return;
+    const pending = this.pending.get(id);
+    if (pending === undefined) return;
+    this.pending.delete(id);
+    if (message.type === 'success') pending.resolve(message.result);
+    else pending.reject(new BidiError(pending.method, message.error, message.message));
+  }
+
+  private drop(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const pending of this.pending.values()) pending.reject(disconnected(pending.method));
+    this.pending.clear();
+    for (const handler of this.closeHandlers) handler();
+  }
+}
+
+/** The error every command in flight, and every later one, fails with once the browser is gone. */
+function disconnected(method: string): EngineError {
+  return new EngineError('ENGINE_FAILURE', `${method}: the BiDi connection closed`, { retryable: false });
+}
+
+/** A transport over a WebSocket URL, opened with Node's built-in client. */
+export function webSocketTransport(url: string, timeoutMs: number): Promise<BidiTransport> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const timer = setTimeout(() => {
+      socket.close();
+      reject(new Error(`WebSocket ${url} did not open within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const closeHandlers: (() => void)[] = [];
+    socket.addEventListener('close', () => {
+      for (const handler of closeHandlers) handler();
+    });
+    socket.addEventListener('error', () => {
+      clearTimeout(timer);
+      reject(new Error(`WebSocket ${url} failed to open`));
+    });
+    socket.addEventListener('open', () => {
+      clearTimeout(timer);
+      resolve({
+        send: (message) => socket.send(message),
+        onMessage: (handler) => socket.addEventListener('message', (event) => handler(String(event.data))),
+        onClose: (handler) => closeHandlers.push(handler),
+        close: () => socket.close(),
+      });
+    });
+  });
+}

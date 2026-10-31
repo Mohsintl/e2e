@@ -782,6 +782,19 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
     },
   };
 
+  return declareBrowserFixture(context, browser, expectation);
+}
+
+/**
+ * Declares a built `browser` object as the fixture: each method's step kind,
+ * label, and timeout, and `expect(browser)` wired to `expectation`. Shared by
+ * both drivers, so the fixture records the same steps whichever drives it.
+ */
+export function declareBrowserFixture(
+  context: EngineFixtureContext,
+  browser: Omit<Browser, keyof Expectable<BrowserExpectation>>,
+  expectation: BrowserExpectation,
+): Browser {
   const action: FixtureOperation = { kind: 'resource' };
   const navigationCall = { kind: 'resource', timeout: false } as const;
   const matchers: FixtureOperations<BrowserExpectation> = {
@@ -817,7 +830,7 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
   });
 }
 
-interface ExpectationDeps {
+export interface ExpectationDeps {
   currentUrl(deadline: Deadline): Promise<string>;
   currentTitle(deadline: Deadline): Promise<string>;
   baseHref(): string;
@@ -837,7 +850,7 @@ interface BrowserSample {
  * that stops answering ends the assertion at its own timeout, and the
  * failure reports the last read instead of reading a hung page again.
  */
-function createBrowserExpectation(deps: ExpectationDeps, negated = false): BrowserExpectation {
+export function createBrowserExpectation(deps: ExpectationDeps, negated = false): BrowserExpectation {
   const poll = async (
     api: string,
     label: string,
@@ -942,7 +955,8 @@ async function readClass(target: Locator): Promise<string | null | undefined> {
   return target.getAttribute('class');
 }
 
-function requireSelector(method: string, selector: unknown): string {
+/** The selector a locator method was given, refused unless it is a nonempty string. */
+export function requireSelector(method: string, selector: unknown): string {
   if (typeof selector !== 'string' || selector.length === 0) {
     throw new TestError('INVALID_LOCATOR', `${method}() requires a nonempty selector`);
   }
@@ -959,7 +973,7 @@ function patternLabel(pattern: string | RegExp): string {
  * both escape hatches compile through the same `frame` chain, so a `locator`
  * inside it resolves against the innermost document.
  */
-function frameScreen(context: EngineFixtureContext, frames: readonly string[]): FrameScreen {
+export function frameScreen(context: EngineFixtureContext, frames: readonly string[]): FrameScreen {
   const scope = (expression: LocatorExpression): LocatorExpression =>
     frames.reduceRight<LocatorExpression>((source, selector) => ({ kind: 'frame', selector, source }), expression);
   return Object.assign(context.screen(scope), {

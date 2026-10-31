@@ -514,12 +514,14 @@ function wheelAim(element: Element): WheelAim {
   return hit !== null && element.contains(hit) ? { aim: 'centre', box } : { aim: 'blocked' };
 }
 
-function swipeDistance(extent: number, momentum: Momentum): number {
+/** How far one swipe scrolls across an `extent` of CSS pixels at `momentum`. */
+export function swipeDistance(extent: number, momentum: Momentum): number {
   const ratio = momentum === 'fast' ? 1.5 : momentum === 'slow' ? 0.75 : 0.5;
   return Math.round(extent * ratio);
 }
 
-function wheelDelta(direction: ScrollDirection, distance: number): [number, number] {
+/** The wheel deltas that scroll `distance` pixels toward `direction`. */
+export function wheelDelta(direction: ScrollDirection, distance: number): [number, number] {
   switch (direction) {
     case 'down':
       return [0, distance];
