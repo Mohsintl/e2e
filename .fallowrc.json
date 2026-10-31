@@ -18,6 +18,7 @@
     "packages/web/tests/parity/server.mjs",
     "packages/web/tests/parity/tests/**/*.ts",
     "packages/e2e/tests/types/sdk-types.ts",
+    "packages/web/bench/*.ts",
     "packages/web/tests/types/connection.ts",
     "packages/web/tests/types/init-scripts.ts",
     "packages/web/tests/types/keyboard.ts",
