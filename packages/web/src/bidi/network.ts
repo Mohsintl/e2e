@@ -151,8 +151,10 @@ export class AttemptNetwork {
 
   /**
    * Binds the network to a fresh user context (the attempt's first, or the
-   * one a reset or restore replaced it with): its subscription and request
-   * collector follow it, and its tabs start empty.
+   * one a reset or restore replaced it with): its subscription and
+   * collectors follow it, and its tabs start empty. The response collector
+   * starts here, so a response wait has nothing to set up before the action
+   * it waits on can fire the response.
    */
   bind(userContext: string): Promise<void> {
     return this.change(async () => {
@@ -160,6 +162,7 @@ export class AttemptNetwork {
       this.userContext = userContext;
       this.tops.clear();
       if (this.needsEvents) await this.subscribe();
+      await this.collectResponses();
     });
   }
 
@@ -441,9 +444,10 @@ export class AttemptNetwork {
 
   /**
    * Resolves with the first response of the attempt's tab whose URL
-   * `matches`, once its headers arrive. Its body is collected from the moment
-   * of the call, so start the wait before the action that triggers the
-   * response; reading it waits for the load to finish. Loads that finish are
+   * `matches`, once its headers arrive (`network.responseStarted`, in the
+   * session's subscription); start the wait before the action that triggers
+   * the response. Its body comes from the attempt's response collector, and
+   * reading it waits for the load to finish. Loads that finish are
    * tracked from the call on too, so one that completes in the same burst as
    * its headers is never missed.
    */
@@ -473,10 +477,8 @@ export class AttemptNetwork {
     const offStart = connection.on('network.responseStarted', (event) => {
       if (this.options.onPage(event.context) && matches(event.response.url)) started(event);
     });
-    let subscription: string | undefined;
     try {
       const collector = await this.collectResponses();
-      subscription = (await connection.send('session.subscribe', { events: ['network.responseStarted'], ...(this.userContext === undefined ? {} : { userContexts: [this.userContext] }) })).subscription;
       const event = await raceAbort(first, signal, 'waitForResponse');
       const request = event.request.request;
       matched = request;
@@ -507,7 +509,6 @@ export class AttemptNetwork {
       throw cause;
     } finally {
       offStart();
-      if (subscription !== undefined) await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
     }
   }
 

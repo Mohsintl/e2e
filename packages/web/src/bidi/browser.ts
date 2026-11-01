@@ -39,6 +39,7 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
     deadlineFor: (timeout) => new Deadline(context.operation(timeout ?? context.timeouts.assertion).timeoutMs),
     context,
   });
+  const latch = surface.attemptLatch();
   const heldKeys = new Set<string>();
   const routes: { readonly pattern: TextPattern; readonly route: NetworkRoute }[] = [];
   const removeRoutes = (match: (stored: (typeof routes)[number]) => boolean): Promise<void> => {
@@ -72,8 +73,8 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
       const route: NetworkRoute = {
         predicate: (url) => routePatternMatches(wirePattern, url.href),
         handle: (request, decisions) => {
-          const work = runRouteHandler(handler, routeAdapter(surface, context, request, decisions), (error) => surface.latchFailure(error), context, (file) => surface.projectPath(file));
-          surface.trackHandler(work);
+          const work = runRouteHandler(handler, routeAdapter(surface, context, request, decisions), (error) => latch.latch(error), context, (file) => surface.projectPath(file));
+          latch.track('route', work);
           return work;
         },
       };
@@ -100,7 +101,7 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
           name: cookie.name,
           value: { type: 'string', value: cookie.value },
           domain: url?.hostname ?? ('domain' in target ? target.domain : ''),
-          path: url === undefined && 'path' in target ? target.path : '/',
+          path: url === undefined ? ('path' in target ? target.path : '/') : url.pathname.slice(0, url.pathname.lastIndexOf('/') + 1),
           ...(cookie.expires !== undefined && cookie.expires >= 0 ? { expiry: Math.floor(cookie.expires) } : {}),
           ...(cookie.httpOnly !== undefined ? { httpOnly: cookie.httpOnly } : {}),
           secure: cookie.secure ?? url?.protocol === 'https:',
@@ -173,7 +174,9 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
  * from Node as the browser sent it (its body bytes, its cookies, and the
  * site headers) within the operation's budget, and stores the cookies the
  * response sets in the user context, as Playwright's `route.fetch` does. A
- * body the browser did not keep refuses the replay rather than send none.
+ * Basic challenge is answered once with the attempt's `basicAuth`
+ * credentials, as the browser answers its own. A body the browser did not
+ * keep refuses the replay rather than send none.
  */
 function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, request: InterceptedRequest, decisions: RouteDecisions): RouteAdapter {
   return {
@@ -184,13 +187,20 @@ function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, reque
       }
       const operation = context.operation();
       const signal = AbortSignal.any([operation.signal, AbortSignal.timeout(operation.timeoutMs)]);
-      const fetched = await fetch(request.url, {
+      const headers = { ...request.headers, ...(request.cookie === undefined ? {} : { cookie: request.cookie }), ...surface.siteHeaders(request.url) };
+      const send = (extra: Record<string, string>): Promise<Response> => fetch(request.url, {
         method: request.method,
-        headers: { ...request.headers, ...(request.cookie === undefined ? {} : { cookie: request.cookie }), ...surface.siteHeaders(request.url) },
+        headers: { ...headers, ...extra },
         redirect: 'manual',
         signal,
         ...(request.body === undefined ? {} : { body: new Uint8Array(request.body) }),
       });
+      let fetched = await send({});
+      const credentials = surface.attemptCredentials();
+      if (fetched.status === 401 && credentials !== undefined && /^basic\b/i.test(fetched.headers.get('www-authenticate') ?? '')) {
+        await fetched.body?.cancel();
+        fetched = await send({ authorization: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}` });
+      }
       const cookies = fetched.headers.getSetCookie().flatMap((header) => setCookieOf(header, new URL(request.url)) ?? []);
       if (cookies.length > 0) await surface.setCookies(cookies, operation);
       const text = await readResponseBody('route.fetch', async () => Buffer.from(await fetched.arrayBuffer()));
@@ -204,13 +214,18 @@ function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, reque
   };
 }
 
+/** A `Set-Cookie` cookie's path when the header gives none: the directory of `url`'s path (RFC 6265 default-path). */
+function defaultCookiePath(url: URL): string {
+  const directory = url.pathname.slice(0, url.pathname.lastIndexOf('/'));
+  return directory === '' ? '/' : directory;
+}
+
 /** One `Set-Cookie` header of a response from `url` as a cookie to store; undefined for one with no name. */
 export function setCookieOf(header: string, url: URL): Storage.PartialCookie | undefined {
   const [pair = '', ...attributes] = header.split(';');
   const split = pair.indexOf('=');
   const name = pair.slice(0, split).trim();
   if (split <= 0 || name === '') return undefined;
-  const directory = url.pathname.slice(0, url.pathname.lastIndexOf('/'));
   const attribute = new Map<string, string>();
   for (const each of attributes) {
     const at = each.indexOf('=');
@@ -226,7 +241,7 @@ export function setCookieOf(header: string, url: URL): Storage.PartialCookie | u
     name,
     value: { type: 'string', value: pair.slice(split + 1).trim() },
     domain: domain === '' ? url.hostname : domain,
-    path: path.startsWith('/') ? path : directory === '' ? '/' : directory,
+    path: path.startsWith('/') ? path : defaultCookiePath(url),
     ...(attribute.has('secure') ? { secure: true } : {}),
     ...(attribute.has('httponly') ? { httpOnly: true } : {}),
     ...(['strict', 'lax', 'none'].includes(sameSite) ? { sameSite: sameSite as Network.SameSite } : {}),

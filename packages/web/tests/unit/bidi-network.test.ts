@@ -11,6 +11,7 @@ import { FakeBidi, settle } from '../helpers/bidi-fake.ts';
 
 const SITE = 'http://app.test';
 
+/** An attempt network over `fake`, and the failures it latched. */
 function network(
   fake: FakeBidi,
   options: { holdAll?: boolean; credentials?: { username: string; password: string }; exclusive?: boolean; ours?: (context: string | null) => boolean; onPage?: (context: string | null) => boolean } = {},
@@ -32,6 +33,7 @@ function network(
   return { net, failures };
 }
 
+/** A `beforeRequestSent` event held by `intercepts`. */
 function request(id: string, url: string, intercepts: string[] = ['intercept-1']): Record<string, unknown> {
   return {
     context: 'tab',
@@ -44,6 +46,7 @@ function request(id: string, url: string, intercepts: string[] = ['intercept-1']
   };
 }
 
+/** A route for the tests. */
 function route(predicate: (url: URL) => boolean, handle: NetworkRoute['handle']): NetworkRoute {
   return { predicate, handle };
 }
@@ -189,7 +192,6 @@ describe('AttemptNetwork', () => {
     fake.emit('network.responseCompleted', started('users', `${SITE}/api/users`));
     await expect(body).resolves.toBe('[1,2,3]');
     expect(fake.commands('network.getData')[0]?.params).toEqual({ dataType: 'response', request: 'users', collector: 'collector-1' });
-    expect(fake.commands('session.unsubscribe')).toHaveLength(1);
   });
 
   it('rejects a body read with the browser’s error when the load failed', async () => {

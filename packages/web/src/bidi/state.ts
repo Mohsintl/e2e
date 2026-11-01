@@ -10,7 +10,7 @@ import type { Network } from 'webdriver-bidi-protocol';
 import { EngineError, type EngineState } from 'e2e/engine';
 import { releaseQuietly } from './errors.ts';
 import type { PageJson } from './script.ts';
-import type { BidiSession } from './session.ts';
+import { SCRATCH_PARAM, type BidiSession } from './session.ts';
 
 const STATE_FORMAT = 'bidi-storage-state';
 
@@ -177,7 +177,12 @@ export async function restoreState(session: BidiSession, state: EngineState): Pr
   });
 }
 
-/** Runs `work` in a scratch tab of the user context at each origin in turn, on a blank document the network serves; the tab is closed after. */
+/**
+ * Runs `work` in a scratch tab of the user context at each origin in turn,
+ * on a blank document the network serves and the app's init scripts skip
+ * (`SCRATCH_PARAM`), so reading or writing storage changes nothing else;
+ * the tab is closed after.
+ */
 async function atEachOrigin(session: BidiSession, origins: readonly string[], work: (origin: string, context: string) => Promise<void>): Promise<void> {
   if (origins.length === 0) return;
   const connection = session.connection;
@@ -190,7 +195,7 @@ async function atEachOrigin(session: BidiSession, origins: readonly string[], wo
     const undo = await session.network.serveBlank(context);
     try {
       for (const origin of origins) {
-        await connection.send('browsingContext.navigate', { context, url: `${origin}/`, wait: 'complete' });
+        await connection.send('browsingContext.navigate', { context, url: `${origin}/?${SCRATCH_PARAM}`, wait: 'complete' });
         await work(origin, context);
       }
     } finally {

@@ -12,6 +12,7 @@ import type { BidiSession, ContextOwners } from './session.ts';
 /** The events every session subscribes to for as long as the browser runs. */
 export const SESSION_EVENTS = [
   'log.entryAdded',
+  'network.responseStarted',
   'network.responseCompleted',
   'network.fetchError',
   'browsingContext.contextCreated',

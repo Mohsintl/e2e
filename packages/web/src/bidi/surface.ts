@@ -5,6 +5,7 @@
  * delegates to the module that implements it.
  */
 
+import type { ErrorLatch } from '../support.ts';
 import { copyFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Input, Network, Storage } from 'webdriver-bidi-protocol';
@@ -305,7 +306,7 @@ export class BidiSurface {
 
   /** Reloads the tab. */
   reload(operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'navigation', (session) => reload(session), { traced: true });
+    return this.guard(operation, 'navigation', (session, budget) => reload(session, budget.signal), { traced: true });
   }
 
   /** One observation of the tab, its frames and, when asked, masked pixels. */
@@ -392,14 +393,14 @@ export class BidiSurface {
     return this.settings?.siteHeaders(url);
   }
 
-  /** Tracks one route handler so the attempt's end waits for it. */
-  trackHandler(work: Promise<void>): void {
-    this.requireSession().latch.track('route', work);
+  /** The running attempt's basic-auth credentials, which a route's own `fetch` answers a challenge with. */
+  attemptCredentials(): { readonly username: string; readonly password: string } | undefined {
+    return this.requireSession().attempt.credentials;
   }
 
-  /** Fails the next step with `error`, a route handler's failure nobody awaited. */
-  latchFailure(error: Error): void {
-    this.requireSession().latch.latch(error);
+  /** The running attempt's error latch, which a fixture binds once so a late handler failure never lands on a later attempt. */
+  attemptLatch(): ErrorLatch {
+    return this.requireSession().latch;
   }
 
   /** The next response of the tab whose URL `matches`. */

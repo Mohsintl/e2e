@@ -98,9 +98,14 @@ function toLocalValue(value: PageArgument): Script.LocalValue {
 /**
  * One serialized result as a plain value: a node becomes its reference, a
  * window its context, any other type an `UnreadableValue`. Object keys are
- * defined as own properties, so a `__proto__` key in page data is a key.
+ * defined as own properties, so a `__proto__` key in page data is a key. An
+ * object the result holds twice arrives once with an `internalId` and then as
+ * that id alone; each later mention is the same object, so an alias keeps its
+ * contents and a cycle stays a cycle for a JSON check to refuse.
  */
-function fromRemoteValue(value: Script.RemoteValue): PageValue {
+function fromRemoteValue(value: Script.RemoteValue, seen = new Map<string, PageValue>()): PageValue {
+  const internalId = 'internalId' in value ? value.internalId : undefined;
+  if (internalId !== undefined && !('value' in value && value.value !== undefined) && seen.has(internalId)) return seen.get(internalId);
   switch (value.type) {
     case 'undefined':
       return undefined;
@@ -111,12 +116,17 @@ function fromRemoteValue(value: Script.RemoteValue): PageValue {
       return value.value;
     case 'number':
       return typeof value.value === 'number' ? value.value : Number(value.value);
-    case 'array':
-      return (value.value ?? []).map(fromRemoteValue);
+    case 'array': {
+      const out: PageValue[] = [];
+      if (internalId !== undefined) seen.set(internalId, out);
+      for (const entry of value.value ?? []) out.push(fromRemoteValue(entry, seen));
+      return out;
+    }
     case 'object': {
       const out: Record<string, PageValue> = {};
+      if (internalId !== undefined) seen.set(internalId, out);
       for (const [key, entry] of value.value ?? []) {
-        if (typeof key === 'string') Object.defineProperty(out, key, { value: fromRemoteValue(entry), enumerable: true, writable: true, configurable: true });
+        if (typeof key === 'string') Object.defineProperty(out, key, { value: fromRemoteValue(entry, seen), enumerable: true, writable: true, configurable: true });
       }
       return out;
     }

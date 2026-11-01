@@ -317,6 +317,7 @@ export function fill(element: Element, value: string, key: string): string | nul
       return `input of type "${element.type}" cannot be filled`;
     }
     if (element.disabled || element.readOnly) return 'element is not editable';
+    if (element instanceof HTMLInputElement && element.type === 'number' && Number.isNaN(Number(value))) return 'cannot type text into input[type=number]';
     if (!focused()) return 'element could not be focused';
     if (element instanceof HTMLInputElement && !typed.includes(element.type)) {
       element.value = value;
@@ -337,11 +338,13 @@ export function fill(element: Element, value: string, key: string): string | nul
     return 'element is not an <input>, <textarea> or [contenteditable] element';
   }
   const edited = value === '' ? document.execCommand('delete') : document.execCommand('insertText', false, value);
-  if (!edited && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+  const number = element instanceof HTMLInputElement && element.type === 'number';
+  if ((!edited || (number && (element as HTMLInputElement).value !== value)) && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
     Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value')?.set?.call(element, value);
     element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     element.dispatchEvent(new Event('change', { bubbles: true }));
   }
+  if (number && (element as HTMLInputElement).value !== value) return 'malformed value for input of type "number"';
   return null;
 }
 
