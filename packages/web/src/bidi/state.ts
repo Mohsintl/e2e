@@ -14,7 +14,12 @@ import type { BidiSession } from './session.ts';
 
 const STATE_FORMAT = 'bidi-storage-state';
 
-/** A stored value as JSON, a date or a non-finite number tagged. */
+/**
+ * A stored value as JSON. A date, a non-finite number, and `undefined` are
+ * one-key objects tagged `$date`, `$number`, `$undefined`; an object key of
+ * the value's own that starts with `$` gains another, so no value reads as a
+ * tag.
+ */
 type StoredValue = PageJson;
 
 /** One IndexedDB object store: its shape and records; a key is kept only for a store with no key path. */
@@ -61,7 +66,7 @@ async function readOriginStorage(): Promise<StoredOrigin | string> {
     if (value instanceof Date) return { $date: value.getTime() };
     if (Array.isArray(value)) return value.map((each) => encode(each, where));
     if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
-      return Object.fromEntries(Object.entries(value).map(([key, each]) => [key, encode(each, where)]));
+      return Object.fromEntries(Object.entries(value).map(([key, each]) => [key.startsWith('$') ? `$${key}` : key, encode(each, where)]));
     }
     if (value === undefined) return { $undefined: true };
     throw new Error(`${where} holds a ${Object.prototype.toString.call(value).slice(8, -1)}, which a saved session cannot keep`);
@@ -110,10 +115,11 @@ async function writeOriginStorage(origin: StoredOrigin): Promise<void> {
   const decode = (value: StoredValue): unknown => {
     if (Array.isArray(value)) return value.map(decode);
     if (value === null || typeof value !== 'object') return value;
-    if (typeof value['$date'] === 'number') return new Date(value['$date']);
-    if (typeof value['$number'] === 'string') return Number(value['$number']);
-    if (value['$undefined'] === true) return undefined;
-    return Object.fromEntries(Object.entries(value).map(([key, each]) => [key, decode(each)]));
+    const keys = Object.keys(value);
+    if (keys.length === 1 && typeof value['$date'] === 'number') return new Date(value['$date']);
+    if (keys.length === 1 && typeof value['$number'] === 'string') return Number(value['$number']);
+    if (keys.length === 1 && value['$undefined'] === true) return undefined;
+    return Object.fromEntries(Object.entries(value).map(([key, each]) => [key.startsWith('$$') ? key.slice(1) : key, decode(each)]));
   };
   localStorage.clear();
   for (const { name, value } of origin.localStorage) localStorage.setItem(name, value);

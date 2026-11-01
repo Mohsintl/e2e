@@ -11,6 +11,7 @@ import type { Input, Network, Storage } from 'webdriver-bidi-protocol';
 import {
   EngineError,
   raceAbort,
+  withTimeout,
   withinCleanupBudget,
   type EngineAttemptContext,
   type EngineCleanupContext,
@@ -89,6 +90,10 @@ export class BidiSurface {
   private headed = false;
   private readonly owners = new ContextOwners();
   private unrouteEvents: () => void = () => undefined;
+  /** The launch or attach in flight, which a caller that gave up leaves running and `dispose` waits out. */
+  private acquiring: Promise<BidiBrowser> | undefined;
+  /** Set by `dispose`: a launch that finishes after it closes its browser instead of publishing it. */
+  private disposed = false;
 
   constructor(private readonly options: BidiSurfaceOptions) {}
 
@@ -107,6 +112,7 @@ export class BidiSurface {
 
   /** Launches or attaches to the worker's browser. */
   async init(info: EngineInitInfo): Promise<void> {
+    this.disposed = false;
     this.headed = info.headed;
     const headers = this.options.headers === undefined ? undefined : lowercaseNames(this.options.headers);
     const site = info.app.site;
@@ -132,27 +138,42 @@ export class BidiSurface {
     await this.acquireBrowser(info.signal);
   }
 
-  /** The live browser, relaunched or reattached when the last one went away. */
+  /**
+   * The live browser, relaunched or reattached when the last one went away;
+   * the one that went away is closed first, so a launched browser whose
+   * mapper died leaves no process or profile behind. A caller that gives up
+   * leaves the launch running, owned by the surface: it publishes the
+   * browser, or closes it once the surface was disposed.
+   */
   private async acquireBrowser(signal: AbortSignal): Promise<BidiBrowser> {
     if (this.browser !== undefined && !this.browser.connection.isClosed) return this.browser;
     if (signal.aborted) throw cancelled('browser launch cancelled');
-    const opening = this.openBrowser(signal);
-    let browser: BidiBrowser;
+    this.acquiring ??= this.launch().finally(() => {
+      this.acquiring = undefined;
+    });
+    return raceAbort(this.acquiring, signal, 'browser launch');
+  }
+
+  /** Closes a browser that went away, opens the next, subscribes it, and publishes it unless the surface was disposed meanwhile. */
+  private async launch(): Promise<BidiBrowser> {
+    const stale = this.browser;
+    this.browser = undefined;
+    this.unrouteEvents();
+    if (stale !== undefined) await releaseQuietly(stale.close());
+    const browser = await this.openBrowser(AbortSignal.timeout(BROWSER_LAUNCH_TIMEOUT_MS));
     try {
-      browser = await raceAbort(opening, signal, 'browser launch');
-    } catch (cause) {
-      void releaseQuietly(opening.then((late) => late.close()));
-      throw cause;
-    }
-    try {
-      await browser.connection.send('session.subscribe', { events: [...SESSION_EVENTS] });
+      await withTimeout(
+        browser.connection.send('session.subscribe', { events: [...SESSION_EVENTS] }),
+        BROWSER_LAUNCH_TIMEOUT_MS,
+        () => new EngineError('OPERATION_TIMEOUT', `the browser did not take its event subscription within ${BROWSER_LAUNCH_TIMEOUT_MS}ms`, { retryable: false }),
+      );
+      if (this.disposed) throw cancelled('the engine was disposed while its browser launched');
     } catch (cause) {
       await releaseQuietly(browser.close());
       throw cause;
     }
     this.browser = browser;
     this.owners.clear();
-    this.unrouteEvents();
     this.unrouteEvents = routeEvents(browser.connection, this.owners, () => this.session);
     return browser;
   }
@@ -206,8 +227,10 @@ export class BidiSurface {
 
   /** Ends the attempt, closes the browser, and releases a provider's lease, each attempted whatever the others did. */
   async dispose(context: EngineCleanupContext): Promise<void> {
-    const browser = this.browser;
+    this.disposed = true;
     const results = await Promise.allSettled([this.endAttempt(context)]);
+    if (this.acquiring !== undefined) await releaseQuietly(withinCleanupBudget(this.acquiring, context));
+    const browser = this.browser;
     this.browser = undefined;
     if (browser !== undefined) results.push(...(await Promise.allSettled([withinCleanupBudget(browser.close(), context)])));
     this.unrouteEvents();

@@ -25,6 +25,13 @@ import { callFunction, type CallOptions, type PageArgument, type PageValue, type
 import type { BidiVideo } from './video.ts';
 import type { ProviderVideo } from '../provider-video.ts';
 
+/**
+ * Refuses service worker registration, as Playwright's `serviceWorkers:
+ * 'block'` does when headers are configured: a worker's requests bypass
+ * request interception, so they would leave without the headers.
+ */
+const BLOCK_SERVICE_WORKERS = "if (navigator.serviceWorker) navigator.serviceWorker.register = async () => { console.warn('Service Worker registration blocked by e2e'); };";
+
 /** What every attempt of a worker is configured with. */
 export interface SessionSettings {
   readonly browser: BidiBrowserName;
@@ -41,7 +48,7 @@ export interface SessionSettings {
   readonly permissions: readonly string[];
   /** Whether the browser runs on another machine (a provider's lease), whose filesystem local paths do not reach. */
   readonly remoteFiles: boolean;
-  /** Whether every request is held for the configured site headers. */
+  /** Whether every request is held for the configured site headers, and service workers blocked. */
   readonly holdRequests: boolean;
   readonly siteHeaders: (url: string) => Readonly<Record<string, string>> | undefined;
 }
@@ -214,7 +221,9 @@ export class BidiSession {
    * Creates the attempt's user context and applies everything scoped to it:
    * the preloaded scripts, downloads, the emulated user agent, locale (and
    * the `accept-language` Playwright's locale sends), time zone, and media,
-   * and the network the headers and credentials need.
+   * and the network the headers and credentials need. Every step settles
+   * before a failure is thrown, and each preload script is recorded as it is
+   * added, so `close` removes everything that was set up.
    */
   async openUserContext(): Promise<void> {
     const connection = this.connection;
@@ -223,10 +232,18 @@ export class BidiSession {
     this.granted.clear();
     this.visited.clear();
     const scoped = { userContexts: [userContext] as [string] };
-    const sources = [CLOSED_SHADOW_ROOTS_INIT_SCRIPT, ...this.settings.initScripts.forAttempt(), ...this.addedScripts];
+    const sources = [
+      CLOSED_SHADOW_ROOTS_INIT_SCRIPT,
+      ...(this.settings.holdRequests ? [BLOCK_SERVICE_WORKERS] : []),
+      ...this.settings.initScripts.forAttempt(),
+      ...this.addedScripts,
+    ];
     const { userAgent, locale, timezoneId } = this.settings;
-    const [preloads] = await Promise.all([
-      Promise.all(sources.map(async (source) => (await connection.send('script.addPreloadScript', { functionDeclaration: wrapScript(source), ...scoped })).script)),
+    this.preloads = [];
+    const steps = await Promise.allSettled([
+      ...sources.map(async (source) => {
+        this.preloads.push((await connection.send('script.addPreloadScript', { functionDeclaration: wrapScript(source), ...scoped })).script);
+      }),
       this.downloads.allow(userContext),
       userAgent === undefined ? undefined : connection.send('emulation.setUserAgentOverride', { userAgent, ...scoped }),
       locale === undefined ? undefined : connection.send('emulation.setLocaleOverride', { locale, ...scoped }),
@@ -235,7 +252,8 @@ export class BidiSession {
       this.applyMedia(),
       this.network.bind(userContext),
     ]);
-    this.preloads = preloads;
+    const failed = steps.find((step) => step.status === 'rejected');
+    if (failed !== undefined) throw failed.reason;
   }
 
   /**
