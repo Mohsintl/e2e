@@ -49,16 +49,30 @@ export class FrameRegistry {
   }
 
   /**
+   * Each iframe's content box in the document that holds it, outermost
+   * first: the offsets a point in `context`'s viewport passes through on its
+   * way to the top-level one. Null when a frame on the way lays out no box.
+   */
+  async contentBoxes(connection: BidiConnection, context: string): Promise<Rect[] | null> {
+    const boxes: Rect[] = [];
+    for (const frame of this.chain(context)) {
+      const measured = await callFunction(connection, frame.context, FRAME_BOX, [frame.element]);
+      if (!isFrameBox(measured)) return null;
+      boxes.push(contentBox(measured.border, measured.inset));
+    }
+    return boxes;
+  }
+
+  /**
    * The top-level viewport box of `context`'s viewport: each holding iframe's
    * content box, nested; undefined for the top level, null when a frame on
    * the way lays out no box.
    */
   async viewportBox(connection: BidiConnection, context: string): Promise<Rect | null | undefined> {
+    const boxes = await this.contentBoxes(connection, context);
+    if (boxes === null) return null;
     let box: Rect | undefined;
-    for (const frame of this.chain(context)) {
-      const measured = await callFunction(connection, frame.context, FRAME_BOX, [frame.element]);
-      if (!isFrameBox(measured)) return null;
-      const content = contentBox(measured.border, measured.inset);
+    for (const content of boxes) {
       if (box === undefined) {
         box = content;
         continue;

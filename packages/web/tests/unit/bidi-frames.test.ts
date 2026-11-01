@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LocatorExpression, SemanticNode } from 'e2e/engine';
 import { FrameRegistry, inViewport, resolveFrames, withinFrame } from '../../src/bidi/frames.ts';
+import { ElementRef } from '../../src/bidi/script.ts';
 import { FakeBidi } from '../helpers/bidi-fake.ts';
 
 const text = (value: string) => ({ kind: 'string' as const, value, exact: true });
@@ -30,8 +31,8 @@ describe('resolveFrames', () => {
     const registry = new FrameRegistry();
     await expect(resolveFrames(fake.connection, 'top', ['#outer', '#inner'], registry)).resolves.toBe('inner-doc');
     expect(registry.chain('inner-doc')).toEqual([
-      { element: { sharedId: 'outer' }, context: 'top' },
-      { element: { sharedId: 'inner' }, context: 'outer-doc' },
+      { element: new ElementRef('outer'), context: 'top' },
+      { element: new ElementRef('inner'), context: 'outer-doc' },
     ]);
     expect(registry.chain('top')).toEqual([]);
   });
@@ -55,8 +56,8 @@ describe('FrameRegistry.viewportBox', () => {
       return { result: { type: 'success', realm: 'r', result: { type: 'object', value: [['border', rect(box.border)], ['inset', rect(box.inset)]] } } };
     });
     const registry = new FrameRegistry();
-    registry.enter('outer-doc', { element: { sharedId: 'outer' }, context: 'top' });
-    registry.enter('inner-doc', { element: { sharedId: 'inner' }, context: 'outer-doc' });
+    registry.enter('outer-doc', { element: new ElementRef('outer'), context: 'top' });
+    registry.enter('inner-doc', { element: new ElementRef('inner'), context: 'outer-doc' });
     await expect(registry.viewportBox(fake.connection, 'inner-doc')).resolves.toEqual({ x: 112, y: 72, width: 100, height: 100 });
     await expect(registry.viewportBox(fake.connection, 'top')).resolves.toBeUndefined();
   });

@@ -147,77 +147,128 @@ export interface TreeMetadata {
 /** Where an action can land on an element, or why it cannot yet. */
 export type ActionPoint =
   | { readonly state: 'ok'; readonly x: number; readonly y: number }
-  | { readonly state: 'detached' | 'hidden' | 'disabled' | 'moving' }
-  | { readonly state: 'blocked'; readonly blocker: string };
+  | { readonly state: 'detached' | 'hidden' | 'disabled' | 'moving' | 'outside' };
+
+/** What `actionPoint` checks: `enabled` for an action a disabled control refuses, `scroll` to bring the element into view first, `key` the closed-roots registry. */
+export interface ActionPointOptions {
+  readonly enabled: boolean;
+  readonly scroll: boolean;
+  readonly key: string;
+}
 
 /**
- * Scrolls an element into view when it is not, waits one frame to see it
- * hold still, and hit-tests its centre: the checks Playwright runs before a
- * pointer action (visible, stable, enabled, receives events), descending
- * through open and recorded closed shadow roots to the element actually hit.
- * `enabled` skips the disabled check for a hover; `hitTest` false stops
- * after the scroll, for a `scrollIntoView`; `key` names the closed-roots
- * registry.
+ * The checks Playwright runs before a pointer action, but the hit test:
+ * attached, visible, enabled, scrolled into view when its centre is clipped
+ * by the viewport or a scrolling ancestor, and holding still for a frame.
+ * The point is the centre of the element's visible part, in its document's
+ * viewport.
  */
-export const ACTION_POINT = `async (element, enabled, hitTest, key) => {
-  const recorded = Reflect.get(globalThis, Symbol.for(key));
+export async function actionPoint(element: Element, options: ActionPointOptions): Promise<ActionPoint> {
   if (!element.isConnected) return { state: 'detached' };
-  const box = () => element.getBoundingClientRect();
-  let rect = box();
   const style = getComputedStyle(element);
-  if (rect.width === 0 || rect.height === 0 || style.visibility === 'hidden') return { state: 'hidden' };
-  if (enabled && (element.disabled === true || element.closest('[aria-disabled="true"], fieldset[disabled]') !== null)) return { state: 'disabled' };
-  const inView = rect.top >= 0 && rect.left >= 0 && rect.bottom <= innerHeight && rect.right <= innerWidth;
-  if (!inView) element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-  rect = box();
-  if (!hitTest) return { state: 'ok', x: 0, y: 0 };
-  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-  const after = box();
-  if (after.x !== rect.x || after.y !== rect.y || after.width !== rect.width || after.height !== rect.height) return { state: 'moving' };
-  const x = Math.round(after.left + after.width / 2);
-  const y = Math.round(after.top + after.height / 2);
+  const box = element.getBoundingClientRect();
+  if (box.width === 0 || box.height === 0 || style.visibility === 'hidden') return { state: 'hidden' };
+  if (options.enabled && ((element as HTMLButtonElement).disabled === true || element.closest('[aria-disabled="true"], fieldset[disabled]') !== null)) {
+    return { state: 'disabled' };
+  }
+  const visible = (): { left: number; top: number; right: number; bottom: number } | null => {
+    const rect = element.getBoundingClientRect();
+    let left = Math.max(rect.left, 0);
+    let top = Math.max(rect.top, 0);
+    let right = Math.min(rect.right, innerWidth);
+    let bottom = Math.min(rect.bottom, innerHeight);
+    let at: Element | null = element;
+    while (at !== null && getComputedStyle(at).position !== 'fixed') {
+      const parent: Node | null = at.parentNode;
+      at = parent instanceof ShadowRoot ? parent.host : parent instanceof Element ? parent : null;
+      if (at === null || at === document.documentElement) break;
+      const clip = getComputedStyle(at);
+      const bounds = at.getBoundingClientRect();
+      if (clip.overflowX !== 'visible') {
+        left = Math.max(left, bounds.left);
+        right = Math.min(right, bounds.right);
+      }
+      if (clip.overflowY !== 'visible') {
+        top = Math.max(top, bounds.top);
+        bottom = Math.min(bottom, bounds.bottom);
+      }
+    }
+    return right > left && bottom > top ? { left, top, right, bottom } : null;
+  };
+  const centred = (area: { left: number; top: number; right: number; bottom: number } | null): boolean => {
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    return area !== null && x >= area.left && x <= area.right && y >= area.top && y <= area.bottom;
+  };
+  if (options.scroll && !centred(visible())) element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const before = element.getBoundingClientRect();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const after = element.getBoundingClientRect();
+  if (after.x !== before.x || after.y !== before.y || after.width !== before.width || after.height !== before.height) return { state: 'moving' };
+  const area = visible();
+  if (area === null) return { state: 'outside' };
+  return { state: 'ok', x: Math.round((area.left + area.right) / 2), y: Math.round((area.top + area.bottom) / 2) };
+}
+
+/**
+ * Why a pointer event at `x`, `y` of the element's document would not reach
+ * the element, descending through open and recorded closed shadow roots to
+ * the element actually hit; null when it would.
+ */
+export function hitBlocker(element: Element, x: number, y: number, key: string): string | null {
+  const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
   let hit = document.elementFromPoint(x, y);
-  for (let root = hit?.shadowRoot ?? recorded?.get(hit); hit !== null && root; root = hit.shadowRoot ?? recorded?.get(hit)) {
+  for (let root = hit?.shadowRoot ?? recorded?.get(hit!); hit !== null && root !== undefined && root !== null; root = hit.shadowRoot ?? recorded?.get(hit)) {
     const inner = root.elementFromPoint(x, y);
     if (inner === null || inner === hit) break;
     hit = inner;
   }
-  const contains = (node) => {
-    for (let at = node; at !== null; at = at.parentNode ?? (at instanceof ShadowRoot ? at.host : null)) if (at === element) return true;
-    return false;
-  };
-  if (hit !== null && !contains(hit)) {
-    const id = hit.id ? '#' + hit.id : '';
-    return { state: 'blocked', blocker: '<' + hit.localName + id + '> intercepts pointer events' };
+  if (hit === null) return 'no element receives pointer events at the action point';
+  for (let at: Node | null = hit; at !== null; at = at.parentNode ?? (at instanceof ShadowRoot ? at.host : null)) {
+    if (at === element) return null;
   }
-  return { state: 'ok', x, y };
-}`;
+  return `<${hit.localName}${hit.id === '' ? '' : `#${hit.id}`}> intercepts pointer events`;
+}
 
 /** The viewport's size in CSS pixels. */
-export const VIEWPORT_SIZE = `() => ({ width: innerWidth, height: innerHeight })`;
+export function viewportSize(): { width: number; height: number } {
+  return { width: innerWidth, height: innerHeight };
+}
 
 /** Resolves once the document is past `loading`, or after `timeoutMs`. */
-export const DOM_READY = `(timeoutMs) => new Promise((resolve) => {
-  if (document.readyState !== 'loading') return resolve(true);
-  const timer = setTimeout(() => resolve(false), timeoutMs);
-  document.addEventListener('DOMContentLoaded', () => { clearTimeout(timer); resolve(true); }, { once: true });
-})`;
+export function domReady(timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (document.readyState !== 'loading') return resolve(true);
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    document.addEventListener('DOMContentLoaded', () => {
+      clearTimeout(timer);
+      resolve(true);
+    }, { once: true });
+  });
+}
 
 /** Resolves after the next rendered frame, or at once in a hidden document. */
-export const NEXT_FRAME = `() => document.visibilityState === 'hidden'
-  ? undefined
-  : new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)))`;
+export function nextFrame(): Promise<void> | undefined {
+  if (document.visibilityState === 'hidden') return undefined;
+  return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+}
 
-/** Focuses an element. */
-export const FOCUS = `(element) => { element.focus(); }`;
+/** Focuses an element; returns whether focus landed on it, or on the editing host that holds it. */
+export function focus(element: Element): boolean {
+  (element as HTMLElement).focus();
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  return active === element || ((element as HTMLElement).isContentEditable && active !== null && active.contains(element));
+}
 
 /** A checkable's state and kind: `checked` is null for an element with no checked state. */
-export const CHECK_STATE = `(element) => {
+export function checkState(element: Element): { checked: boolean | null; radio: boolean } {
   const radio = (element instanceof HTMLInputElement && element.type === 'radio') || element.getAttribute('role') === 'radio';
   if (element instanceof HTMLInputElement && (element.type === 'checkbox' || element.type === 'radio')) return { checked: element.checked, radio };
   const aria = element.getAttribute('aria-checked');
   return { checked: aria === 'true' ? true : aria === 'false' ? false : null, radio };
-}`;
+}
 
 /**
  * Fills an element as Playwright's `fill` does, with no key events: a text
@@ -225,69 +276,88 @@ export const CHECK_STATE = `(element) => {
  * inserted as one `insertText` edit (a delete for an empty value), so the app
  * sees the trusted `beforeinput` and `input` an edit fires. A date, color,
  * range, or similar input takes the value directly, with `input` and
- * `change`. Returns null once filled, else why the element cannot be.
+ * `change`. Nothing changes until the element proved editable and took
+ * focus. Returns null once filled, else why the element cannot be.
  */
-export const FILL = `(element, value) => {
+export function fill(element: Element, value: string): string | null {
   const typed = ['', 'text', 'password', 'search', 'email', 'tel', 'url', 'number'];
-  const fired = () => {
-    element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+  const focused = (): boolean => {
+    (element as HTMLElement).focus();
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    return active === element || ((element as HTMLElement).isContentEditable && active !== null && active.contains(element));
   };
-  if (element instanceof HTMLInputElement && !typed.includes(element.type)) {
-    if (['checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'image'].includes(element.type)) return 'input of type "' + element.type + '" cannot be filled';
-    element.focus();
-    element.value = value;
-    if (element.value !== value) return 'malformed value for input of type "' + element.type + '"';
-    fired();
-    return null;
-  }
   if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+    if (element instanceof HTMLInputElement && ['checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'image'].includes(element.type)) {
+      return `input of type "${element.type}" cannot be filled`;
+    }
     if (element.disabled || element.readOnly) return 'element is not editable';
-    element.focus();
+    if (!focused()) return 'element could not be focused';
+    if (element instanceof HTMLInputElement && !typed.includes(element.type)) {
+      element.value = value;
+      if (element.value !== value) return `malformed value for input of type "${element.type}"`;
+      element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      return null;
+    }
     element.select();
   } else if (element instanceof HTMLElement && element.isContentEditable) {
-    element.focus();
+    if (!focused()) return 'element could not be focused';
     const range = document.createRange();
     range.selectNodeContents(element);
     const selection = getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
   } else {
     return 'element is not an <input>, <textarea> or [contenteditable] element';
   }
   const edited = value === '' ? document.execCommand('delete') : document.execCommand('insertText', false, value);
-  if (!edited && 'value' in element) {
-    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value').set;
-    setter.call(element, value);
-    fired();
+  if (!edited && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value')?.set?.call(element, value);
+    element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
   }
   return null;
-}`;
+}
+
+/** Which option `selectOption` picks: by its label, value, or index. */
+export interface OptionChoice {
+  readonly label?: string;
+  readonly value?: string;
+  readonly index?: number;
+}
 
 /**
- * Selects the option of a `<select>` matching `by` (a label, a value, or an
- * index) and fires `input` and `change`, as Playwright's `selectOption` does.
+ * Selects the option of a `<select>` matching `by` and fires `input` and
+ * `change`, as Playwright's `selectOption` does. Returns null once selected,
+ * else why it cannot be.
  */
-export const SELECT_OPTION = `(element, by) => {
+export function selectOption(element: Element, by: OptionChoice): string | null {
   if (!(element instanceof HTMLSelectElement)) return 'element is not a <select> element';
   if (element.disabled) return 'element is not enabled';
   const options = [...element.options];
   const option = by.index !== undefined ? options[by.index]
-    : by.value !== undefined ? options.find((o) => o.value === by.value)
-    : options.find((o) => o.label === by.label || o.textContent.trim() === by.label);
+    : by.value !== undefined ? options.find((each) => each.value === by.value)
+    : options.find((each) => each.label === by.label || each.textContent?.trim() === by.label);
   if (option === undefined) return 'no option matches';
   element.focus();
-  for (const o of options) o.selected = o === option;
+  for (const each of options) each.selected = each === option;
   element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
   element.dispatchEvent(new Event('change', { bubbles: true }));
   return null;
-}`;
+}
 
 /** The file input an element is or labels; null for anything else. */
-export const FILE_INPUT = `(element) => {
+export function fileInput(element: Element): HTMLInputElement | null {
   const control = element instanceof HTMLInputElement ? element : element.closest('label')?.control;
   return control instanceof HTMLInputElement && control.type === 'file' ? control : null;
-}`;
+}
+
+/** An element's box size, which a swipe on it spans. */
+export function boxSize(element: Element): { width: number; height: number } {
+  const rect = element.getBoundingClientRect();
+  return { width: rect.width, height: rect.height };
+}
 
 /**
  * Covers every secure field in the document with an opaque box and hides the
