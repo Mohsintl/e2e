@@ -171,7 +171,7 @@ jobs:
   # passes (the change cannot reach it); a failed or cancelled one fails it.
   gate:
     name: spec gate
-    needs: [check, test, install]
+    needs: [check, test, install, bidi]
     if: ${{ always() }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
