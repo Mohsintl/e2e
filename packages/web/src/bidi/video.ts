@@ -13,6 +13,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, renameSync, copyFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { EngineError, type VideoFile } from 'e2e/engine';
+import { message } from '../support.ts';
 import { ffmpegExecutable } from '../install.ts';
 import type { BidiConnection } from './connection.ts';
 import { classify, isStale, releaseQuietly, unlessStale } from './errors.ts';
@@ -39,6 +40,7 @@ export class BidiVideo {
   private current: Segment | undefined;
   private count = 0;
   private finished: VideoFile[] = [];
+  private lost: { readonly relative: string; readonly cause: unknown } | undefined;
 
   constructor(
     private readonly connection: BidiConnection,
@@ -68,10 +70,20 @@ export class BidiVideo {
     return this.end();
   }
 
-  /** Ends the recording and returns every segment written, in order. */
+  /**
+   * Ends the recording and returns every segment written, in order. A
+   * segment that was lost (its finish failed and left no file) is reported
+   * instead, as the Playwright recorder reports one; the segments that did
+   * finalize stay on disk.
+   */
   async stop(): Promise<readonly VideoFile[]> {
     this.armed = false;
     await this.end();
+    const lost = this.lost;
+    this.lost = undefined;
+    if (lost !== undefined) {
+      throw new EngineError('ENGINE_FAILURE', `video segment ${lost.relative} could not be finalized: ${message(lost.cause)}`, { retryable: false, cause: lost.cause });
+    }
     return this.finished.splice(0);
   }
 
@@ -90,11 +102,19 @@ export class BidiVideo {
     this.current = { relative, absolute, startedAt, finish };
   }
 
+  /** Ends the segment in progress. A finish that failed keeps a file it left; one that left none lost the segment, which `stop` reports. */
   private async end(): Promise<void> {
     const segment = this.current;
     this.current = undefined;
     if (segment === undefined) return;
-    await segment.finish();
+    try {
+      await segment.finish();
+    } catch (cause) {
+      if (!existsSync(segment.absolute)) {
+        this.lost ??= { relative: segment.relative, cause };
+        return;
+      }
+    }
     if (existsSync(segment.absolute)) this.finished.push({ path: segment.relative, startedAt: segment.startedAt });
   }
 
@@ -107,8 +127,8 @@ export class BidiVideo {
     });
     return async () => {
       const stopped = await this.connection.send('browsingContext.stopScreencast', { screencast });
-      if (stopped.error !== undefined) throw new EngineError('ENGINE_FAILURE', `video segment could not be finalized: ${stopped.error}`, { retryable: false });
-      if (!existsSync(stopped.path)) return;
+      if (stopped.error !== undefined) throw new Error(stopped.error);
+      if (!existsSync(stopped.path)) throw new Error(`Firefox reported ${stopped.path}, which it never wrote`);
       try {
         renameSync(stopped.path, absolute);
       } catch {
@@ -119,9 +139,10 @@ export class BidiVideo {
   }
 
   /**
-   * Chromium's CDP screencast through the mapper: each JPEG frame is
-   * acknowledged and handed to the encoder, which holds the last frame for
-   * the time until the next one, so the video plays at the page's own pace.
+   * Chromium's CDP screencast through the mapper. Each JPEG frame goes to
+   * the encoder and is acknowledged once the encoder took it, so Chromium
+   * sends no faster than ffmpeg encodes. Everything the segment acquires is
+   * released when a later step of its start fails.
    */
   private async chromiumSegment(context: string, size: { width: number; height: number }, absolute: string): Promise<() => Promise<void>> {
     const ffmpeg = ffmpegExecutable();
@@ -135,21 +156,32 @@ export class BidiVideo {
     const off = connection.onExtension('goog:cdp.Page.screencastFrame', (event) => {
       if (event['session'] !== session) return;
       const params = event['params'] as { data: string; sessionId: number };
-      encoder.frame(Buffer.from(params.data, 'base64'));
-      connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.screencastFrameAck', params: { sessionId: params.sessionId }, session }).catch((cause: unknown) => {
-        unacknowledged ??= cause;
+      void encoder.frame(Buffer.from(params.data, 'base64'))
+        .then(() => connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.screencastFrameAck', params: { sessionId: params.sessionId }, session }))
+        .catch((cause: unknown) => {
+          unacknowledged ??= cause;
+        });
+    });
+    let subscription: string | undefined;
+    try {
+      subscription = await connection.subscribeExtension(['goog:cdp.Page.screencastFrame'], [context]);
+      await connection.sendExtension('goog:cdp.sendCommand', {
+        method: 'Page.startScreencast',
+        params: { format: 'jpeg', quality: this.options.quality ?? 90, maxWidth: size.width, maxHeight: size.height },
+        session,
       });
-    });
-    const subscription = await connection.subscribeExtension(['goog:cdp.Page.screencastFrame'], [context]);
-    await connection.sendExtension('goog:cdp.sendCommand', {
-      method: 'Page.startScreencast',
-      params: { format: 'jpeg', quality: this.options.quality ?? 90, maxWidth: size.width, maxHeight: size.height },
-      session,
-    });
+    } catch (cause) {
+      off();
+      if (subscription !== undefined) await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
+      await releaseQuietly(encoder.abort());
+      throw cause;
+    }
+    const subscribed = subscription;
     return async () => {
+      await encoder.firstFrameOrGrace();
       off();
       await unlessStale(connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.stopScreencast', params: {}, session }), undefined);
-      await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
+      await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscribed] }));
       await encoder.close();
       if (unacknowledged !== undefined && !isStale(unacknowledged)) throw classify(unacknowledged, 'video');
     };
@@ -163,12 +195,15 @@ export class BidiVideo {
  * needs a moment on the final screen.
  */
 const FRAME_GRACE_MS = 1_000;
+/** How much of ffmpeg's error output a failed encode reports. */
+const STDERR_TAIL = 2_000;
 
 /**
- * Encodes screencast frames to a constant-rate VP9 webm with ffmpeg. A
- * screencast sends a frame only when the page repaints, so each frame is
- * written again for every tick of `FPS` until the next one arrives, and the
- * last one until the segment ends.
+ * Encodes screencast frames to a constant-rate VP9 webm with ffmpeg. The
+ * output is a timeline of `FPS` ticks from the encoder's start: a frame
+ * takes the tick it arrives in, a tick a frame already took leaves the
+ * newer one for the next, and a tick with no new frame repeats the last.
+ * Writes are serialized through ffmpeg's drain cycle.
  */
 class FrameEncoder {
   private readonly process: ChildProcess;
@@ -177,8 +212,12 @@ class FrameEncoder {
   private readonly startedAt = performance.now();
   private framed: () => void = () => undefined;
   private readonly firstFrame = new Promise<void>((resolve) => (this.framed = resolve));
+  private writing: Promise<void> = Promise.resolve();
+  private stderr = '';
+  private failure: Error | undefined;
+  private readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 
-  constructor(ffmpeg: string, size: { width: number; height: number }, output: string) {
+  constructor(ffmpeg: string, size: { width: number; height: number }, private readonly output: string) {
     const { width, height } = size;
     const args = [
       '-loglevel', 'error',
@@ -189,49 +228,90 @@ class FrameEncoder {
       '-vf', `pad=${width}:${height}:0:0:gray,crop=${width}:${height}:0:0`,
       output,
     ];
-    this.process = spawn(ffmpeg, args, { stdio: ['pipe', 'ignore', 'ignore'] });
-    this.process.stdin?.on('error', () => undefined);
+    this.process = spawn(ffmpeg, args, { stdio: ['pipe', 'ignore', 'pipe'] });
+    this.process.stderr?.on('data', (chunk: Buffer) => {
+      this.stderr = (this.stderr + chunk.toString()).slice(-STDERR_TAIL);
+    });
+    this.process.on('error', (cause) => {
+      this.failure ??= cause;
+    });
+    this.process.stdin?.on('error', (cause) => {
+      this.failure ??= cause;
+    });
+    this.exited = new Promise((resolve) => this.process.once('close', (code, signal) => resolve({ code, signal })));
   }
 
-  /** Takes the next frame: the one before it is held until now, then this one shows. */
-  frame(jpeg: Buffer): void {
-    this.fill();
+  /** Takes the next frame; resolves once the encoder took every frame up to it. */
+  frame(jpeg: Buffer): Promise<void> {
+    const due = this.due(0);
+    this.fill(due);
+    if (this.written === due) this.write(jpeg);
     this.last = jpeg;
-    this.write(jpeg);
     this.framed();
+    return this.writing;
+  }
+
+  /** Waits a moment for a first frame when none came. */
+  async firstFrameOrGrace(): Promise<void> {
+    await Promise.race([this.firstFrame, new Promise((resolve) => setTimeout(resolve, FRAME_GRACE_MS))]);
   }
 
   /**
-   * Waits a moment for a first frame when none came, holds the last frame
-   * until now and a moment past it, then closes the input and resolves once
-   * ffmpeg wrote the file. A segment that never got a frame writes none.
+   * Holds the last frame until now and a moment past it, then closes the
+   * input and resolves once ffmpeg wrote the file. A segment that never got
+   * a frame writes none. An encoder that failed, exited nonzero, or had to be
+   * killed rejects with what it said.
    */
   async close(): Promise<void> {
-    await Promise.race([this.firstFrame, new Promise((resolve) => setTimeout(resolve, FRAME_GRACE_MS))]);
-    this.fill(FRAME_GRACE_MS);
-    await new Promise<void>((resolve) => {
-      if (this.process.exitCode !== null) return resolve();
-      const timer = setTimeout(() => {
-        this.process.kill('SIGKILL');
-        resolve();
-      }, 10_000);
-      this.process.once('exit', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      this.process.stdin?.end();
-    });
+    if (this.last === undefined) {
+      await this.abort();
+      return;
+    }
+    this.fill(this.due(FRAME_GRACE_MS));
+    await this.writing;
+    this.process.stdin?.end();
+    const timer = setTimeout(() => this.process.kill('SIGKILL'), 10_000);
+    const { code, signal } = await this.exited.finally(() => clearTimeout(timer));
+    if (this.failure !== undefined) throw new Error(`ffmpeg failed: ${this.failure.message}`);
+    if (code !== 0) throw new Error(`ffmpeg ${signal === null ? `exited with ${String(code)}` : `was killed (${signal})`}${this.stderr === '' ? '' : `: ${this.stderr.trim()}`}`);
   }
 
-  /** Writes the last frame again for every tick that passed since the last write, and for `holdMs` more. */
-  private fill(holdMs = 0): void {
+  /** Kills the encoder and removes what it wrote, for a segment whose start failed. */
+  async abort(): Promise<void> {
+    this.process.kill('SIGKILL');
+    await this.exited;
+    rmSync(this.output, { force: true });
+  }
+
+  /** The tick the timeline is at now, `aheadMs` from now. */
+  private due(aheadMs: number): number {
+    return Math.floor(((performance.now() + aheadMs - this.startedAt) / 1000) * FPS);
+  }
+
+  /** Repeats the last frame for every tick before `due` with none. */
+  private fill(due: number): void {
     if (this.last === undefined) return;
-    const due = Math.floor(((performance.now() + holdMs - this.startedAt) / 1000) * FPS);
     while (this.written < due) this.write(this.last);
   }
 
   private write(jpeg: Buffer): void {
     this.written += 1;
-    if (this.process.stdin?.writable === true) this.process.stdin.write(jpeg);
+    this.writing = this.writing.then(() => this.push(jpeg));
+  }
+
+  /** Hands one frame to ffmpeg, waiting for its input to drain when full. */
+  private push(jpeg: Buffer): Promise<void> | undefined {
+    const stdin = this.process.stdin;
+    if (stdin === null || !stdin.writable || this.failure !== undefined) return undefined;
+    if (stdin.write(jpeg)) return undefined;
+    return new Promise((resolve) => {
+      const done = (): void => {
+        stdin.off('drain', done);
+        stdin.off('close', done);
+        resolve();
+      };
+      stdin.once('drain', done);
+      stdin.once('close', done);
+    });
   }
 }
