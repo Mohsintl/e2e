@@ -14,10 +14,11 @@
 
 import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { PREFIX } from './helpers.ts';
+import { bidiGap, PREFIX } from './helpers.ts';
 
 test.describe('frame goto', { requires: ['browser'] }, () => {
   test('should continue after client redirect', async ({ browser }) => {
+    bidiGap('chromium-bidi rejects browsingContext.navigate with "navigation canceled by concurrent navigation" when the child frame navigates its parent; Playwright\'s own BiDi backend fails here too (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.route('**/frames/script.js', (route) => route.continue({ url: `${PREFIX}/never` }));
     const url = `${PREFIX}/frames/child-redirect.html`;
     const error = await browser.goto(url, { timeout: 5000, waitUntil: 'networkidle' }).catch((caught: unknown) => caught);

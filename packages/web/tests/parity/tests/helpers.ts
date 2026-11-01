@@ -29,3 +29,12 @@ export function content(html: string): string {
 export function bidiGap(reason: string, browser?: 'chromium' | 'firefox'): void {
   test.skip(driver === 'bidi' && (browser === undefined || browser === browserName), reason);
 }
+
+/**
+ * Skips the running test where e2e itself differs from Playwright, on both
+ * drivers unless `on` narrows it (a limit of one driver's path, or of one
+ * browser): `reason` names the difference. These are e2e gaps, not BiDi ones.
+ */
+export function e2eGap(reason: string, on: { readonly driver?: 'playwright' | 'bidi'; readonly browser?: 'chromium' | 'firefox' } = {}): void {
+  test.skip((on.driver === undefined || on.driver === driver) && (on.browser === undefined || on.browser === browserName), `e2e: ${reason}`);
+}

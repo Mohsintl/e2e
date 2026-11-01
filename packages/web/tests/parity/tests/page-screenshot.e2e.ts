@@ -310,7 +310,7 @@ test.describe('page screenshot', { requires: ['browser'] }, () => {
   });
 
   test('should work with Array deleted', async ({ app, browser }) => {
-    e2eGap('the evaluate wrapper needs the page\'s `Array`');
+    e2eGap('the Playwright driver\'s evaluate wrapper needs the page\'s `Array`', { driver: 'playwright' });
     await browser.setViewport({ width: 500, height: 500 });
     await browser.goto('/grid.html');
     await browser.evaluate('() => { delete window.Array; }');
@@ -366,7 +366,7 @@ test.describe('page screenshot', { requires: ['browser'] }, () => {
     });
 
     test('should mask in parallel', async ({ app, browser, screen }) => {
-      e2eGap('two screenshot steps at once are refused');
+      e2eGap('the Playwright driver refuses two screenshot steps at once', { driver: 'playwright' });
       await browser.setViewport({ width: 500, height: 500 });
       await browser.goto('/empty.html');
       await attachFrame(browser, 'frame1', `${PREFIX}/grid.html`);
@@ -397,7 +397,7 @@ test.describe('page screenshot', { requires: ['browser'] }, () => {
     });
 
     test('should work when subframe has stalled navigation', async ({ app, browser, screen }) => {
-      e2eGap('no screenshot comes back while a subframe navigation stalls', { browser: 'chromium' });
+      e2eGap('the Playwright driver returns no screenshot while a subframe navigation stalls', { driver: 'playwright', browser: 'chromium' });
       let routed!: () => void;
       const routeReady = new Promise<void>((f) => (routed = f));
       let release!: () => void;
