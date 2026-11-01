@@ -41,8 +41,8 @@ export interface BidiLaunchOptions {
 }
 
 /**
- * Chromium switches Playwright passes by default, kept here so both drivers
- * launch the same browser configuration.
+ * The Chromium switches and disabled features Playwright 1.64 launches with,
+ * kept equal here so both drivers run the same browser configuration.
  */
 const CHROMIUM_ARGS = [
   '--disable-field-trial-config',
@@ -72,16 +72,111 @@ const CHROMIUM_ARGS = [
   '--no-service-autorun',
   '--disable-search-engine-choice-screen',
   '--disable-infobars',
+  `--disable-features=${[
+    'AvoidUnnecessaryBeforeUnloadCheckSync',
+    'DestroyProfileOnBrowserClose',
+    'DialMediaRouteProvider',
+    'GlobalMediaControls',
+    'HttpsUpgrades',
+    'LensOverlay',
+    'MediaRouter',
+    'PaintHolding',
+    'ThirdPartyStoragePartitioning',
+    'BlockOriginHeaderModificationOnRedirect',
+    'AvoidCorsURLLoaderRestartOnRedirect',
+    'Translate',
+    'AutoDeElevate',
+    'OptimizationHints',
+    'NetworkTimeServiceQuerying',
+    'AimEnabled',
+  ].join(',')}`,
+  '--enable-features=CDPScreenshotNewSurface',
+  '--enable-unsafe-swiftshader',
+  '--no-sandbox',
 ];
 
-/** Firefox preferences beyond the Remote Agent's own recommended set, which it applies on start. */
+/**
+ * The Firefox preferences Playwright 1.64's own BiDi launcher writes into its
+ * profile (beside the Remote Agent's recommended set, which it applies on
+ * start): nothing reaches the network on its own, background windows keep
+ * focus and full-rate timers, and startup opens no page of its own.
+ */
 const FIREFOX_PREFS: Readonly<Record<string, string | number | boolean>> = {
-  'browser.shell.checkDefaultBrowser': false,
-  'browser.tabs.warnOnClose': false,
-  'datareporting.policy.dataSubmissionEnabled': false,
-  'toolkit.telemetry.reportingpolicy.firstRun': false,
+  'app.normandy.api_url': '',
+  'app.update.checkInstallTime': false,
   'app.update.disabledForTesting': true,
+  'apz.content_response_timeout': 60_000,
+  'browser.contentblocking.features.standard': '-tp,tpPrivate,cookieBehavior0,-cm,-fp',
+  'browser.newtabpage.activity-stream.discoverystream.region-weather-config': '',
+  'browser.newtabpage.activity-stream.newtabWallpapers.enabled': false,
+  'browser.newtabpage.activity-stream.newtabWallpapers.v2.enabled': false,
+  'browser.newtabpage.activity-stream.showSponsoredTopSites': false,
+  'browser.newtabpage.activity-stream.feeds.system.topstories': false,
+  'browser.newtabpage.enabled': false,
+  'browser.pagethumbnails.capturing_disabled': true,
+  'browser.safebrowsing.blockedURIs.enabled': false,
+  'browser.safebrowsing.downloads.enabled': false,
+  'browser.safebrowsing.malware.enabled': false,
+  'browser.safebrowsing.phishing.enabled': false,
+  'browser.search.update': false,
+  'browser.sessionstore.resume_from_crash': false,
+  'browser.shell.checkDefaultBrowser': false,
+  'browser.startup.homepage': 'about:blank',
+  'browser.startup.homepage_override.mstone': 'ignore',
+  'browser.startup.page': 0,
+  'browser.tabs.disableBackgroundZombification': false,
+  'browser.tabs.warnOnClose': false,
+  'browser.tabs.warnOnCloseOtherTabs': false,
+  'browser.tabs.warnOnOpen': false,
+  'browser.translations.automaticallyPopup': false,
+  'browser.uitour.enabled': false,
+  'browser.urlbar.suggest.searches': false,
+  'browser.warnOnQuit': false,
+  'datareporting.healthreport.service.enabled': false,
+  'datareporting.healthreport.uploadEnabled': false,
+  'datareporting.usage.uploadEnabled': false,
+  'datareporting.policy.dataSubmissionEnabled': false,
+  'datareporting.policy.dataSubmissionPolicyBypassNotification': true,
+  'toolkit.telemetry.reportingpolicy.firstRun': false,
+  'devtools.jsonview.enabled': false,
   'dom.disable_open_during_load': false,
+  'dom.file.createInChild': true,
+  'dom.ipc.reportProcessHangs': false,
+  'dom.max_chrome_script_run_time': 0,
+  'dom.max_script_run_time': 0,
+  'dom.min_background_timeout_value': 0,
+  'dom.min_background_timeout_value_without_budget_throttling': 0,
+  'dom.timeout.enable_budget_timer_throttling': false,
+  'dom.security.https_first': false,
+  'extensions.autoDisableScopes': 0,
+  'extensions.enabledScopes': 5,
+  'extensions.getAddons.cache.enabled': false,
+  'extensions.installDistroAddons': false,
+  'extensions.update.enabled': false,
+  'extensions.update.notifyUser': false,
+  'focusmanager.testmode': true,
+  'general.useragent.updates.enabled': false,
+  'geo.provider.testing': true,
+  'geo.wifi.scan': false,
+  'hangmonitor.timeout': 0,
+  'layout.testing.top-level-always-active': true,
+  'media.gmp-manager.updateEnabled': false,
+  'media.sanity-test.disabled': true,
+  'network.connectivity-service.enabled': false,
+  'network.cookie.sameSite.laxByDefault': false,
+  'network.http.prompt-temp-redirect': false,
+  'network.http.speculative-parallel-limit': 0,
+  'network.manage-offline-status': false,
+  'privacy.trackingprotection.enabled': false,
+  'security.certerrors.mitm.priming.enabled': false,
+  'security.fileuri.strict_origin_policy': false,
+  'security.notification_enable_delay': 0,
+  'signon.autofillForms': false,
+  'signon.rememberSignons': false,
+  'startup.homepage_welcome_url': 'about:blank',
+  'startup.homepage_welcome_url.additional': '',
+  'toolkit.cosmeticAnimations.enabled': false,
+  'toolkit.startup.max_resumed_crashes': -1,
   // Wheel actions go through the path real wheels take, so a scroll shows on the next frame, as it does in Chromium.
   'remote.events.async.wheel.enabled': true,
 };
@@ -188,7 +283,7 @@ function executableFor(name: BidiBrowserName, options: BidiLaunchOptions): strin
 function spawnFirefox(profile: string, options: BidiLaunchOptions): ChildProcess {
   const prefs = Object.entries({ ...FIREFOX_PREFS, ...options.firefoxPrefs }).map(([key, value]) => `user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`);
   writeFileSync(path.join(profile, 'user.js'), `${prefs.join('\n')}\n`);
-  const args = ['--remote-debugging-port=0', '--profile', profile, '-no-remote', ...(options.headed ? [] : ['--headless']), 'about:blank'];
+  const args = ['--remote-debugging-port=0', '--profile', profile, '-no-remote', ...(options.headed ? ['--foreground'] : ['--headless'])];
   return spawn(executableFor('firefox', options), args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
 }
 
@@ -197,8 +292,10 @@ function spawnChromium(profile: string, options: BidiLaunchOptions): ChildProces
     ...CHROMIUM_ARGS,
     '--remote-debugging-port=0',
     `--user-data-dir=${profile}`,
-    ...(options.headed ? [] : ['--headless', '--hide-scrollbars', '--mute-audio']),
-    'about:blank',
+    ...(options.headed
+      ? []
+      : ['--headless', '--hide-scrollbars', '--mute-audio', '--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4']),
+    '--no-startup-window',
   ];
   return spawn(executableFor('chromium', options), args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
 }
