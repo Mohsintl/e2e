@@ -28,9 +28,10 @@ export class BidiError extends Error {
   constructor(
     readonly method: string,
     readonly error: string,
-    text: string,
+    /** The browser's own words, apart from the method and code. */
+    readonly detail: string,
   ) {
-    super(`${method}: ${error}${text === '' ? '' : `: ${text}`}`);
+    super(`${method}: ${error}${detail === '' ? '' : `: ${detail}`}`);
     this.name = 'BidiError';
   }
 }

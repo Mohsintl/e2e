@@ -5,14 +5,21 @@ import { isClassified, message } from '../support.ts';
 import { BidiError } from './connection.ts';
 import { ScriptError } from './script.ts';
 
-/** BiDi and page errors that mean the element or its document is gone. */
-const STALE_PATTERN = /no such node|no such frame|stale element|no such element|detached|execution context was destroyed|cannot find context|context with specified id|document unloaded|navigat/i;
+/** BiDi codes and browser words that mean the element, frame, or document is gone. */
+const STALE_PATTERN = /no such node|no such frame|stale element|no such element|detached|execution context was destroyed|cannot find context|context with specified id|document unloaded|target navigated or closed/i;
+
+/** What a failure says about itself, the BiDi method name left out: a navigation command's failure is no stale node. */
+function ownWords(cause: unknown): string | undefined {
+  if (cause instanceof BidiError) return `${cause.error} ${cause.detail}`;
+  if (cause instanceof ScriptError) return cause.message;
+  return undefined;
+}
 
 /** Maps a failure onto the engine error contract: classified errors pass, a gone node or document is retryable `NODE_STALE`. */
 export function classify(cause: unknown, label: string): Error {
   if (isClassified(cause)) return cause;
   const text = message(cause);
-  if ((cause instanceof BidiError || cause instanceof ScriptError) && STALE_PATTERN.test(text)) {
+  if (STALE_PATTERN.test(ownWords(cause) ?? '')) {
     return new EngineError('NODE_STALE', `${label}: ${text}`, { retryable: true, cause });
   }
   return new EngineError('ENGINE_FAILURE', `${label}: ${text}`, { retryable: false, cause });
