@@ -236,7 +236,7 @@ async function captureInto(
  * page that embeds it. It has an opaque origin rather than an inherited one, and
  * navigation admits only http(s) and `about:blank`.
  */
-function isOnSiteFrame(url: string, site: string | undefined): boolean {
+export function isOnSiteFrame(url: string, site: string | undefined): boolean {
   if (url === '' || url === 'about:blank' || url === 'about:srcdoc') return true;
   if (site === undefined) return false;
   const protocol = URL.canParse(url) ? new URL(url).protocol : undefined;

@@ -1498,6 +1498,12 @@ export const readSemanticsFunction = <Mode extends SemanticMode>(
   if (options.mode.kind === 'node') {
     return describe(element) as SemanticResult<Mode>;
   }
+  if (options.mode.kind === 'roles') {
+    return options.mode.elements.map((el) => roleOf(el, el.localName)) as SemanticResult<Mode>;
+  }
+  if (options.mode.kind === 'nodes') {
+    return options.mode.elements.map((el) => describe(el)) as SemanticResult<Mode>;
+  }
 
   const maxNodes = options.mode.maxNodes;
   const nodes: RawObservedNode[] = [];
