@@ -32,7 +32,7 @@ import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
 import fs from 'node:fs';
 import path from 'node:path';
-import { browserName, content, driver, e2eGap, PREFIX } from './helpers.ts';
+import { bidiGap, browserName, content, driver, e2eGap, PREFIX } from './helpers.ts';
 
 /** `/respond` answering with `headers` and `body`. */
 function respond(headers: Record<string, string>, body = 'Hello world'): string {
@@ -50,6 +50,7 @@ function assertDownloadToPDF(download: { absolutePath: string; suggestedFilename
 
 test.describe('download event', { requires: ['browser'] }, () => {
   test('should report download when navigation turns into download @smoke', async ({ browser }) => {
+    bidiGap('chromium-bidi rejects the navigation with net::ERR_ABORTED before it announces the download, so goto cannot say "Download is starting"; Playwright\'s own BiDi backend times out here (tests/bidi/expectations/bidi-chromium-library.txt)', 'chromium');
     // e2e opens no page before the first goto, where Playwright starts on about:blank.
     await browser.goto('/empty.html');
     let responseOrError: unknown;
@@ -64,6 +65,7 @@ test.describe('download event', { requires: ['browser'] }, () => {
   });
 
   test('should work with Cross-Origin-Opener-Policy', async ({ browser }) => {
+    bidiGap('chromium-bidi rejects the navigation with net::ERR_ABORTED before it announces the download, so goto cannot say "Download is starting"; Playwright\'s own BiDi backend times out here (tests/bidi/expectations/bidi-chromium-library.txt)', 'chromium');
     // e2e opens no page before the first goto, where Playwright starts on about:blank.
     await browser.goto('/empty.html');
     let responseOrError: unknown;

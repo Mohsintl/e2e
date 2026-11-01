@@ -70,6 +70,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should not type text with Alt modifier', async ({ browser }) => {
+    if (process.platform === 'darwin') bidiGap('Firefox on macOS types the Option (Alt) layer for WebDriver key actions held with Alt; Playwright\'s BiDi expectations run on Linux', 'firefox');
     await browser.goto(content('<input><textarea></textarea><div contenteditable></div>'));
     for (const locator of [browser.locator('input'), browser.locator('textarea'), browser.locator('div')]) {
       await locator.focus();
@@ -113,6 +114,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should report shiftKey', async ({ browser }) => {
+    if (process.platform === 'darwin') bidiGap('Firefox on macOS types the Option (Alt) layer for WebDriver key actions held with Alt; Playwright\'s BiDi expectations run on Linux', 'firefox');
     await browser.goto('/input/keyboard.html');
     const keyboard = browser.keyboard;
     const codeForKey = { 'Shift': 16, 'Alt': 18, 'Control': 17 };
@@ -313,6 +315,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should press NumpadDecimal as Delete', async ({ browser }) => {
+    bidiGap('WebDriver\'s numpad key values are the NumLock-on keys (https://w3c.github.io/webdriver/#keyboard-actions), so NumpadDecimal types "." where Playwright\'s layout presses Delete; Playwright\'s own BiDi backend sends the same value (server/bidi/third_party/bidiKeyboard.ts)');
     await browser.goto(content('<textarea></textarea>'));
     await browser.evaluate(captureLastKeydown);
     const textarea = browser.locator('textarea');
@@ -326,6 +329,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should type numpad digits with Shift', async ({ browser }) => {
+    bidiGap('Firefox reads a WebDriver numpad key held with Shift as NumLock off and types nothing (https://w3c.github.io/webdriver/#keyboard-actions); Playwright\'s own BiDi backend sends the same values', 'firefox');
     await browser.goto(content('<textarea></textarea>'));
     const textarea = browser.locator('textarea');
     await textarea.focus();
@@ -354,7 +358,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should press audio and media control keys', async ({ browser }) => {
-    bidiGap('WebDriver defines no key values for the media keys; Playwright\'s own BiDi backend fails here too (tests/bidi/expectations/moz-firefox-nightly-page.txt)', 'firefox');
+    bidiGap('WebDriver defines no key values for the media keys; Playwright\'s own BiDi backend throws "Unknown key" for them (server/bidi/third_party/bidiKeyboard.ts) and fails here (tests/bidi/expectations/moz-firefox-nightly-page.txt)');
     await browser.goto(content('<input autofocus>'));
     await browser.locator('input').focus();
     await browser.evaluate(captureLastKeydown);
@@ -441,6 +445,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should support MacOS shortcuts', async ({ browser }) => {
+    bidiGap('Chromium runs the macOS editing key bindings only for CDP key events that name their commands; BiDi input.performActions carries none (https://w3c.github.io/webdriver/#keyboard-actions). The test runs on macOS only, so Playwright\'s Linux BiDi expectations never list it', 'chromium');
     test.skip(!isMac);
     test.skip(browserName === 'firefox', 'https://github.com/microsoft/playwright/issues/5721');
     await browser.goto('/input/textarea.html');
@@ -496,6 +501,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should move to the start of the document', async ({ browser }) => {
+    bidiGap('Chromium runs the macOS editing key bindings only for CDP key events that name their commands; BiDi input.performActions carries none (https://w3c.github.io/webdriver/#keyboard-actions). The test runs on macOS only, so Playwright\'s Linux BiDi expectations never list it', 'chromium');
     test.skip(!isMac);
     await browser.goto(content('<div contenteditable></div>'));
     await browser.locator('div').focus();
