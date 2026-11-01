@@ -392,12 +392,14 @@ export function boxSize(element: Element): { width: number; height: number } {
 /**
  * Covers every secure field of the document, through open and recorded
  * closed shadow roots, with an opaque box, and hides the caret, for one
- * screenshot; returns how many fields it covered. The boxes sit in a manual
- * popover, so they paint in the top layer above a modal dialog or popover
- * the app shows, inside a closed shadow root of a host whose every style is
- * set inline as `!important`, so no page rule reaches them. `token` names
- * this masking for `unmaskSecureFields`; captures that overlap each keep
- * their own.
+ * screenshot; returns how many fields it covered. A field inside a top-layer
+ * element (a modal dialog, an open popover, a fullscreen element) gets its
+ * box inside that element, so the box moves with it however the app reorders
+ * the top layer; any other field's box sits in a manual popover of its own,
+ * above what the app shows. Boxes live in closed shadow roots of hosts whose
+ * every style is set inline as `!important`, so no page rule reaches them.
+ * `token` names this masking for `unmaskSecureFields`; captures that overlap
+ * each keep their own.
  */
 export function maskSecureFields(selector: string, key: string, token: string): number {
   const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
@@ -415,21 +417,43 @@ export function maskSecureFields(selector: string, key: string, token: string): 
     element.style.setProperty('all', 'initial', 'important');
     for (const [name, value] of Object.entries(styles)) element.style.setProperty(name, value, 'important');
   };
-  const host = document.createElement('e2e-mask');
-  host.popover = 'manual';
-  pin(host, {
-    display: 'block', position: 'fixed', inset: '0', width: '100vw', height: '100vh', margin: '0', padding: '0', border: '0',
-    opacity: '1', visibility: 'visible', overflow: 'visible', background: 'transparent', 'pointer-events': 'none', 'z-index': '2147483647',
-  });
-  const layer = host.attachShadow({ mode: 'closed' });
+  const layerOf = (field: Element): Element | null => {
+    for (let at: Element | null = field; at !== null; at = at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? (at.getRootNode() as ShadowRoot).host : null)) {
+      if (at.matches(':modal, :popover-open, :fullscreen')) return at;
+    }
+    return null;
+  };
+  const hosts = new Map<Element | null, { host: HTMLElement; layer: ShadowRoot }>();
+  const hostFor = (container: Element | null): { host: HTMLElement; layer: ShadowRoot } => {
+    let made = hosts.get(container);
+    if (made === undefined) {
+      const host = document.createElement('e2e-mask');
+      pin(host, {
+        display: 'block', position: 'fixed', inset: '0', width: '100vw', height: '100vh', margin: '0', padding: '0', border: '0',
+        opacity: '1', visibility: 'visible', overflow: 'visible', background: 'transparent', 'pointer-events': 'none', 'z-index': '2147483647',
+      });
+      if (container === null) {
+        host.popover = 'manual';
+        document.documentElement.append(host);
+        host.showPopover();
+      } else {
+        container.append(host);
+      }
+      made = { host, layer: host.attachShadow({ mode: 'closed' }) };
+      hosts.set(container, made);
+    }
+    return made;
+  };
   const boxes: { field: Element; rect: DOMRect; box: HTMLElement }[] = [];
   for (const field of fields) {
     const rect = field.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
+    const { host, layer } = hostFor(layerOf(field));
+    const origin = host.getBoundingClientRect();
     const box = document.createElement('div');
     pin(box, {
-      display: 'block', position: 'fixed', left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px`,
-      background: '#000', opacity: '1', visibility: 'visible',
+      display: 'block', position: 'absolute', left: `${rect.left - origin.left}px`, top: `${rect.top - origin.top}px`, width: `${rect.width}px`, height: `${rect.height}px`,
+      background: '#000', opacity: '1', visibility: 'visible', 'pointer-events': 'none',
     });
     layer.append(box);
     boxes.push({ field, rect, box });
@@ -437,10 +461,8 @@ export function maskSecureFields(selector: string, key: string, token: string): 
   const caret = new CSSStyleSheet();
   caret.replaceSync('*, *::before, *::after { caret-color: transparent !important; }');
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, caret];
-  document.documentElement.append(host);
-  host.showPopover();
   const masks = (Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as Map<string, unknown> | undefined) ?? new Map<string, unknown>();
-  masks.set(token, { host, caret, boxes, selector, key });
+  masks.set(token, { hosts: [...hosts].map(([container, { host }]) => ({ container, host })), caret, boxes, selector, key });
   Reflect.set(globalThis, Symbol.for('e2e.bidi.mask'), masks);
   return boxes.length;
 }
@@ -448,23 +470,31 @@ export function maskSecureFields(selector: string, key: string, token: string): 
 /**
  * Removes what `maskSecureFields` added. Returns whether the screenshot taken
  * between the two showed no secure field: this document holds the masking
- * under `token`, every box still painted opaque in the top layer, every
- * covered field where its box was, and no visible secure field appeared
- * that no box covers.
+ * under `token`, every host still where it was put (the popover still open,
+ * each other host still inside its top-layer element) and painted opaque,
+ * every covered field where its box was, and no visible secure field
+ * appeared that no box covers.
  */
 export function unmaskSecureFields(token: string): boolean {
-  const masks = Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as
-    | Map<string, { host: HTMLElement; caret: CSSStyleSheet; boxes: { field: Element; rect: DOMRect; box: HTMLElement }[]; selector: string; key: string }>
-    | undefined;
+  type Mask = {
+    hosts: { container: Element | null; host: HTMLElement }[];
+    caret: CSSStyleSheet;
+    boxes: { field: Element; rect: DOMRect; box: HTMLElement }[];
+    selector: string;
+    key: string;
+  };
+  const masks = Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as Map<string, Mask> | undefined;
   const mask = masks?.get(token);
-  if (mask === undefined) return false;
-  masks!.delete(token);
+  if (masks === undefined || mask === undefined) return false;
+  masks.delete(token);
   const painted = (element: HTMLElement): boolean => {
     const style = getComputedStyle(element);
     return style.display !== 'none' && style.visibility === 'visible' && style.opacity === '1';
   };
-  const shown = mask.host.matches(':popover-open') && painted(mask.host) && mask.boxes.every(({ box }) => painted(box));
-  mask.host.remove();
+  const placed = ({ container, host }: Mask['hosts'][number]): boolean =>
+    (container === null ? host.matches(':popover-open') : host.parentNode === container && container.matches(':modal, :popover-open, :fullscreen')) && painted(host);
+  const shown = mask.hosts.every(placed) && mask.boxes.every(({ box }) => painted(box));
+  for (const { host } of mask.hosts) host.remove();
   document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== mask.caret);
   if (!shown) return false;
   const still = mask.boxes.every(({ field, rect }) => {
