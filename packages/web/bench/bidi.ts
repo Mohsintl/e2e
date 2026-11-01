@@ -5,12 +5,17 @@
  * `locate`, `perform`, `artifacts.screenshot`). Serves the testbed app and a
  * synthetic heavy page itself, so nothing leaves the machine.
  *
+ * Drivers run interleaved, in alternating order, so a drift of the machine
+ * over the run lands on both; each scenario's BiDi/Playwright ratio carries a
+ * bootstrap 95% interval, and the observations both drivers made of the same
+ * pages are compared, so the timings are of equal work.
+ *
  *   pnpm build
  *   node packages/web/bench/bidi.ts [--iterations 20] [--browsers chromium,firefox] [--testbed-runs 3] [--out bidi-results.json]
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,6 +48,8 @@ const STEPS_PER_TEST = Number(values['steps-per-test']);
  * (upstream Firefox gaps), and the pad drag that fails on Playwright's Firefox on main too.
  */
 const FIREFOX_SKIPS = 'drags and drops on the board|dragging the card marks it done|emulated media reaches|raw mouse input drags along the pad';
+/** Warm iterations a driver runs before the other takes its turn. */
+const BLOCK = 5;
 const TESTBED_PORT = 4291;
 const HEAVY_PORT = 4292;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -100,10 +107,15 @@ async function boot(engine: EngineHandle): Promise<void> {
   } as never);
 }
 
+/** Every artifact directory an attempt made, removed when the bench ends however it ends. */
+const tempDirs: string[] = [];
+
 async function attempt(engine: EngineHandle): Promise<void> {
+  const artifactsDir = mkdtempSync(path.join(os.tmpdir(), 'e2e-bench-'));
+  tempDirs.push(artifactsDir);
   await engine.startAttempt!({
     attemptId: 'bench',
-    artifactsDir: mkdtempSync(path.join(os.tmpdir(), 'e2e-bench-')),
+    artifactsDir,
     resolveSecret: async () => '',
     signal: AbortSignal.timeout(120_000),
     appLog: () => undefined,
@@ -114,9 +126,15 @@ async function attempt(engine: EngineHandle): Promise<void> {
 
 const cleanup = () => ({ signal: AbortSignal.timeout(30_000), timeoutMs: 30_000 });
 
+/** Boots `engine` with an attempt running; an engine whose boot or attempt failed is disposed before the failure goes on. */
 async function driven(engine: EngineHandle): Promise<Driven> {
-  await boot(engine);
-  await attempt(engine);
+  try {
+    await boot(engine);
+    await attempt(engine);
+  } catch (cause) {
+    await engine.dispose!(cleanup()).catch(() => undefined);
+    throw cause;
+  }
   return {
     engine,
     open: (url) => engine.session!.open!(url, operation()),
@@ -227,22 +245,41 @@ async function agentFlow(d: Driven): Promise<void> {
   }
 }
 
-async function runWarm(driver: 'playwright' | 'bidi', browser: 'chromium' | 'firefox'): Promise<{ samples: Samples; resources: Record<string, number> }> {
-  const samples: Samples = {};
+/** What one driver measured: its samples, its resources over every block, and the node counts of the pages both drivers observe. */
+interface DriverRun {
+  readonly samples: Samples;
+  peakRssMb: number;
+  nodeCpuSeconds: number;
+  treeCpuSeconds: number;
+  readonly work: Record<string, number>;
+}
+
+function driverRun(): DriverRun {
+  return { samples: {}, peakRssMb: 0, nodeCpuSeconds: 0, treeCpuSeconds: 0, work: {} };
+}
+
+/** Runs `iterations` warm iterations of every scenario on a fresh engine, into `run`. */
+async function warmBlock(driver: 'playwright' | 'bidi', browser: 'chromium' | 'firefox', iterations: number, run: DriverRun): Promise<void> {
+  const { samples, work } = run;
   const d = await driven(engineFor(driver, browser));
   const { engine } = d;
   const meter = new ResourceMeter();
   const sample = () => meter.sample();
   const nodeCpu = process.cpuUsage();
+  const nodes = (observed: { root: SemanticNode }) => flatten(observed.root).length;
   try {
-    for (let index = 0; index < ITERATIONS; index += 1) {
+    for (let index = 0; index < iterations; index += 1) {
       record(samples, 'new context + page (startAttempt → first open)', await time(async () => {
         await engine.endAttempt!(cleanup());
         await attempt(engine);
         await d.open(testbed('/'));
       }));
       record(samples, 'navigate: testbed /forms', await time(() => d.open(testbed('/forms'))));
-      record(samples, 'observe: testbed /forms', await time(() => engine.observe!(operation())));
+      let observed: { root: SemanticNode } | undefined;
+      record(samples, 'observe: testbed /forms', await time(async () => {
+        observed = await engine.observe!(operation());
+      }));
+      work['/forms nodes'] = nodes(observed!);
       record(samples, 'locate role+name: testbed /forms', await time(() => d.locateOne(role('button', 'Save profile'))));
       record(samples, 'click/type sequence: forms (5 actions)', await time(async () => {
         await engine.perform!(await d.locateOne(label('Full name')), { kind: 'fill', value: 'Ada Lovelace', sensitive: false }, operation());
@@ -254,7 +291,10 @@ async function runWarm(driver: 'playwright' | 'bidi', browser: 'chromium' | 'fir
       record(samples, 'screenshot: testbed /forms', await time(() => engine.artifacts!.screenshot(undefined, operation())));
       record(samples, 'navigate: testbed /scroll (8k px)', await time(() => d.open(testbed('/scroll'))));
       record(samples, 'navigate: heavy page (9k elements)', await time(() => d.open(HEAVY)));
-      record(samples, 'observe: heavy page', await time(() => engine.observe!(operation())));
+      record(samples, 'observe: heavy page', await time(async () => {
+        observed = await engine.observe!(operation());
+      }));
+      work['heavy page nodes'] = nodes(observed!);
       record(samples, 'observe + pixels: heavy page', await time(() => engine.observe!(operation(), { pixels: true })));
       record(samples, 'locate role+name: heavy page', await time(() => d.locateOne(role('button', 'Open 1499'))));
       record(samples, 'locate + fill + tap: heavy page', await time(async () => {
@@ -280,20 +320,15 @@ async function runWarm(driver: 'playwright' | 'bidi', browser: 'chromium' | 'fir
   }
   const cpu = process.cpuUsage(nodeCpu);
   const { peakRssMb, cpuSeconds } = meter.result();
-  return {
-    samples,
-    resources: {
-      'peak RSS, node + browser (MB)': peakRssMb,
-      'node CPU, warm loop (s)': (cpu.user + cpu.system) / 1e6,
-      'node + browser CPU, warm loop (s, floor)': cpuSeconds,
-    },
-  };
+  run.peakRssMb = Math.max(run.peakRssMb, peakRssMb);
+  run.nodeCpuSeconds += (cpu.user + cpu.system) / 1e6;
+  run.treeCpuSeconds += cpuSeconds;
 }
 
-async function runCold(driver: 'playwright' | 'bidi', browser: 'chromium' | 'firefox'): Promise<Samples> {
-  const samples: Samples = {};
-  for (let index = 0; index < COLD_ITERATIONS; index += 1) {
-    const engine = engineFor(driver, browser);
+/** One cold launch and first page on a fresh engine, into `samples`; the engine is disposed however the iteration ends. */
+async function coldIteration(driver: 'playwright' | 'bidi', browser: 'chromium' | 'firefox', samples: Samples): Promise<void> {
+  const engine = engineFor(driver, browser);
+  try {
     record(samples, 'cold launch (init)', await time(() => boot(engine)));
     record(samples, 'cold first page (startAttempt → open /forms → observe)', await time(async () => {
       await attempt(engine);
@@ -301,9 +336,33 @@ async function runCold(driver: 'playwright' | 'bidi', browser: 'chromium' | 'fir
       await engine.observe!(operation());
     }));
     await engine.endAttempt!(cleanup());
+  } finally {
     await engine.dispose!(cleanup());
   }
-  return samples;
+}
+
+/** The drivers in the order of round `round`: alternating, so neither always runs first. */
+function inTurn(round: number): ('playwright' | 'bidi')[] {
+  return round % 2 === 0 ? DRIVERS : DRIVERS.toReversed();
+}
+
+/** A deterministic random source, so a run's intervals can be reproduced. */
+function seeded(seed: number): () => number {
+  let state = seed;
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** The bootstrap 95% interval of the ratio of `bidi`'s median to `pw`'s. */
+function ratioInterval(pw: number[], bidi: number[]): [number, number] {
+  const random = seeded(1503);
+  const resample = (list: number[]) => Array.from(list, () => list[Math.floor(random() * list.length)]!);
+  const ratios = Array.from({ length: 2000 }, () => stats(resample(bidi)).p50 / stats(resample(pw)).p50).toSorted((a, b) => a - b);
+  return [ratios[Math.floor(0.025 * ratios.length)]!, ratios[Math.floor(0.975 * ratios.length) - 1]!];
 }
 
 function stats(list: number[]): { p50: number; p95: number; mean: number; n: number } {
@@ -322,23 +381,40 @@ const heavy = createServer((_request, response) => {
   response.end(heavyPage());
 });
 await listen(heavy, HEAVY_PORT);
-const results: Record<string, { samples: Record<string, ReturnType<typeof stats>>; resources?: Record<string, number> }> = {};
+const results: Record<string, { samples: Record<string, ReturnType<typeof stats>>; raw: Samples; resources: Record<string, number>; work: Record<string, number> }> = {};
 try {
   await waitForHttp(testbed('/'));
   for (const browser of BROWSERS) {
-    for (const driver of DRIVERS) {
-      const key = `${driver}/${browser}`;
-      process.stderr.write(`${key}: cold\n`);
-      const cold = await runCold(driver, browser);
-      process.stderr.write(`${key}: warm\n`);
-      const warm = await runWarm(driver, browser);
-      const merged = { ...cold, ...warm.samples };
-      results[key] = { samples: Object.fromEntries(Object.entries(merged).map(([name, list]) => [name, stats(list)])), resources: warm.resources };
+    const runs = new Map(DRIVERS.map((driver) => [driver, driverRun()]));
+    for (let index = 0; index < COLD_ITERATIONS; index += 1) {
+      for (const driver of inTurn(index)) {
+        process.stderr.write(`${driver}/${browser}: cold ${index + 1}\n`);
+        await coldIteration(driver, browser, runs.get(driver)!.samples);
+      }
+    }
+    for (let done = 0, round = 0; done < ITERATIONS; done += BLOCK, round += 1) {
+      for (const driver of inTurn(round)) {
+        process.stderr.write(`${driver}/${browser}: warm ${done + 1}-${Math.min(ITERATIONS, done + BLOCK)}\n`);
+        await warmBlock(driver, browser, Math.min(BLOCK, ITERATIONS - done), runs.get(driver)!);
+      }
+    }
+    for (const [driver, run] of runs) {
+      results[`${driver}/${browser}`] = {
+        samples: Object.fromEntries(Object.entries(run.samples).map(([name, list]) => [name, stats(list)])),
+        raw: run.samples,
+        resources: {
+          'peak RSS, node + browser (MB)': run.peakRssMb,
+          'node CPU, warm loop (s)': run.nodeCpuSeconds,
+          'node + browser CPU, warm loop (s, floor)': run.treeCpuSeconds,
+        },
+        work: run.work,
+      };
     }
   }
 } finally {
   app.kill();
   heavy.close();
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 }
 
 /** Wall-clock milliseconds of one whole testbed run on `driver` and `browser`, at the testbed's own concurrency. */
@@ -353,16 +429,15 @@ function testbedRun(driver: 'playwright' | 'bidi', browser: 'chromium' | 'firefo
 
 const testbedTimes: Record<string, { median: number; runs: number[]; passed: boolean }> = {};
 for (const browser of BROWSERS) {
-  for (const driver of DRIVERS) {
-    const runs: number[] = [];
-    let passed = true;
-    for (let index = 0; index < TESTBED_RUNS; index += 1) {
+  for (let index = 0; index < TESTBED_RUNS; index += 1) {
+    for (const driver of inTurn(index)) {
       process.stderr.write(`${driver}/${browser}: testbed run ${index + 1}\n`);
       const run = await testbedRun(driver, browser);
-      runs.push(run.ms);
-      passed &&= run.passed;
+      const times = (testbedTimes[`${driver}/${browser}`] ??= { median: 0, runs: [], passed: true });
+      times.runs.push(run.ms);
+      times.passed &&= run.passed;
+      times.median = stats(times.runs).p50;
     }
-    testbedTimes[`${driver}/${browser}`] = { median: stats(runs).p50, runs, passed };
   }
 }
 
@@ -394,21 +469,31 @@ const meta = {
 const summary = Object.fromEntries(Object.keys(results).map((key) => [key, totals(key)]));
 writeFileSync(values.out, JSON.stringify({ meta, results, testbed: testbedTimes, totals: summary }, null, 2));
 
+for (const browser of BROWSERS) {
+  const [first, ...others] = DRIVERS.map((driver) => results[`${driver}/${browser}`]!.work);
+  for (const [page, count] of Object.entries(first ?? {})) {
+    if (others.some((work) => work[page] !== count)) console.log(`\nwarning: ${browser} drivers observed ${page} differently: ${DRIVERS.map((driver) => results[`${driver}/${browser}`]!.work[page]).join(' vs ')}`);
+  }
+}
+
 const fmt = (ms: number) => (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1));
 for (const browser of BROWSERS) {
   const keys = DRIVERS.map((driver) => `${driver}/${browser}`);
   const names = Object.keys(results[keys[0]!]!.samples);
   console.log(`\n### ${browser}\n`);
-  console.log(`| Scenario (ms) | ${keys.map((key) => `${key.split('/')[0]} p50 / p95 / mean`).join(' | ')} | BiDi vs PW (p50) |`);
+  console.log(`| Scenario (ms) | ${keys.map((key) => `${key.split('/')[0]} p50 / p95 / mean`).join(' | ')} | BiDi vs PW (p50, 95% CI) |`);
   console.log(`| --- | ${keys.map(() => '---').join(' | ')} | --- |`);
   for (const name of names) {
     const cells = keys.map((key) => {
       const s = results[key]!.samples[name]!;
       return `${fmt(s.p50)} / ${fmt(s.p95)} / ${fmt(s.mean)}`;
     });
-    const pw = results[`playwright/${browser}`]?.samples[name]?.p50;
-    const bidi = results[`bidi/${browser}`]?.samples[name]?.p50;
-    const ratio = pw !== undefined && bidi !== undefined ? `${(bidi / pw).toFixed(2)}x` : '';
+    const pw = results[`playwright/${browser}`]?.raw[name];
+    const bidi = results[`bidi/${browser}`]?.raw[name];
+    const interval = pw !== undefined && bidi !== undefined ? ratioInterval(pw, bidi) : undefined;
+    const ratio = pw !== undefined && bidi !== undefined && interval !== undefined
+      ? `${(stats(bidi).p50 / stats(pw).p50).toFixed(2)}x (${interval[0].toFixed(2)}-${interval[1].toFixed(2)})`
+      : '';
     console.log(`| ${name} | ${cells.join(' | ')} | ${ratio} |`);
   }
   for (const resource of Object.keys(results[keys[0]!]!.resources ?? {})) {
