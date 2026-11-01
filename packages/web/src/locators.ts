@@ -413,7 +413,17 @@ export function frameSelectors(expression: LocatorExpression): string[] {
     }
     case 'query':
       return expression.scope === undefined ? [] : frameSelectors(expression.scope);
-    case 'filter':
+    case 'filter': {
+      const source = frameSelectors(expression.source);
+      for (const inner of [expression.has, expression.hasNot]) {
+        if (inner === undefined) continue;
+        const chain = frameSelectors(inner);
+        if (chain.length > 0 && (chain.length !== source.length || chain.some((selector, index) => selector !== source[index]))) {
+          throw new EngineError('UNSUPPORTED_CAPABILITY', 'an inner has or hasNot locator must belong to the same frame as the locator it filters', { retryable: false });
+        }
+      }
+      return source;
+    }
     case 'index':
       return frameSelectors(expression.source);
     case 'selector':

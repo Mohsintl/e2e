@@ -25,7 +25,7 @@ import { chromiumDrag } from './drag.ts';
 import { unlessStale } from './errors.ts';
 import type { NodeTarget } from './frames.ts';
 import { clickSources, dragPath, dragSources, dragStepMs, moveSources, pressSource, typeSource, wheelSources, type ClickOptions } from './input.ts';
-import { actionPoint as readActionPoint, armHitInterceptor, ELEMENT_DISABLED, hitInterceptorResult, boxSize, checkState, fileInput, fill as fillElement, focus, hitBlocker, nextFrame, selectOption, type ActionPoint } from './page.ts';
+import { actionPoint as readActionPoint, armHitInterceptor, ELEMENT_DISABLED, hitInterceptorResult, scrollIntoViewIfNeeded, boxSize, checkState, fileInput, fill as fillElement, focus, hitBlocker, nextFrame, selectOption, type ActionPoint } from './page.ts';
 import { ElementRef } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -75,8 +75,7 @@ export async function perform(session: BidiSession, ref: NodeRef, action: Locato
     case 'focus':
       return focusOn(session, target, signal);
     case 'scrollIntoView':
-      await settledPoint(session, target, deadline, { enabled: false, scroll: true }, signal);
-      return;
+      return scrollIntoView(session, target, deadline, signal);
     case 'check':
     case 'uncheck':
       return setChecked(session, target, action.kind === 'check', deadline, signal);
@@ -158,6 +157,19 @@ async function click(session: BidiSession, target: NodeTarget, deadline: Deadlin
     if (verdict === null) return;
     session.dispatches = dispatched;
     if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${verdict === 'unseen' ? 'the input reached another document' : verdict}`, { retryable: false });
+    await sleep(POLL_MS, undefined, { signal });
+  }
+}
+
+/** Scrolls the element, and each frame holding it, into view as Playwright does, polling while it lays out no box or moves. */
+async function scrollIntoView(session: BidiSession, target: NodeTarget, deadline: Deadline, signal: AbortSignal): Promise<void> {
+  for (const frame of session.frames.chain(target.context)) await session.run(scrollIntoViewIfNeeded, [frame.element], frame.context);
+  for (;;) {
+    signal.throwIfAborted();
+    const state = await session.run(scrollIntoViewIfNeeded, [target.element], target.context);
+    if (state === 'ok') return;
+    if (state === 'detached') throw new EngineError('NODE_STALE', 'element is not attached to the DOM', { retryable: true });
+    if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${state === 'moving' ? 'element is not stable' : 'element is not visible'}`, { retryable: false });
     await sleep(POLL_MS, undefined, { signal });
   }
 }

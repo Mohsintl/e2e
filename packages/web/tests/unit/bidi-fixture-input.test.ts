@@ -29,7 +29,7 @@ describe('fixtureKeySource', () => {
   it('refuses a combination to hold, a non-modifier prefix, and an unknown name', () => {
     expect(() => fixtureKeySource('Shift+a', 'keyDown', false)).toThrow('keyboard.down cannot read the key "Shift+a"');
     expect(() => fixtureKeySource('a+b', 'press', false)).toThrow('"a" in "a+b" is not a modifier');
-    expect(() => fixtureKeySource('Hyper', 'press', false)).toThrow('unknown key "Hyper"');
+    expect(() => fixtureKeySource('Hyper', 'press', false)).toThrow('Unknown key: "Hyper"');
   });
 });
 

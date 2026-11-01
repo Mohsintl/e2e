@@ -129,8 +129,9 @@ export const LOCATE_READ = `(options, wants, key, structured) => {
   });
   const nodes = read(document.documentElement, { ...base, mode: { kind: 'nodes', elements } });
   const valued = elements.map((element) => element.matches('input:not([type="checkbox" i]):not([type="radio" i]), textarea, select'));
-  if (structured) return [{ nodes, parents, valued }, elements];
-  return [${NATIVE_JSON} ? JSON.stringify({ nodes, parents, valued }) : null, elements];
+  const aria = (${playwrightAria.toString()})(elements, nodes.map((node) => node.role));
+  if (structured) return [{ nodes, parents, valued, aria }, elements];
+  return [${NATIVE_JSON} ? JSON.stringify({ nodes, parents, valued, aria }) : null, elements];
 }`;
 
 
@@ -160,6 +161,105 @@ export interface LocateMetadata {
   readonly nodes: RawNodeData[];
   readonly parents: number[];
   readonly valued: boolean[];
+  readonly aria: PlaywrightAria[];
+}
+
+/**
+ * What Playwright's own engines read of an element, beside the shared
+ * reader: its text as the text engine joins it, whether the role engine
+ * counts it hidden, and its ARIA states with `mixed` and absent kept apart
+ * from false.
+ */
+export interface PlaywrightAria {
+  readonly text: string;
+  readonly hidden: boolean;
+  readonly checked: boolean | 'mixed';
+  readonly pressed: boolean | 'mixed';
+  readonly expanded: boolean | null;
+  readonly selected: boolean;
+}
+
+/**
+ * Reads `PlaywrightAria` for each element, given the role the shared reader
+ * gave it, by the rules of Playwright's injected script (`elementText`,
+ * `isElementHiddenForAria`, `getAriaChecked`, `getAriaPressed`,
+ * `getAriaExpanded`, `getAriaSelected`). Runs in the page, embedded in
+ * `LOCATE_READ`.
+ */
+export function playwrightAria(elements: Element[], roles: (string | null)[]): PlaywrightAria[] {
+  const normalize = (text: string): string => text.replace(/\u200b/g, '').trim().replace(/\s+/g, ' ');
+  const texts = new Map<Element | ShadowRoot, string>();
+  const textOf = (root: Element | ShadowRoot): string => {
+    const cached = texts.get(root);
+    if (cached !== undefined) return cached;
+    let full = '';
+    const skipped = root.nodeType === 1 && (['SCRIPT', 'NOSCRIPT', 'STYLE'].includes(root.nodeName) || (document.head !== null && document.head.contains(root)));
+    if (!skipped) {
+      if (root.nodeName === 'INPUT' && ['submit', 'button', 'reset'].includes((root as HTMLInputElement).type)) {
+        full = (root as HTMLInputElement).value;
+      } else {
+        for (let child = root.firstChild; child !== null; child = child.nextSibling) {
+          if (child.nodeType === 3) full += child.nodeValue ?? '';
+          else if (child.nodeType === 1) full += textOf(child as Element);
+        }
+        if (root.nodeType === 1 && (root as Element).shadowRoot !== null) full += textOf((root as Element).shadowRoot!);
+      }
+    }
+    texts.set(root, full);
+    return full;
+  };
+  const parentOrHost = (element: Element): Element | null =>
+    element.parentElement ?? (element.parentNode?.nodeType === 11 ? (element.parentNode as ShadowRoot).host : null);
+  const hiddenUp = new Map<Element, boolean>();
+  const belongsHidden = (element: Element): boolean => {
+    let hidden = hiddenUp.get(element);
+    if (hidden === undefined) {
+      hidden = element.parentElement !== null && element.parentElement.shadowRoot !== null && element.assignedSlot === null;
+      if (!hidden) hidden = getComputedStyle(element).display === 'none' || (element.getAttribute('aria-hidden') ?? '').toLowerCase() === 'true';
+      if (!hidden) {
+        const parent = parentOrHost(element);
+        if (parent !== null) hidden = belongsHidden(parent);
+      }
+      hiddenUp.set(element, hidden);
+    }
+    return hidden;
+  };
+  const styleVisible = (element: Element, style: CSSStyleDeclaration): boolean =>
+    (typeof element.checkVisibility !== 'function' || element.checkVisibility()) && style.visibility === 'visible';
+  const hiddenForAria = (element: Element): boolean => {
+    if (['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE'].includes(element.nodeName)) return true;
+    const style = getComputedStyle(element);
+    const slot = element.nodeName === 'SLOT';
+    if (style.display === 'contents' && !slot) {
+      for (let child = element.firstChild; child !== null; child = child.nextSibling) {
+        if (child.nodeType === 1 && !hiddenForAria(child as Element)) return false;
+        if (child.nodeType === 3 && (child.nodeValue ?? '').trim() !== '') return false;
+      }
+      return true;
+    }
+    const option = element.nodeName === 'OPTION' && element.closest('select') !== null;
+    if (!option && !slot && !styleVisible(element, style)) return true;
+    return belongsHidden(element);
+  };
+  const checkedRoles = new Set(['checkbox', 'menuitemcheckbox', 'option', 'radio', 'switch', 'menuitemradio', 'treeitem']);
+  const pressedRoles = new Set(['button']);
+  const expandedRoles = new Set(['application', 'button', 'checkbox', 'combobox', 'gridcell', 'link', 'listbox', 'menuitem', 'row', 'rowheader', 'tab', 'treeitem', 'columnheader', 'menuitemcheckbox', 'menuitemradio', 'switch']);
+  const selectedRoles = new Set(['gridcell', 'option', 'row', 'tab', 'rowheader', 'columnheader', 'treeitem']);
+  return elements.map((element, index) => {
+    const role = roles[index] ?? '';
+    let checked: boolean | 'mixed' = false;
+    const input = element.nodeName === 'INPUT' ? (element as HTMLInputElement) : null;
+    if (input !== null && input.indeterminate) checked = 'mixed';
+    else if (input !== null && ['checkbox', 'radio'].includes(input.type)) checked = input.checked;
+    else if (checkedRoles.has(role)) checked = element.getAttribute('aria-checked') === 'true' ? true : element.getAttribute('aria-checked') === 'mixed' ? 'mixed' : false;
+    const pressedAttribute = element.getAttribute('aria-pressed');
+    const pressed: boolean | 'mixed' = pressedRoles.has(role) ? (pressedAttribute === 'true' ? true : pressedAttribute === 'mixed' ? 'mixed' : false) : false;
+    let expanded: boolean | null = null;
+    if (element.nodeName === 'DETAILS') expanded = (element as HTMLDetailsElement).open;
+    else if (expandedRoles.has(role) && element.getAttribute('aria-expanded') !== null) expanded = element.getAttribute('aria-expanded') === 'true';
+    const selected = element.nodeName === 'OPTION' ? (element as HTMLOptionElement).selected : selectedRoles.has(role) && element.getAttribute('aria-selected') === 'true';
+    return { text: normalize(textOf(element)), hidden: hiddenForAria(element), checked, pressed, expanded, selected };
+  });
 }
 
 /** The walk's metadata, as `READ_TREE` reports it. */
@@ -196,7 +296,14 @@ export interface ActionPointOptions {
 export async function actionPoint(element: Element, options: ActionPointOptions): Promise<ActionPoint> {
   if (!element.isConnected) return { state: 'detached' };
   const style = getComputedStyle(element);
-  const box = element.getBoundingClientRect();
+  const rectsOf = (): DOMRect[] => {
+    const own = [...element.getClientRects()];
+    if (own.length > 0 || style.display !== 'contents') return own;
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    return [...range.getClientRects()];
+  };
+  const box = rectsOf()[0] ?? element.getBoundingClientRect();
   if (box.width === 0 || box.height === 0 || style.visibility === 'hidden') return { state: 'hidden' };
   if (options.pointer === false) return { state: 'ok', x: 0, y: 0 };
   type Area = { left: number; top: number; right: number; bottom: number };
@@ -233,23 +340,26 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
     return (right - left) * (bottom - top) > 0.99 && right > left && bottom > top ? { left, top, right, bottom } : null;
   };
   const visible = (): Area | null => {
-    for (const rect of element.getClientRects()) {
+    for (const rect of rectsOf()) {
       const area = clipped(rect);
       if (area !== null) return area;
     }
     return null;
   };
   const centred = (area: Area | null): boolean => {
-    const rect = element.getClientRects()[0] ?? element.getBoundingClientRect();
+    const rect = rectsOf()[0] ?? element.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     return area !== null && x >= area.left && x <= area.right && y >= area.top && y <= area.bottom;
   };
-  if (options.scroll && options.align !== undefined) element.scrollIntoView({ ...options.align, behavior: 'instant' });
-  else if (options.scroll && !centred(visible())) element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-  const before = element.getBoundingClientRect();
+  const scrolled = element.getClientRects().length > 0
+    ? element
+    : ([...element.querySelectorAll('*')].find((child) => child.getClientRects().length > 0) ?? element.parentElement ?? element);
+  if (options.scroll && options.align !== undefined) scrolled.scrollIntoView({ ...options.align, behavior: 'instant' });
+  else if (options.scroll && !centred(visible())) scrolled.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const before = rectsOf()[0] ?? element.getBoundingClientRect();
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-  const after = element.getBoundingClientRect();
+  const after = rectsOf()[0] ?? element.getBoundingClientRect();
   if (after.x !== before.x || after.y !== before.y || after.width !== before.width || after.height !== before.height) return { state: 'moving' };
   const area = visible();
   if (area === null) return { state: 'outside' };
@@ -426,16 +536,18 @@ export function boxSize(element: Element): { width: number; height: number } {
 
 /**
  * Covers every secure field of the document, through open and recorded
- * closed shadow roots, with an opaque box, and hides the caret, for one
+ * closed shadow roots, with an opaque box, and hides the caret in the
+ * document and each of those roots (as `screenshot-caret.ts` does), for one
  * screenshot; returns how many fields it covered. A field inside a top-layer
- * element (found through the composed tree, slots included) (a modal dialog, an open popover, a fullscreen element) gets its
- * box inside that element, in its scaled coordinates, so the box moves with
- * it however the app reorders the top layer; any other field's box (and one
- * in a top-layer element turned or mirrored) sits in a manual popover of its
- * own, above what the app shows. Boxes live in closed shadow roots of hosts whose
- * every style is set inline as `!important`, so no page rule reaches them.
- * `token` names this masking for `unmaskSecureFields`; captures that overlap
- * each keep their own.
+ * element (a modal dialog, an open popover, a fullscreen element, found
+ * through the composed tree, slots included) gets its box inside that
+ * element, in its scaled coordinates, so the box moves with it however the
+ * app reorders the top layer; any other field's box (and one in a top-layer
+ * element turned or mirrored) sits in a manual popover of its own, above
+ * what the app shows. Boxes live in closed shadow roots of hosts whose every
+ * style is set inline as `!important`, so no page rule reaches them. `token`
+ * names this masking for `unmaskSecureFields`; captures that overlap each
+ * keep their own.
  */
 export function maskSecureFields(selector: string, key: string, token: string): number {
   const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
@@ -514,10 +626,11 @@ export function maskSecureFields(selector: string, key: string, token: string): 
     boxes.push({ field, rect, box });
   }
   const caret = new CSSStyleSheet();
-  caret.replaceSync('*, *::before, *::after { caret-color: transparent !important; }');
-  document.adoptedStyleSheets = [...document.adoptedStyleSheets, caret];
+  caret.replaceSync('input, textarea, [contenteditable] { caret-color: transparent !important; }');
+  const sheeted = roots.filter((root): root is Document | ShadowRoot => root instanceof Document || root instanceof ShadowRoot);
+  for (const root of sheeted) root.adoptedStyleSheets = [...root.adoptedStyleSheets, caret];
   const masks = (Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as Map<string, unknown> | undefined) ?? new Map<string, unknown>();
-  masks.set(token, { hosts: [...hosts].map(([container, { host }]) => ({ container, host })), caret, boxes, selector, key });
+  masks.set(token, { hosts: [...hosts].map(([container, { host }]) => ({ container, host })), caret, sheeted, boxes, selector, key });
   Reflect.set(globalThis, Symbol.for('e2e.bidi.mask'), masks);
   return boxes.length;
 }
@@ -535,6 +648,7 @@ export function unmaskSecureFields(token: string): boolean {
   type Mask = {
     hosts: { container: Element | null; host: HTMLElement }[];
     caret: CSSStyleSheet;
+    sheeted: (Document | ShadowRoot)[];
     boxes: { field: Element; rect: DOMRect; box: HTMLElement }[];
     selector: string;
     key: string;
@@ -556,7 +670,7 @@ export function unmaskSecureFields(token: string): boolean {
   };
   const shown = mask.hosts.every(placed) && mask.boxes.every((entry) => painted(entry.box) && covers(entry));
   for (const { host } of mask.hosts) host.remove();
-  document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== mask.caret);
+  for (const root of mask.sheeted) root.adoptedStyleSheets = root.adoptedStyleSheets.filter((sheet) => sheet !== mask.caret);
   if (!shown) return false;
   const still = mask.boxes.every(({ field, rect }) => {
     const now = field.getBoundingClientRect();
@@ -633,4 +747,47 @@ export function hitInterceptorResult(token: string): string | null {
   interceptors.delete(token);
   watch.remove();
   return watch.state.verdict === undefined ? 'unseen' : watch.state.verdict;
+}
+
+/**
+ * Scrolls an element into view as Playwright's `scrollIntoViewIfNeeded`
+ * does: once it holds still for a frame, and only when some of it is out of
+ * the viewport or a scrolling ancestor, to the nearest edge then. Any element with a box counts, a zero-sized or
+ * `visibility: hidden` one included; a `display: contents` element counts by
+ * the boxes of its contents. Returns `detached`, `hidden` when nothing lays
+ * out a box yet (it may appear), `moving`, or `ok`.
+ */
+export async function scrollIntoViewIfNeeded(element: Element): Promise<'detached' | 'hidden' | 'moving' | 'ok'> {
+  if (!element.isConnected) return 'detached';
+  const bounds = (): DOMRect | null => {
+    let rects = [...element.getClientRects()];
+    if (rects.length === 0 && getComputedStyle(element).display === 'contents') {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      rects = [...range.getClientRects()];
+    }
+    if (rects.length === 0) return null;
+    const left = Math.min(...rects.map((rect) => rect.left));
+    const top = Math.min(...rects.map((rect) => rect.top));
+    return new DOMRect(left, top, Math.max(...rects.map((rect) => rect.right)) - left, Math.max(...rects.map((rect) => rect.bottom)) - top);
+  };
+  const before = bounds();
+  if (before === null) return 'hidden';
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const rect = bounds();
+  if (rect === null) return 'hidden';
+  if (rect.x !== before.x || rect.y !== before.y || rect.width !== before.width || rect.height !== before.height) return 'moving';
+  const outside = (area: { left: number; top: number; right: number; bottom: number }): boolean =>
+    rect.left < area.left || rect.top < area.top || rect.right > area.right || rect.bottom > area.bottom;
+  let clipped = outside({ left: 0, top: 0, right: visualViewport?.width || innerWidth, bottom: visualViewport?.height || innerHeight });
+  for (let at = element.parentElement; !clipped && at !== null && at !== document.documentElement; at = at.parentElement) {
+    if (getComputedStyle(at).overflow !== 'visible') clipped = outside(at.getBoundingClientRect());
+  }
+  if (clipped) {
+    const target = element.getClientRects().length > 0
+      ? element
+      : ([...element.querySelectorAll('*')].find((child) => child.getClientRects().length > 0) ?? element.parentElement);
+    target?.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+  }
+  return 'ok';
 }

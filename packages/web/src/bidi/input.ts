@@ -53,10 +53,12 @@ function modifierCode(modifier: KeyModifier): string {
   return MODIFIER_CODES[modifier];
 }
 
-/** The key source that presses one key of the contract grammar with its modifiers held. */
+/** The key source that presses one key of the contract grammar with its modifiers held; a character off the US keyboard Playwright types on is an unknown key, as there. */
 export function pressSource(key: string): Input.KeySourceActions {
   const parsed = parseKey(key);
-  if (parsed === undefined) throw new EngineError('UNSUPPORTED_CAPABILITY', `key "${key}" is outside the key grammar`, { retryable: false });
+  if (parsed === undefined || (parsed.key.kind === 'char' && !/^[\x20-\x7e]$/.test(parsed.key.char))) {
+    throw new EngineError('UNSUPPORTED_CAPABILITY', `Unknown key: "${key}"`, { retryable: false });
+  }
   const value = parsed.key.kind === 'named' ? KEY_CODES[parsed.key.name] : parsed.key.char;
   const modifiers = parsed.modifiers.map(modifierCode);
   return {
@@ -168,8 +170,8 @@ function fixtureKeyValue(name: string, shifted: boolean): string {
   if (/^[a-z]$/.test(name) && shifted) return name.toUpperCase();
   const digit = /^Digit([0-9])$/.exec(name)?.[1];
   if (digit !== undefined) return digit;
-  if ([...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(name)].length === 1) return name;
-  throw new TestError('INVALID_ARGUMENT', `unknown key "${name}"`);
+  if (/^[\x20-\x7e]$/.test(name)) return name;
+  throw new TestError('INVALID_ARGUMENT', `Unknown key: "${name}"`);
 }
 
 /** Steps a drag moves through between its press and its release, so drag-and-drop libraries see motion. */

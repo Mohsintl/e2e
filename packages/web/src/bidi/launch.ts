@@ -110,6 +110,7 @@ const FIREFOX_PREFS: Readonly<Record<string, string | number | boolean>> = {
   'app.update.checkInstallTime': false,
   'app.update.disabledForTesting': true,
   'apz.content_response_timeout': 60_000,
+  'ui.useOverlayScrollbars': 0,
   'browser.contentblocking.features.standard': '-tp,tpPrivate,cookieBehavior0,-cm,-fp',
   'browser.newtabpage.activity-stream.discoverystream.region-weather-config': '',
   'browser.newtabpage.activity-stream.newtabWallpapers.enabled': false,
