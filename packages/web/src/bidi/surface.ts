@@ -38,6 +38,7 @@ import {
   type OperationContext,
   type PointerAction,
   type SemanticNode,
+  type TextPattern,
   type VideoFile,
   type ViewportPoint,
   type ViewportSize,
@@ -60,7 +61,8 @@ import type { WebBasicAuth, WebScreencastOptions } from '../surface.ts';
 import { BidiError, type BidiConnection } from './connection.ts';
 import { AttemptDownloads, type FinishedDownload } from './downloads.ts';
 import { contentContext, FrameRegistry, inViewport, resolveFrames, withinFrame, type NodeTarget } from './frames.ts';
-import { clickSources, dragSources, moveSources, pressSource, typeSource, wheelSources, type ClickOptions } from './input.ts';
+import { chromiumDrag } from './drag.ts';
+import { clickSources, dragPath, dragSources, dragStepMs, moveSources, pressSource, typeSource, wheelSources, type ClickOptions } from './input.ts';
 import { connectBidiOverCdp, launchBidiBrowser, type BidiBrowser, type BidiBrowserName } from './launch.ts';
 import { AttemptNetwork, type NetworkRoute, type ObservedResponse } from './network.ts';
 import {
@@ -944,7 +946,7 @@ export class BidiSurface {
       case 'dragTo': {
         const from = await this.actionPoint(target, deadline, true);
         const to = await this.actionPoint(attempt.refs.lookup(action.target), deadline, false);
-        await this.sendInput(dragSources(from, to));
+        await this.drag(from, to, 0);
         return;
       }
       case 'swipe': {
@@ -972,11 +974,11 @@ export class BidiSurface {
   private async actionPoint(target: NodeTarget, deadline: Deadline, enabled: boolean, hitTest = true): Promise<{ x: number; y: number }> {
     const attempt = this.requireAttempt();
     for (const frame of attempt.frames.chain(target.context)) {
-      await this.call(ACTION_POINT, [frame.element, false, false], { awaitPromise: true }, frame.context);
+      await this.call(ACTION_POINT, [frame.element, false, false, CLOSED_SHADOW_ROOTS_KEY], { awaitPromise: true }, frame.context);
     }
     let last: ActionPoint;
     for (;;) {
-      last = await this.read<ActionPoint>(ACTION_POINT, [target.element, enabled, hitTest], { awaitPromise: true }, target.context);
+      last = await this.read<ActionPoint>(ACTION_POINT, [target.element, enabled, hitTest, CLOSED_SHADOW_ROOTS_KEY], { awaitPromise: true }, target.context);
       if (last.state === 'ok') break;
       if (last.state === 'detached') throw new EngineError('NODE_STALE', 'element is not attached to the DOM', { retryable: true });
       if (deadline.remaining() <= ACTIONABILITY_POLL_MS) {
@@ -1055,6 +1057,22 @@ export class BidiSurface {
     }
   }
 
+  /**
+   * Presses at `from`, moves to `to` over `durationMs`, and releases there.
+   * On Chromium a drag the page starts carries its data to the drop
+   * (`chromiumDrag`); Firefox's remote agent does not synthesize the drop
+   * (bugzilla.mozilla.org/1515879), so there the pointer moves alone.
+   */
+  private async drag(from: ViewportPoint, to: ViewportPoint, durationMs: number): Promise<void> {
+    if (this.options.browser !== 'chromium') {
+      await this.sendInput(dragSources(from, to, durationMs));
+      return;
+    }
+    const context = this.requireContext();
+    await chromiumDrag(this.requireBrowser().connection, context, await this.documentContexts(context), dragPath(from, to), dragStepMs(durationMs));
+    this.requireAttempt().pointer = { x: to.x, y: to.y };
+  }
+
   /** Wheels at a viewport point by a swipe of `extent`'s size, then waits for the frame that renders it. */
   private async wheel(
     at: ViewportPoint,
@@ -1085,9 +1103,9 @@ export class BidiSurface {
         case 'hover':
           return this.sendInput(moveSources(at.x, at.y));
         case 'dragTo':
-          return this.sendInput(dragSources(at, nearestPixel(action.target)));
+          return this.drag(at, nearestPixel(action.target), 0);
         case 'swipeTo':
-          return this.sendInput(dragSources(at, nearestPixel(action.target), action.durationMs));
+          return this.drag(at, nearestPixel(action.target), action.durationMs ?? 0);
         case 'swipe':
           return this.wheel(at, await this.viewportSize(), action.direction, action.momentum ?? 'none');
       }
@@ -1439,29 +1457,41 @@ function classify(cause: unknown, label: string): Error {
   return new EngineError('ENGINE_FAILURE', `${label}: ${text}`, { retryable: false, cause });
 }
 
+/** A text pattern as a page function argument. */
+function patternArgument(pattern: TextPattern): PageArgument {
+  return pattern.kind === 'string'
+    ? { kind: 'string', value: pattern.value, exact: pattern.exact }
+    : { kind: 'regexp', source: pattern.source, flags: pattern.flags };
+}
+
 /**
- * What a locate must read: the query kinds and, for role queries, the roles
- * the expression names, so the page reads only elements one of its queries
- * could match. A selector, or a role query outside the known roles, reads
- * every element.
+ * What a locate must read, as `LOCATE_READ` takes it: each query of the
+ * expression, and whether a text filter needs every element with text. A
+ * selector, or a role query whose role is a pattern, reads every element.
  */
-function wantedQueries(expression: LocatorExpression): { kinds: Record<string, boolean>; roles: string[]; all: boolean } {
-  const kinds: Record<string, boolean> = {};
-  const roles = new Set<string>();
+function wantedQueries(expression: LocatorExpression): PageArgument {
+  const queries: PageArgument[] = [];
+  let hasText = false;
   let all = false;
   const walk = (node: LocatorExpression): void => {
     switch (node.kind) {
-      case 'query':
-        kinds[node.query.kind] = true;
-        if (node.query.kind === 'role' && node.query.value.kind === 'string') roles.add(node.query.value.value);
-        else if (node.query.kind === 'role') all = true;
+      case 'query': {
+        const { kind, value, name } = node.query;
+        if (kind === 'role' && value.kind !== 'string') all = true;
+        queries.push({
+          kind,
+          value: patternArgument(value),
+          ...(name === undefined ? {} : { name: patternArgument(name) }),
+          ...(kind === 'role' && value.kind === 'string' ? { role: value.value } : {}),
+        });
         if (node.scope !== undefined) walk(node.scope);
         return;
+      }
       case 'selector':
         all = true;
         return;
       case 'filter':
-        if (node.hasText !== undefined || node.hasNotText !== undefined) kinds['text'] = true;
+        if (node.hasText !== undefined || node.hasNotText !== undefined) hasText = true;
         walk(node.source);
         if (node.has !== undefined) walk(node.has);
         if (node.hasNot !== undefined) walk(node.hasNot);
@@ -1476,7 +1506,7 @@ function wantedQueries(expression: LocatorExpression): { kinds: Record<string, b
     }
   };
   walk(expression);
-  return { kinds, roles: [...roles], all };
+  return { queries, hasText, all };
 }
 
 /** Builds the read elements into trees by their nearest read ancestor; the roots, in document order. */

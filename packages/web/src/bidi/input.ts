@@ -110,23 +110,33 @@ export function moveSources(x: number, y: number): Input.SourceActions[] {
 /** Steps a drag moves through between its press and its release, so drag-and-drop libraries see motion. */
 const DRAG_STEPS = 5;
 
-/** The source that presses at `from`, moves to `to` over `durationMs`, and releases there. */
-export function dragSources(from: { x: number; y: number }, to: { x: number; y: number }, durationMs = 0): Input.SourceActions[] {
-  const step = Math.round(durationMs / DRAG_STEPS);
-  const pointer: Input.PointerSourceAction[] = [
-    { type: 'pointerMove', x: from.x, y: from.y, origin: 'viewport' },
-    { type: 'pointerDown', button: 0 },
-  ];
+/** A drag's points: its start, then each step to `to`. */
+export function dragPath(from: { x: number; y: number }, to: { x: number; y: number }): { x: number; y: number }[] {
+  const path = [{ x: from.x, y: from.y }];
   for (let index = 1; index <= DRAG_STEPS; index += 1) {
-    pointer.push({
-      type: 'pointerMove',
+    path.push({
       x: Math.round(from.x + ((to.x - from.x) * index) / DRAG_STEPS),
       y: Math.round(from.y + ((to.y - from.y) * index) / DRAG_STEPS),
-      origin: 'viewport',
-      ...(step > 0 ? { duration: step } : {}),
     });
   }
-  pointer.push({ type: 'pointerUp', button: 0 });
+  return path;
+}
+
+/** How long each step of a drag that lasts `durationMs` takes. */
+export function dragStepMs(durationMs: number): number {
+  return Math.round(durationMs / DRAG_STEPS);
+}
+
+/** The source that presses at `from`, moves to `to` over `durationMs`, and releases there. */
+export function dragSources(from: { x: number; y: number }, to: { x: number; y: number }, durationMs = 0): Input.SourceActions[] {
+  const step = dragStepMs(durationMs);
+  const [start, ...steps] = dragPath(from, to);
+  const pointer: Input.PointerSourceAction[] = [
+    { type: 'pointerMove', x: start!.x, y: start!.y, origin: 'viewport' },
+    { type: 'pointerDown', button: 0 },
+    ...steps.map((point) => ({ type: 'pointerMove' as const, x: point.x, y: point.y, origin: 'viewport' as const, ...(step > 0 ? { duration: step } : {}) })),
+    { type: 'pointerUp', button: 0 },
+  ];
   return [mouse(pointer)];
 }
 

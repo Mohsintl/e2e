@@ -23,58 +23,103 @@ export const READ_TREE = `(options, structured) => {
 /**
  * Reads the elements a locate could match, in document order through open
  * and recorded closed shadow roots, with the reader's node projection (the
- * full locator-read surface), all under one reader. `wants` names the
- * expression's query kinds and the roles its role queries ask for: a role
- * query reads only the elements the reader gives one of those roles, the
- * other kinds only elements that carry what they compare. An element no
- * query could match is skipped, and its read descendants hang under the
- * nearest read ancestor, which keeps every containment a scope or filter
- * asks about. Iframe documents are not entered.
+ * full locator-read surface), all under one reader. `wants` lists the
+ * expression's queries: an element is read when some query could match it,
+ * a superset test on what that query compares (its role, then its name; an
+ * attribute; its text), case-insensitive with whitespace removed, so the
+ * contract's resolver, which runs on the reads, stays the one judge. A
+ * pattern is no prefilter. A shadow host is always read, since its text is
+ * in its shadow tree. Skipped elements leave their read descendants under
+ * the nearest read ancestor, which keeps every containment a scope or
+ * filter asks about. Iframe documents are not entered.
  */
 export const LOCATE_READ = `(options, wants, key) => {
   const read = (${readSemanticsFunction.toString()});
   const recorded = Reflect.get(globalThis, Symbol.for(key));
   const skip = new Set(['script', 'style', 'noscript', 'template', 'head', 'meta', 'link', 'title', 'base']);
   const labelable = 'input, select, textarea, button, meter, output, progress, [aria-label], [aria-labelledby], [contenteditable], [role]';
-  const kinds = wants.kinds;
+  const squash = (text) => text.replace(/\\s+/g, '').toLowerCase();
+  const may = (actual, pattern) => pattern === undefined || pattern === null || pattern.kind !== 'string' || (actual !== null && actual !== undefined && squash(String(actual)).includes(squash(pattern.value)));
   const all = [];
   const parentOf = [];
+  const hosts = new Set();
   const visit = (element, parent) => {
     if (skip.has(element.localName)) return;
     const index = all.length;
     all.push(element);
     parentOf.push(parent);
     const shadow = element.shadowRoot ?? recorded?.get(element);
-    if (shadow) for (const child of shadow.children) visit(child, index);
+    if (shadow) {
+      hosts.add(index);
+      for (const child of shadow.children) visit(child, index);
+    }
     for (const child of element.children) visit(child, index);
   };
   visit(document.documentElement, -1);
   const base = { testIdAttribute: options.testIdAttribute, secureFieldSelector: options.secureFieldSelector };
-  const roles = !wants.all && wants.roles.length > 0
-    ? read(document.documentElement, { ...base, mode: { kind: 'roles', elements: all } })
-    : null;
-  const roleSet = new Set(wants.roles);
-  const keep = all.map((element, index) => {
-    if (wants.all) return true;
-    if (roles !== null && roleSet.has(roles[index])) return true;
-    if (kinds.testId && element.hasAttribute(options.testIdAttribute)) return true;
-    if (kinds.placeholder && element.hasAttribute('placeholder')) return true;
-    if (kinds.displayValue && /^(input|textarea|select)$/.test(element.localName)) return true;
-    if (kinds.label && element.matches(labelable)) return true;
-    if (kinds.text && (element.textContent.trim() !== '' || element.hasAttribute('aria-label') || element.hasAttribute('alt') || element.hasAttribute('title') || element.hasAttribute('value'))) return true;
-    return false;
-  });
-  const keptIndex = new Array(all.length).fill(-1);
+  const keep = all.map(() => wants.all);
+  if (!wants.all) {
+    const roleQueries = wants.queries.filter((query) => query.kind === 'role');
+    if (roleQueries.length > 0) {
+      const roles = read(document.documentElement, { ...base, mode: { kind: 'roles', elements: all } });
+      const named = [];
+      all.forEach((element, index) => {
+        for (const query of roleQueries) {
+          if (roles[index] !== query.role) continue;
+          if (query.name === undefined || query.name.kind !== 'string') keep[index] = true;
+          else named.push(index);
+          return;
+        }
+      });
+      const names = named.length === 0 ? [] : read(document.documentElement, { ...base, mode: { kind: 'names', elements: named.map((index) => all[index]) } });
+      named.forEach((index, at) => {
+        const name = names[at];
+        // A nameless element may still match by a label the resolver reads; only a known name can rule it out.
+        if (roleQueries.some((query) => query.role === roles[index] && (name === null || may(name, query.name)))) keep[index] = true;
+      });
+    }
+    all.forEach((element, index) => {
+      if (keep[index]) return;
+      if (wants.hasText && (element.textContent.trim() !== '' || hosts.has(index))) {
+        keep[index] = true;
+        return;
+      }
+      for (const query of wants.queries) {
+        switch (query.kind) {
+          case 'testId': {
+            const value = element.getAttribute(options.testIdAttribute);
+            if (value !== null && may(value, query.value)) keep[index] = true;
+            break;
+          }
+          case 'placeholder': {
+            const value = element.getAttribute('placeholder');
+            if (value !== null && may(value, query.value)) keep[index] = true;
+            break;
+          }
+          case 'displayValue':
+            if (element.localName === 'select' || (/^(input|textarea)$/.test(element.localName) && may(element.value, query.value))) keep[index] = true;
+            break;
+          case 'label':
+            if (element.matches(labelable)) keep[index] = true;
+            break;
+          case 'text':
+            if (hosts.has(index) || element.hasAttribute('aria-label') || element.hasAttribute('aria-labelledby') || element.hasAttribute('alt') ||
+                element.hasAttribute('title') || element.hasAttribute('value') || may(element.textContent, query.value)) keep[index] = true;
+            break;
+        }
+        if (keep[index]) return;
+      }
+    });
+  }
   const nearest = new Array(all.length).fill(-1);
   const elements = [];
   const parents = [];
   all.forEach((element, index) => {
     const above = parentOf[index] >= 0 ? nearest[parentOf[index]] : -1;
     if (keep[index]) {
-      keptIndex[index] = elements.length;
+      nearest[index] = elements.length;
       parents.push(above);
       elements.push(element);
-      nearest[index] = keptIndex[index];
     } else {
       nearest[index] = above;
     }
@@ -108,11 +153,14 @@ export type ActionPoint =
 /**
  * Scrolls an element into view when it is not, waits one frame to see it
  * hold still, and hit-tests its centre: the checks Playwright runs before a
- * pointer action (visible, stable, enabled, receives events). `enabled`
- * skips the disabled check for a hover; `hitTest` false stops after the
- * scroll, for a `scrollIntoView`.
+ * pointer action (visible, stable, enabled, receives events), descending
+ * through open and recorded closed shadow roots to the element actually hit.
+ * `enabled` skips the disabled check for a hover; `hitTest` false stops
+ * after the scroll, for a `scrollIntoView`; `key` names the closed-roots
+ * registry.
  */
-export const ACTION_POINT = `async (element, enabled, hitTest) => {
+export const ACTION_POINT = `async (element, enabled, hitTest, key) => {
+  const recorded = Reflect.get(globalThis, Symbol.for(key));
   if (!element.isConnected) return { state: 'detached' };
   const box = () => element.getBoundingClientRect();
   let rect = box();
@@ -129,8 +177,8 @@ export const ACTION_POINT = `async (element, enabled, hitTest) => {
   const x = Math.round(after.left + after.width / 2);
   const y = Math.round(after.top + after.height / 2);
   let hit = document.elementFromPoint(x, y);
-  while (hit !== null && hit.shadowRoot !== null) {
-    const inner = hit.shadowRoot.elementFromPoint(x, y);
+  for (let root = hit?.shadowRoot ?? recorded?.get(hit); hit !== null && root; root = hit.shadowRoot ?? recorded?.get(hit)) {
+    const inner = root.elementFromPoint(x, y);
     if (inner === null || inner === hit) break;
     hit = inner;
   }
