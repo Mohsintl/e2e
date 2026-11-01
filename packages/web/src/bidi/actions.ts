@@ -38,6 +38,13 @@ const ARIA_DISABLED_ROLES = [
   'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'radiogroup', 'row', 'rowheader', 'searchbox',
   'select', 'slider', 'spinbutton', 'switch', 'tablist', 'textbox', 'toolbar', 'tree', 'treegrid', 'treeitem',
 ];
+/** How a retry scrolls a covered element into view, as Playwright cycles them: as needed, then to the end, the centre, the start. */
+const SCROLL_ALIGNMENTS = [
+  undefined,
+  { block: 'end', inline: 'end' },
+  { block: 'center', inline: 'center' },
+  { block: 'start', inline: 'start' },
+] as const;
 /** What the page's `fill` and `selectOption` refuse for now but may take once the app catches up, polled until the deadline. */
 const NOT_YET = new Set(['element is not editable', 'element is not enabled', 'no option matches']);
 
@@ -159,7 +166,7 @@ async function settledPoint(
   session: BidiSession,
   target: NodeTarget,
   deadline: Deadline,
-  checks: { enabled: boolean; scroll: boolean },
+  checks: { enabled: boolean; scroll: boolean; align?: NonNullable<(typeof SCROLL_ALIGNMENTS)[number]> },
   signal: AbortSignal,
 ): Promise<{ x: number; y: number }> {
   if (checks.scroll) {
@@ -180,12 +187,15 @@ async function settledPoint(
 /**
  * The element's actionable point in the top-level viewport, once a pointer
  * event there reaches it: the element itself is hit in its document, and
- * every iframe holding it is hit at the same point in its parent's. Polls a
- * covered element until the deadline, as Playwright does.
+ * every iframe holding it is hit at the same point in its parent's. A
+ * covered element is polled until the deadline, each retry scrolling it into
+ * view another way (`SCROLL_ALIGNMENTS`), as Playwright does to get an
+ * element out from under a sticky header.
  */
 async function pointerPoint(session: BidiSession, target: NodeTarget, deadline: Deadline, enabled: boolean, signal: AbortSignal): Promise<{ x: number; y: number }> {
-  for (;;) {
-    const local = await settledPoint(session, target, deadline, { enabled, scroll: true }, signal);
+  for (let retry = 0; ; retry += 1) {
+    const align = SCROLL_ALIGNMENTS[retry % SCROLL_ALIGNMENTS.length];
+    const local = await settledPoint(session, target, deadline, { enabled, scroll: true, ...(align === undefined ? {} : { align }) }, signal);
     const chain = session.frames.chain(target.context);
     const steps = await session.frames.frameSteps(session.connection, target.context);
     if (steps === null) throw new EngineError('NOT_ACTIONABLE', 'element is in a frame that lays out no box, or is rotated', { retryable: false });

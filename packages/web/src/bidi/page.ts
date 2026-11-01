@@ -163,6 +163,8 @@ export interface ActionPointOptions {
   readonly enabled: boolean;
   readonly ariaDisabledRoles: readonly string[];
   readonly scroll: boolean;
+  /** How to scroll the element into view, for a retry after an overlay covered it; unset, only when its point is clipped. */
+  readonly align?: { readonly block: ScrollLogicalPosition; readonly inline: ScrollLogicalPosition };
   readonly key: string;
 }
 
@@ -170,10 +172,12 @@ export interface ActionPointOptions {
  * The checks Playwright runs before a pointer action, but the hit test:
  * attached, visible, enabled (`:disabled`, or the nearest `aria-disabled`
  * across shadow hosts on the element itself or on a widget, as the shared
- * reader decides), scrolled into view when its centre is clipped
- * by the viewport or a scrolling ancestor, and holding still for a frame.
- * The point is the centre of the element's visible part, in its document's
- * viewport.
+ * reader decides), scrolled into view when its point is clipped by the
+ * viewport or a scrolling ancestor (or as `align` says), and holding still
+ * for a frame. The point is the centre of the element's first client rect
+ * that shows at least a pixel, as Playwright's clickable point, in whole
+ * pixels inside that rect: pointer input takes whole pixels, and a
+ * rounded centre can miss a small element.
  */
 export async function actionPoint(element: Element, options: ActionPointOptions): Promise<ActionPoint> {
   if (!element.isConnected) return { state: 'detached' };
@@ -193,12 +197,17 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
     }
     if (element.matches(':disabled') || inherited) return { state: 'disabled' };
   }
-  const visible = (): { left: number; top: number; right: number; bottom: number } | null => {
-    const rect = element.getBoundingClientRect();
+  type Area = { left: number; top: number; right: number; bottom: number };
+  const viewport = (): { width: number; height: number } => ({
+    width: document.documentElement.clientWidth || innerWidth,
+    height: document.documentElement.clientHeight || innerHeight,
+  });
+  const clipped = (rect: DOMRect): Area | null => {
+    const { width, height } = viewport();
     let left = Math.max(rect.left, 0);
     let top = Math.max(rect.top, 0);
-    let right = Math.min(rect.right, innerWidth);
-    let bottom = Math.min(rect.bottom, innerHeight);
+    let right = Math.min(rect.right, width);
+    let bottom = Math.min(rect.bottom, height);
     let at: Element | null = element;
     while (at !== null && getComputedStyle(at).position !== 'fixed') {
       const parent: Node | null = at.parentNode;
@@ -215,31 +224,51 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
         bottom = Math.min(bottom, bounds.bottom);
       }
     }
-    return right > left && bottom > top ? { left, top, right, bottom } : null;
+    return (right - left) * (bottom - top) > 0.99 && right > left && bottom > top ? { left, top, right, bottom } : null;
   };
-  const centred = (area: { left: number; top: number; right: number; bottom: number } | null): boolean => {
-    const rect = element.getBoundingClientRect();
+  const visible = (): Area | null => {
+    for (const rect of element.getClientRects()) {
+      const area = clipped(rect);
+      if (area !== null) return area;
+    }
+    return null;
+  };
+  const centred = (area: Area | null): boolean => {
+    const rect = element.getClientRects()[0] ?? element.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     return area !== null && x >= area.left && x <= area.right && y >= area.top && y <= area.bottom;
   };
-  if (options.scroll && !centred(visible())) element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  if (options.scroll && options.align !== undefined) element.scrollIntoView({ ...options.align, behavior: 'instant' });
+  else if (options.scroll && !centred(visible())) element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
   const before = element.getBoundingClientRect();
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   const after = element.getBoundingClientRect();
   if (after.x !== before.x || after.y !== before.y || after.width !== before.width || after.height !== before.height) return { state: 'moving' };
   const area = visible();
   if (area === null) return { state: 'outside' };
-  return { state: 'ok', x: Math.round((area.left + area.right) / 2), y: Math.round((area.top + area.bottom) / 2) };
+  const x = (area.left + area.right) / 2;
+  const y = (area.top + area.bottom) / 2;
+  const inside = (px: number, py: number): boolean => px >= area.left && px < area.right && py >= area.top && py < area.bottom;
+  for (const [px, py] of [[Math.floor(x), Math.floor(y)], [Math.floor(x) + 1, Math.floor(y)], [Math.floor(x) + 1, Math.floor(y) + 1], [Math.floor(x), Math.floor(y) + 1]] as const) {
+    if (inside(px, py)) return { state: 'ok', x: px, y: py };
+  }
+  return { state: 'ok', x: Math.round(x), y: Math.round(y) };
 }
 
 /**
  * Why a pointer event at `x`, `y` of the element's document would not reach
  * the element, descending through open and recorded closed shadow roots to
- * the element actually hit; null when it would.
+ * the element actually hit; null when it would. As Playwright's hit check,
+ * the element is first retargeted to the button or link that holds it (a
+ * label inside a button lets the button take the event), and the hit
+ * element's ancestors are walked through the slots it is assigned to.
  */
 export function hitBlocker(element: Element, x: number, y: number, key: string): string | null {
   const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
+  const target = element.matches('input, textarea, select') || (element as HTMLElement).isContentEditable
+    ? element
+    : (element.closest('button, [role=button], a, [role=link]') ?? element);
   let hit = document.elementFromPoint(x, y);
   for (let root = hit?.shadowRoot ?? recorded?.get(hit!); hit !== null && root !== undefined && root !== null; root = hit.shadowRoot ?? recorded?.get(hit)) {
     const inner = root.elementFromPoint(x, y);
@@ -247,8 +276,8 @@ export function hitBlocker(element: Element, x: number, y: number, key: string):
     hit = inner;
   }
   if (hit === null) return 'no element receives pointer events at the action point';
-  for (let at: Node | null = hit; at !== null; at = at.parentNode ?? (at instanceof ShadowRoot ? at.host : null)) {
-    if (at === element) return null;
+  for (let at: Element | null = hit; at !== null; at = at.assignedSlot ?? at.parentElement ?? (at.parentNode instanceof ShadowRoot ? at.parentNode.host : null)) {
+    if (at === target) return null;
   }
   return `<${hit.localName}${hit.id === '' ? '' : `#${hit.id}`}> intercepts pointer events`;
 }
