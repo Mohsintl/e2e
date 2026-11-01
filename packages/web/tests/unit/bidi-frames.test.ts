@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { LocatorExpression, SemanticNode } from 'e2e/engine';
-import { FrameRegistry, inViewport, resolveFrames, withinFrame } from '../../src/bidi/frames.ts';
+import { FrameRegistry, inViewport, resolveFrames, selectorLocator, withinFrame } from '../../src/bidi/frames.ts';
 import { ElementRef } from '../../src/bidi/script.ts';
 import { FakeBidi } from '../helpers/bidi-fake.ts';
 
@@ -86,5 +86,16 @@ describe('inViewport', () => {
     expect(inViewport(node, { x: 0, y: 0, width: 5, height: 5 }, ['#f']).rect).toBeUndefined();
     expect(inViewport(node, null, ['#f']).rect).toBeUndefined();
     expect(inViewport(node, undefined, [])).toBe(node);
+  });
+});
+
+describe('selectorLocator', () => {
+  it('reads a selector as Playwright does: a prefix names the engine, a path is XPath, the rest CSS', () => {
+    expect(selectorLocator('xpath=//iframe')).toEqual({ type: 'xpath', value: '//iframe' });
+    expect(selectorLocator('css=#a > b')).toEqual({ type: 'css', value: '#a > b' });
+    expect(selectorLocator('//li')).toEqual({ type: 'xpath', value: '//li' });
+    expect(selectorLocator('(//li)[2]')).toEqual({ type: 'xpath', value: '(//li)[2]' });
+    expect(selectorLocator('../a')).toEqual({ type: 'xpath', value: '../a' });
+    expect(selectorLocator('iframe[name="pay"]')).toEqual({ type: 'css', value: 'iframe[name="pay"]' });
   });
 });

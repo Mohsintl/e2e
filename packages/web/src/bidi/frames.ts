@@ -6,6 +6,7 @@
  * the top-level viewport the pointer and the screenshot share.
  */
 
+import type { BrowsingContext } from 'webdriver-bidi-protocol';
 import { EngineError, type LocatorExpression, type SemanticNode } from 'e2e/engine';
 import { contentBox, frameContentInset, placeRectInFrame } from '../observation.ts';
 import type { BidiConnection } from './connection.ts';
@@ -28,6 +29,18 @@ function contentWindow(element: HTMLIFrameElement): Window | null {
 export async function contentContext(connection: BidiConnection, frame: NodeTarget): Promise<string | undefined> {
   const window = await callFunction(connection, frame.context, contentWindow, [frame.element]);
   return window instanceof WindowRef ? window.context : undefined;
+}
+
+/**
+ * A selector as a `browsingContext.locateNodes` locator, read as Playwright
+ * reads one: an `xpath=` or `css=` prefix names its engine, and an
+ * unprefixed one is XPath when it starts with `/`, `..`, or a parenthesized
+ * path such as `(//li)[2]`, else CSS.
+ */
+export function selectorLocator(selector: string): BrowsingContext.Locator {
+  if (selector.startsWith('xpath=')) return { type: 'xpath', value: selector.slice('xpath='.length) };
+  if (selector.startsWith('css=')) return { type: 'css', value: selector.slice('css='.length) };
+  return /^\(*(\/|\.\.)/.test(selector) ? { type: 'xpath', value: selector } : { type: 'css', value: selector };
 }
 
 /** The iframe that holds each child context the surface entered, by child context. */
@@ -117,7 +130,7 @@ export async function resolveFrames(
 ): Promise<string> {
   let context = top;
   for (const selector of selectors) {
-    const { nodes } = await connection.send('browsingContext.locateNodes', { context, locator: { type: 'css', value: selector } });
+    const { nodes } = await connection.send('browsingContext.locateNodes', { context, locator: selectorLocator(selector) });
     const iframes = nodes.filter((node) => node.value?.localName === 'iframe' || node.value?.localName === 'frame');
     if (iframes.length === 0) {
       throw new EngineError('FRAME_NOT_FOUND', `no frame matches ${selector}`, { retryable: true });
