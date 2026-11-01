@@ -16,7 +16,7 @@
 
 import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { browserName, content, CROSS } from './helpers.ts';
+import { bidiGap, browserName, content, CROSS, driver } from './helpers.ts';
 
 /** Records the last keydown in `window.lastEvent`, Playwright's `captureLastKeydown`. */
 const captureLastKeydown = `() => {
@@ -99,7 +99,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should dispatch key events in separate tasks', async ({ browser }) => {
-    test.skip(browserName === 'firefox', 'Firefox/Juggler dispatches keydown and keypress in the same task');
+    test.skip(browserName === 'firefox' && driver === 'playwright', 'Firefox/Juggler dispatches keydown and keypress in the same task');
     await browser.goto(content('<input>'));
     await browser.evaluate(`() => {
       window.log = [];
@@ -235,6 +235,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should shift raw codes', async ({ browser }) => {
+    bidiGap('Chromium does not shift a digit key held with Shift over BiDi, so Shift+Digit3 types 3; Playwright\'s own BiDi backend fails here too (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.goto('/input/keyboard.html');
     await browser.keyboard.press('Shift+Digit3');
     expect(await browser.evaluate('getResult()')).toBe(
@@ -353,6 +354,7 @@ test.describe('page keyboard', { requires: ['browser'] }, () => {
   });
 
   test('should press audio and media control keys', async ({ browser }) => {
+    bidiGap('WebDriver defines no key values for the media keys; Playwright\'s own BiDi backend fails here too (tests/bidi/expectations/moz-firefox-nightly-page.txt)', 'firefox');
     await browser.goto(content('<input autofocus>'));
     await browser.locator('input').focus();
     await browser.evaluate(captureLastKeydown);

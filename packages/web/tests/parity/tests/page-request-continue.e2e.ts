@@ -14,7 +14,7 @@
 
 import { test, type Browser } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { browserName, content, CROSS, PREFIX, e2eGap } from './helpers.ts';
+import { bidiGap, browserName, content, CROSS, e2eGap, PREFIX } from './helpers.ts';
 
 const EMPTY_PAGE = `${PREFIX}/empty.html`;
 
@@ -51,6 +51,7 @@ test.describe('page request continue', { requires: ['browser'] }, () => {
   });
 
   test('should not allow to override unsafe HTTP headers', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend fails it on Chromium (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.route('**/*', (route) => route.continue({ headers: { ...route.request.headers, host: 'bar', trailer: 'baz' } }));
     await browser.goto('/cors-echo');
     const serverRequest = await served(browser);
@@ -239,6 +240,7 @@ test.describe('page request continue', { requires: ['browser'] }, () => {
   });
 
   test('continue with headers should send fresh cookie from the browser cookie store', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend fails it in Firefox (tests/bidi/expectations/moz-firefox-nightly-page.txt)', 'firefox');
     await browser.goto('/set-cookie?cookie=foo=v1;');
     expect(await browser.evaluate('() => document.cookie')).toBe('foo=v1');
     await browser.route('**/cors-echo', async (route) => {

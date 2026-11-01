@@ -75,7 +75,7 @@ test.describe('locator query', { requires: ['browser'] }, () => {
 
   test('should filter by regex with a single quote', async ({ screen, browser }) => {
     await browser.goto(content(`<button>let's let's<span>hello</span></button>`));
-    for (const pattern of [/let's/i, /let\'s/i, /'s/i, /\'s/i, /let['abc]s/i, /let's let\'s/i, /let\'s let's/i]) {
+    for (const pattern of [/let's/i, /let's/i, /'s/i, /'s/i, /let['abc]s/i, /let's let's/i, /let's let's/i]) {
       await expect.soft(browser.locator('button').filter({ hasText: pattern }).getByText('hello')).toHaveText('hello');
       await expect.soft(screen.getByRole('button', { name: pattern }).getByText('hello')).toHaveText('hello');
     }
@@ -83,9 +83,9 @@ test.describe('locator query', { requires: ['browser'] }, () => {
     await expect.soft(screen.getByRole('button', { name: /let\\'s/i })).not.toBeVisible();
 
     await browser.goto(content(`<button>let\\'s let\\'s<span>hello</span></button>`));
-    await expect.soft(browser.locator('button').filter({ hasText: /let\'s/i })).not.toBeVisible();
-    await expect.soft(screen.getByRole('button', { name: /let\'s/i })).not.toBeVisible();
-    for (const pattern of [/let\\'s/i, /let\\\'s/i, /let\\'s let\\\'s/i, /let\\\'s let\\'s/i]) {
+    await expect.soft(browser.locator('button').filter({ hasText: /let's/i })).not.toBeVisible();
+    await expect.soft(screen.getByRole('button', { name: /let's/i })).not.toBeVisible();
+    for (const pattern of [/let\\'s/i, /let\\'s/i, /let\\'s let\\'s/i, /let\\'s let\\'s/i]) {
       await expect.soft(browser.locator('button').filter({ hasText: pattern }).getByText('hello')).toHaveText('hello');
       await expect.soft(screen.getByRole('button', { name: pattern }).getByText('hello')).toHaveText('hello');
     }

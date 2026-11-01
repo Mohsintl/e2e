@@ -25,7 +25,7 @@
 
 import { test, type WebRoute } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { browserName, content, CROSS, PREFIX, e2eGap } from './helpers.ts';
+import { bidiGap, browserName, content, CROSS, driver, e2eGap, PREFIX } from './helpers.ts';
 
 const EMPTY_PAGE = `${PREFIX}/empty.html`;
 
@@ -160,6 +160,7 @@ test.describe('page route', { requires: ['browser'] }, () => {
   });
 
   test('should not override cookie header', async ({ browser }) => {
+    bidiGap('BiDi network.continueRequest headers replace the cookies the browser sends; Playwright\'s own BiDi backend fails it on Chromium and times out in Firefox (tests/bidi/expectations/bidi-chromium-page.txt, moz-firefox-nightly-page.txt)');
     await browser.goto(EMPTY_PAGE);
     await browser.evaluate("() => { document.cookie = 'original=value'; }");
     let cookieValueInRoute: string | undefined;
@@ -269,7 +270,8 @@ test.describe('page route', { requires: ['browser'] }, () => {
     await browser.route('**/*', (route) => route.abort());
     const error = await browser.goto(EMPTY_PAGE).catch((caught: Error) => caught);
     expect(error).toBeTruthy();
-    if (browserName === 'firefox') expect((error as Error).message).toContain('NS_ERROR_FAILURE');
+    if (browserName === 'firefox' && driver === 'bidi') expect((error as Error).message).toContain('NS_ERROR_ABORT');
+    else if (browserName === 'firefox') expect((error as Error).message).toContain('NS_ERROR_FAILURE');
     else expect((error as Error).message).toContain('net::ERR_FAILED');
   });
 
@@ -437,6 +439,7 @@ test.describe('page route', { requires: ['browser'] }, () => {
   });
 
   test('should add Access-Control-Allow-Origin by default when fulfill', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend fails it on Chromium (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.goto(EMPTY_PAGE);
     await browser.route('**/cars', (route) => route.fulfill({ contentType: 'application/json', status: 200, body: JSON.stringify(['electric', 'gas']) }));
     const [result, response] = await Promise.all([
@@ -501,6 +504,7 @@ test.describe('page route', { requires: ['browser'] }, () => {
   });
 
   test('should not auto-intercept non-preflight OPTIONS with network interception', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend fails it on Chromium (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.goto(EMPTY_PAGE);
     const key = `options-${Date.now()}-${Math.random()}`;
     await browser.route('**/options?*', (route) => route.continue());
@@ -514,11 +518,12 @@ test.describe('page route', { requires: ['browser'] }, () => {
     expect(text1).toBe('Hello');
     expect(text2).toBe('World');
     const requests = await browser.evaluate('(key) => fetch(`/options-log?key=${key}`).then((response) => response.json())', key);
-    if (browserName === 'chromium') expect(requests).toEqual(['OPTIONS:/options', 'GET:/options']);
+    if (browserName === 'chromium' || driver === 'bidi') expect(requests).toEqual(['OPTIONS:/options', 'GET:/options']);
     else expect(requests).toEqual(['OPTIONS:/options', 'OPTIONS:/options', 'GET:/options']);
   });
 
   test('should support cors with POST', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend fails it on Chromium (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.goto(EMPTY_PAGE);
     await browser.route('**/cars', (route) => route.fulfill({
       contentType: 'application/json',
@@ -539,6 +544,7 @@ test.describe('page route', { requires: ['browser'] }, () => {
   });
 
   test('should support cors with credentials', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend fails it on Chromium (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.goto(EMPTY_PAGE);
     await browser.route('**/cars', (route) => route.fulfill({
       contentType: 'application/json',
@@ -592,6 +598,7 @@ test.describe('page route', { requires: ['browser'] }, () => {
   });
 
   test('should support cors for different methods', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend fails it on Chromium (tests/bidi/expectations/bidi-chromium-page.txt)', 'chromium');
     await browser.goto(EMPTY_PAGE);
     await browser.route('**/cars', (route) => route.fulfill({
       contentType: 'application/json',

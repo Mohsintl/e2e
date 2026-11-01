@@ -32,7 +32,7 @@ import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
 import fs from 'node:fs';
 import path from 'node:path';
-import { browserName, content, PREFIX, e2eGap } from './helpers.ts';
+import { browserName, content, driver, e2eGap, PREFIX } from './helpers.ts';
 
 /** `/respond` answering with `headers` and `body`. */
 function respond(headers: Record<string, string>, body = 'Hello world'): string {
@@ -183,6 +183,7 @@ test.describe('download', { requires: ['browser'] }, () => {
   });
 
   test('should be able to download a inline PDF file via navigation', async ({ browser }) => {
+    test.skip(browserName === 'firefox' && driver === 'bidi', 'We expect PDF Viewer to open up in Firefox with Bidi');
     await browser.goto('/empty.html');
     await browser.goto(content('<a href="/empty.pdf">open</a>'));
     const download = await browser.waitForDownload(() => browser.locator('a').tap());

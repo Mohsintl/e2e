@@ -16,7 +16,7 @@ import { expect } from 'e2e';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { content, PREFIX } from './helpers.ts';
+import { bidiGap, content, PREFIX } from './helpers.ts';
 
 const EMPTY_PAGE = `${PREFIX}/empty.html`;
 
@@ -67,6 +67,7 @@ test.describe('page set input files', { requires: ['browser'] }, () => {
   });
 
   test('should upload a folder', async ({ browser }) => {
+    bidiGap('Firefox input.setFiles refuses a directory; Playwright\'s own BiDi backend fails it too (tests/bidi/expectations/moz-firefox-nightly-page.txt)', 'firefox');
     await browser.goto('/input/folderupload.html');
     const dir = path.join(outputDir(), 'file-upload-test');
     fs.mkdirSync(dir, { recursive: true });

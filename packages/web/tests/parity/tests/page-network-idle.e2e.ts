@@ -14,7 +14,7 @@
 
 import { test, type Browser } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { content, PREFIX } from './helpers.ts';
+import { bidiGap, content, PREFIX } from './helpers.ts';
 
 const EMPTY_PAGE = `${PREFIX}/empty.html`;
 
@@ -144,6 +144,7 @@ test.describe('page network idle', { requires: ['browser'] }, () => {
   });
 
   test('should not wait for an open EventSource connection', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend times out on it in Firefox (tests/bidi/expectations/moz-firefox-nightly-page.txt)', 'firefox');
     const page = content("<script>new EventSource('/sse');</script>");
     const [response] = await Promise.all([
       browser.waitForResponse('**/content?**'),
@@ -153,6 +154,7 @@ test.describe('page network idle', { requires: ['browser'] }, () => {
   });
 
   test('should not wait for an open EventSource connection in setContent', async ({ browser }) => {
+    bidiGap('Playwright\'s own BiDi backend times out on it in Firefox (tests/bidi/expectations/moz-firefox-nightly-page.txt)', 'firefox');
     await browser.goto(EMPTY_PAGE);
     await browser.goto(content(`<script>
       window.__sseOpened = new Promise(resolve => {

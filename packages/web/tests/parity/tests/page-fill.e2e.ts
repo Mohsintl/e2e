@@ -11,7 +11,7 @@
 
 import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { browserName, content } from './helpers.ts';
+import { browserName, driver, content } from './helpers.ts';
 
 /** Five pairs of animation frames, Playwright's `rafraf(page, 5)`, so a pending fill has had its chance. */
 const giveItAChanceToFill = '() => new Promise((resolve) => { let frames = 0; const step = () => (++frames === 10 ? setTimeout(resolve, 0) : requestAnimationFrame(step)); requestAnimationFrame(step); })';
@@ -187,7 +187,7 @@ test.describe('page fill', { requires: ['browser'] }, () => {
   });
 
   test('should fill contenteditable with new lines', async ({ browser }) => {
-    test.skip(browserName === 'firefox', 'Firefox does not handle new lines in contenteditable');
+    test.skip(browserName === 'firefox' && driver === 'playwright', 'Firefox does not handle new lines in contenteditable');
     await browser.goto('/empty.html');
     await browser.goto(content('<div contenteditable="true"></div>'));
     await browser.locator('div[contenteditable]').fill('John\nDoe');
@@ -195,7 +195,7 @@ test.describe('page fill', { requires: ['browser'] }, () => {
   });
 
   test('should not double-fill in contenteditable with beforeinput handler in Firefox', async ({ browser }) => {
-    test.skip(browserName === 'firefox', 'https://github.com/microsoft/playwright/issues/36715');
+    test.skip(browserName === 'firefox' && driver === 'playwright', 'https://github.com/microsoft/playwright/issues/36715');
     await browser.goto(content(`
       <div id="editor" contenteditable="true"></div>
       <script>
