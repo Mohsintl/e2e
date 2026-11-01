@@ -18,11 +18,20 @@ export class WindowRef {
   constructor(readonly context: string) {}
 }
 
+/**
+ * A page value with no JSON form (a date, a map, a bigint, a function), kept
+ * as its type, so a caller that wants JSON refuses it rather than read it as
+ * `undefined`.
+ */
+export class UnreadableValue {
+  constructor(readonly type: string) {}
+}
+
 /** What a page function may take: JSON values and element references. */
 export type PageArgument = string | number | boolean | null | ElementRef | readonly PageArgument[] | { readonly [key: string]: PageArgument };
 
-/** What a page function hands back: JSON values, each DOM node as its reference, each window as its browsing context. */
-export type PageValue = string | number | boolean | null | undefined | ElementRef | WindowRef | PageValue[] | { [key: string]: PageValue };
+/** What a page function hands back: JSON values, each DOM node as its reference, each window as its browsing context, anything else as an `UnreadableValue`. */
+export type PageValue = string | number | boolean | null | undefined | ElementRef | WindowRef | UnreadableValue | PageValue[] | { [key: string]: PageValue };
 
 /** A page function: a self-contained function serialized with `toString()`, or source composed from one. */
 export type PageFunction = string | ((...args: never[]) => unknown);
@@ -88,7 +97,7 @@ function toLocalValue(value: PageArgument): Script.LocalValue {
 
 /**
  * One serialized result as a plain value: a node becomes its reference, a
- * window its context, anything unreadable undefined. Object keys are
+ * window its context, any other type an `UnreadableValue`. Object keys are
  * defined as own properties, so a `__proto__` key in page data is a key.
  */
 function fromRemoteValue(value: Script.RemoteValue): PageValue {
@@ -117,6 +126,6 @@ function fromRemoteValue(value: Script.RemoteValue): PageValue {
       if (value.sharedId === undefined) throw new EngineError('NODE_STALE', 'a returned node has no shared id', { retryable: true });
       return new ElementRef(value.sharedId);
     default:
-      return undefined;
+      return new UnreadableValue(value.type);
   }
 }

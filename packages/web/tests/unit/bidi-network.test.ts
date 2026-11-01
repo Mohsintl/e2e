@@ -265,4 +265,32 @@ describe('AttemptNetwork', () => {
     await settle();
     expect(routed).toBe(1);
   });
+
+  it('reads the body of a response whose load completes in the same burst as its headers', async () => {
+    const fake = new FakeBidi().on('network.getData', { result: { bytes: { type: 'string', value: 'fast' } } });
+    const { net } = network(fake);
+    await net.bind('user-1');
+    const waiting = net.waitForResponse(() => true, AbortSignal.timeout(5_000));
+    const event = { ...request('fast', `${SITE}/fast`, []), response: { url: `${SITE}/fast`, status: 200, headers: [] } };
+    fake.emit('network.responseStarted', event);
+    fake.emit('network.responseCompleted', event);
+    const response = await waiting;
+    await expect(response.body().then(String)).resolves.toBe('fast');
+  });
+
+  it('marks a held request body the browser did not keep, so it is never replayed empty', async () => {
+    const fake = new FakeBidi().on('network.getData', () => ({ error: 'no such network data', message: 'evicted' }));
+    const { net } = network(fake);
+    await net.bind('user-1');
+    await net.addContext('tab');
+    let seen: unknown;
+    await net.addRoute(route(() => true, async (held, decisions) => {
+      seen = held;
+      await decisions.continue();
+    }));
+    const posted = request('post', `${SITE}/upload`);
+    fake.emit('network.beforeRequestSent', { ...posted, request: { ...(posted['request'] as object), method: 'POST', bodySize: 30_000_000 } });
+    await settle();
+    expect(seen).toMatchObject({ bodyUnavailable: true });
+  });
 });

@@ -28,6 +28,8 @@ export interface InterceptedRequest {
   readonly postData?: string;
   /** The same body as the browser sent it, byte for byte. */
   readonly body?: Buffer;
+  /** Whether the request had a body the browser kept none of (too large, a stream), so it cannot be replayed. */
+  readonly bodyUnavailable?: boolean;
   /** The cookies the browser sends with it, as one `cookie` header value. */
   readonly cookie?: string;
 }
@@ -352,15 +354,16 @@ export class AttemptNetwork {
     await this.continue(intercepted);
   }
 
-  /** The request's body when the collector kept one, as text and bytes; a body it did not keep (too large, a stream) is none. */
-  private async postData(request: Network.RequestData): Promise<{ postData?: string; body?: Buffer }> {
-    if (this.requestCollector === undefined || (request.bodySize ?? 0) === 0) return {};
+  /** The request's body when the collector kept one, as text and bytes; a body it did not keep (too large, a stream) is marked unavailable. */
+  private async postData(request: Network.RequestData): Promise<{ postData?: string; body?: Buffer; bodyUnavailable?: true }> {
+    if (request.bodySize === 0 || (request.bodySize === null && ['GET', 'HEAD'].includes(request.method))) return {};
+    if (this.requestCollector === undefined) return { bodyUnavailable: true };
     try {
       const { bytes } = await this.connection.send('network.getData', { dataType: 'request', request: request.request, collector: this.requestCollector });
       const body = bytes.type === 'string' ? Buffer.from(bytes.value) : Buffer.from(bytes.value, 'base64');
       return { postData: body.toString(), body };
     } catch (cause) {
-      if (cause instanceof BidiError && cause.error === 'no such network data') return {};
+      if (cause instanceof BidiError && cause.error === 'no such network data') return { bodyUnavailable: true };
       throw cause;
     }
   }
@@ -440,62 +443,72 @@ export class AttemptNetwork {
    * Resolves with the first response of the attempt's tab whose URL
    * `matches`, once its headers arrive. Its body is collected from the moment
    * of the call, so start the wait before the action that triggers the
-   * response; reading it waits for the load to finish.
+   * response; reading it waits for the load to finish. Loads that finish are
+   * tracked from the call on too, so one that completes in the same burst as
+   * its headers is never missed.
    */
   async waitForResponse(matches: (url: string) => boolean, signal: AbortSignal): Promise<ObservedResponse> {
     const connection = this.connection;
-    let off: () => void = () => undefined;
-    const started = new Promise<BidiEventParams<'network.responseStarted'>>((resolve) => {
-      off = connection.on('network.responseStarted', (event) => {
-        if (this.options.onPage(event.context) && matches(event.response.url)) resolve(event);
-      });
+    const wanted = (event: { readonly context: string | null; readonly request: Network.RequestData }): boolean =>
+      this.options.onPage(event.context) && matches(event.request.url);
+    const finished = new Map<string, string | null>();
+    let matched: string | undefined;
+    let settled: () => void = () => undefined;
+    const ended = (event: { readonly context: string | null; readonly request: Network.RequestData }, failure: string | null): void => {
+      if (matched === undefined ? !wanted(event) : event.request.request !== matched) return;
+      finished.set(event.request.request, failure);
+      settled();
+    };
+    const offs = [
+      connection.on('network.responseCompleted', (event) => ended(event, null)),
+      connection.on('network.fetchError', (event) => ended(event, event.errorText)),
+    ];
+    const stop = (): void => {
+      for (const off of offs.splice(0)) off();
+      this.pendingBodies.delete(stop);
+    };
+    this.pendingBodies.add(stop);
+    let started: (event: BidiEventParams<'network.responseStarted'>) => void = () => undefined;
+    const first = new Promise<BidiEventParams<'network.responseStarted'>>((resolve) => (started = resolve));
+    const offStart = connection.on('network.responseStarted', (event) => {
+      if (this.options.onPage(event.context) && matches(event.response.url)) started(event);
     });
     let subscription: string | undefined;
     try {
       const collector = await this.collectResponses();
       subscription = (await connection.send('session.subscribe', { events: ['network.responseStarted'], ...(this.userContext === undefined ? {} : { userContexts: [this.userContext] }) })).subscription;
-      const event = await raceAbort(started, signal, 'waitForResponse');
-      const loaded = this.loaded(event.request.request);
+      const event = await raceAbort(first, signal, 'waitForResponse');
+      const request = event.request.request;
+      matched = request;
+      for (const id of finished.keys()) if (id !== request) finished.delete(id);
+      const loaded = new Promise<void>((resolve, reject) => {
+        settled = () => {
+          if (!finished.has(request)) return;
+          stop();
+          const failure = finished.get(request);
+          if (failure == null) resolve();
+          else reject(new Error(failure));
+        };
+        settled();
+      });
+      loaded.catch(() => undefined);
       return {
         url: event.response.url,
         status: event.response.status,
         headers: headerRecord(event.response.headers),
         body: async () => {
           await loaded;
-          const data = await connection.send('network.getData', { dataType: 'response', request: event.request.request, collector });
+          const data = await connection.send('network.getData', { dataType: 'response', request, collector });
           return data.bytes.type === 'string' ? Buffer.from(data.bytes.value) : Buffer.from(data.bytes.value, 'base64');
         },
       };
+    } catch (cause) {
+      stop();
+      throw cause;
     } finally {
-      off();
+      offStart();
       if (subscription !== undefined) await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
     }
-  }
-
-  /** Settles once `request` finished loading, rejecting with the browser's error text when it failed. */
-  private loaded(request: string): Promise<void> {
-    const connection = this.connection;
-    const done = new Promise<void>((resolve, reject) => {
-      const offs = [
-        connection.on('network.responseCompleted', (event) => {
-          if (event.request.request === request) end(() => resolve());
-        }),
-        connection.on('network.fetchError', (event) => {
-          if (event.request.request === request) end(() => reject(new Error(event.errorText)));
-        }),
-      ];
-      const stop = (): void => {
-        for (const each of offs) each();
-        this.pendingBodies.delete(stop);
-      };
-      const end = (settle: () => void): void => {
-        stop();
-        settle();
-      };
-      this.pendingBodies.add(stop);
-    });
-    done.catch(() => undefined);
-    return done;
   }
 
   /** The bound user context's response collector, added once however many waits ask at the same time. */

@@ -6,7 +6,7 @@
 
 import type { Network, Storage } from 'webdriver-bidi-protocol';
 import type { Expectable, JsonValue } from 'e2e';
-import { Deadline, rejectUnknownOptions, toTextPattern, type EngineFixtureContext, type OperationContext, type TextPattern } from 'e2e/engine';
+import { Deadline, rejectUnknownOptions, TestError, toTextPattern, type EngineFixtureContext, type OperationContext, type TextPattern } from 'e2e/engine';
 import { createBrowserExpectation, declareBrowserFixture, frameScreen, requireSelector, type Browser, type BrowserExpectation, type Cookie } from '../browser.ts';
 import {
   cookieTargets,
@@ -172,12 +172,16 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
  * A held request as the shared route contract drives it. `fetch` replays it
  * from Node as the browser sent it (its body bytes, its cookies, and the
  * site headers) within the operation's budget, and stores the cookies the
- * response sets in the user context, as Playwright's `route.fetch` does.
+ * response sets in the user context, as Playwright's `route.fetch` does. A
+ * body the browser did not keep refuses the replay rather than send none.
  */
 function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, request: InterceptedRequest, decisions: RouteDecisions): RouteAdapter {
   return {
     request: { url: request.url, method: request.method, headers: request.headers, ...(request.postData === undefined ? {} : { postData: request.postData }) },
     fetch: async () => {
+      if (request.bodyUnavailable === true) {
+        throw new TestError('ACTION_FAILED', 'route.fetch: the browser kept none of the request body (too large or streamed), so the request cannot be replayed');
+      }
       const operation = context.operation();
       const signal = AbortSignal.any([operation.signal, AbortSignal.timeout(operation.timeoutMs)]);
       const fetched = await fetch(request.url, {
