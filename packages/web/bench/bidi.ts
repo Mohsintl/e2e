@@ -6,7 +6,7 @@
  * synthetic heavy page itself, so nothing leaves the machine.
  *
  *   pnpm build
- *   node packages/web/bench/bidi.ts [--iterations 20] [--browsers chromium,firefox] [--out bench.json]
+ *   node packages/web/bench/bidi.ts [--iterations 20] [--browsers chromium,firefox] [--out bidi-results.json]
  */
 
 import { spawn, execFileSync } from 'node:child_process';
@@ -25,7 +25,7 @@ const { values } = parseArgs({
     'cold-iterations': { type: 'string', default: '10' },
     browsers: { type: 'string', default: 'chromium,firefox' },
     drivers: { type: 'string', default: 'playwright,bidi' },
-    out: { type: 'string' },
+    out: { type: 'string', default: path.join(path.dirname(fileURLToPath(import.meta.url)), 'bidi-results.json') },
   },
 });
 const ITERATIONS = Number(values.iterations);
@@ -337,7 +337,7 @@ const meta = {
   iterations: ITERATIONS,
   coldIterations: COLD_ITERATIONS,
 };
-if (values.out !== undefined) writeFileSync(values.out, JSON.stringify({ meta, results }, null, 2));
+writeFileSync(values.out, JSON.stringify({ meta, results }, null, 2));
 
 const fmt = (ms: number) => (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1));
 for (const browser of BROWSERS) {
