@@ -21,14 +21,14 @@ import {
 } from 'e2e/engine';
 import { CLOSED_SHADOW_ROOTS_KEY } from '../closed-shadow.ts';
 import { frameSelectors } from '../locators.ts';
-import { assembleTree, isOnSiteFrame, ROOT_NODE_ID, toSemanticNode } from '../observation.ts';
+import { assembleTree, frameContentInset, isOnSiteFrame, ROOT_NODE_ID, toSemanticNode } from '../observation.ts';
 import { readPngSize } from '../observe.ts';
 import { SECURE_FIELD_SELECTOR, type RawNodeData } from '../read-node.ts';
 import { cancelled, message } from '../support.ts';
 import { BidiError } from './connection.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
 import { contentContext, inViewport, resolveFrames, selectorLocator, withinFrame, type NodeTarget } from './frames.ts';
-import { domReady, FRAME_INSET, LOCATE_READ, maskSecureFields, READ_TREE, unmaskSecureFields, type LocateMetadata, type TreeMetadata } from './page.ts';
+import { domReady, LOCATE_READ, maskSecureFields, READ_TREE, unmaskSecureFields, type LocateMetadata, type TreeMetadata } from './page.ts';
 import { ElementRef, type PageArgument } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -250,7 +250,7 @@ async function readFrame(
   budget: number,
   deadline: number,
 ): Promise<{ inset: Rect; captured: CapturedTree }> {
-  const inset = await session.read<Rect>(FRAME_INSET, [frame.element], undefined, frame.context);
+  const inset = await session.run(frameContentInset, [frame.element], frame.context);
   return { inset, captured: await captureTree(session, child, framePath, budget, deadline) };
 }
 

@@ -5,7 +5,6 @@
  */
 
 import { readSemanticsFunction } from '../in-page/read-semantics.ts';
-import { frameContentInset } from '../observation.ts';
 import type { RawNodeData, RawObservedNode } from '../read-node.ts';
 
 /**
@@ -133,8 +132,6 @@ export const LOCATE_READ = `(options, wants, key, structured) => {
   return [${NATIVE_JSON} ? JSON.stringify({ nodes, parents }) : null, elements];
 }`;
 
-/** An iframe element's content box inset, in its own document; see `frameContentInset`. */
-export const FRAME_INSET = `(element) => (${frameContentInset.toString()})(element)`;
 
 /** What `LOCATE_READ` reports beside the elements: each read and the index of its nearest read ancestor. */
 export interface LocateMetadata {
@@ -431,4 +428,9 @@ export function historyEntry(): string | null {
   if (document.readyState !== 'complete') return null;
   const key = (globalThis as { navigation?: { currentEntry?: { key?: string } | null } }).navigation?.currentEntry?.key;
   return key ?? `${location.href} ${JSON.stringify(history.state)}`;
+}
+
+/** The document's title. */
+export function documentTitle(): string {
+  return document.title;
 }

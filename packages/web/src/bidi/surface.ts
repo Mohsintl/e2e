@@ -48,6 +48,7 @@ import { pressSource } from './input.ts';
 import { connectBidiOverCdp, launchBidiBrowser, type BidiBrowser, type BidiBrowserName } from './launch.ts';
 import type { NetworkRoute, ObservedResponse } from './network.ts';
 import { locate, observe, traceScreen } from './observe.ts';
+import { documentTitle } from './page.ts';
 import type { PageArgument, PageValue } from './script.ts';
 import { BidiSession, ContextOwners, type SessionSettings } from './session.ts';
 import { captureState, restoreState } from './state.ts';
@@ -313,7 +314,7 @@ export class BidiSurface {
   }
 
   title(operation: OperationContext): Promise<string> {
-    return this.guard(operation, 'title', async (session) => String(await session.call('() => document.title')));
+    return this.guard(operation, 'title', (session) => session.run(documentTitle, []));
   }
 
   /** Calls a compiled page function (`compileEvaluation`) with `arg` and returns its whole result. */

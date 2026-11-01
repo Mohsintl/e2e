@@ -202,7 +202,7 @@ export function wheelSources(x: number, y: number, deltaX: number, deltaY: numbe
   return [{ type: 'wheel', id: 'wheel', actions: [{ type: 'scroll', x, y, deltaX, deltaY, origin: 'viewport' }] }];
 }
 
-function mouse(actions: Input.PointerSourceAction[]): Input.PointerSourceActions {
+export function mouse(actions: Input.PointerSourceAction[]): Input.PointerSourceActions {
   return { type: 'pointer', id: 'mouse', parameters: { pointerType: 'mouse' }, actions };
 }
 

@@ -14,6 +14,7 @@ import path from 'node:path';
 import type { Network } from 'webdriver-bidi-protocol';
 import { raceAbort } from 'e2e/engine';
 import { BidiError, type BidiConnection, type BidiEventParams } from './connection.ts';
+import { lowercaseNames } from '../protected-app.ts';
 import { releaseQuietly } from './errors.ts';
 
 /** A request the browser holds for a route to decide. */
@@ -360,7 +361,7 @@ export class AttemptNetwork {
     overrides: { url?: string; method?: string; headers?: Record<string, string>; postData?: string } = {},
   ): Promise<void> {
     const site = this.options.siteHeaders(overrides.url ?? request.url);
-    const headers = overrides.headers === undefined && site === undefined ? undefined : { ...lowercase(overrides.headers ?? request.headers), ...site };
+    const headers = overrides.headers === undefined && site === undefined ? undefined : { ...lowercaseNames(overrides.headers ?? request.headers), ...site };
     await this.connection.send('network.continueRequest', {
       request: request.id,
       ...(overrides.url === undefined ? {} : { url: overrides.url }),
@@ -375,7 +376,7 @@ export class AttemptNetwork {
     request: string,
     response: { status: number; headers: Record<string, string>; contentType?: string; body?: string; json?: unknown; path?: string },
   ): Promise<void> {
-    const headers = { ...lowercase(response.headers) };
+    const headers = { ...lowercaseNames(response.headers) };
     let body: Network.BytesValue;
     if (response.json !== undefined) {
       body = { type: 'string', value: JSON.stringify(response.json) };
@@ -541,9 +542,6 @@ function bytesText(value: Network.BytesValue): string {
   return value.type === 'string' ? value.value : Buffer.from(value.value, 'base64').toString();
 }
 
-function lowercase(headers: Readonly<Record<string, string>>): Record<string, string> {
-  return Object.fromEntries(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]));
-}
 
 function wireHeaders(headers: Readonly<Record<string, string>>): Network.Header[] {
   return Object.entries(headers).map(([name, value]) => ({ name, value: { type: 'string', value } }));

@@ -8,19 +8,21 @@
  * the page does not start stays plain pointer moves.
  */
 
-import type { Input } from 'webdriver-bidi-protocol';
 import type { BidiConnection } from './connection.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
+import { mouse } from './input.ts';
 import { callFunction } from './script.ts';
 
 type Point = { readonly x: number; readonly y: number };
 
 /** Records, in the page, whether the next mouse move started a drag the page did not cancel. */
-const WATCH_DRAG = `() => {
+function watchDrag(): void {
   let started = Promise.resolve(false);
-  let drag = null;
-  const onDrag = (event) => { drag = event; };
-  const onMove = () => {
+  let drag: DragEvent | null = null;
+  const onDrag = (event: DragEvent): void => {
+    drag = event;
+  };
+  const onMove = (): void => {
     started = new Promise((resolve) => {
       window.addEventListener('dragstart', onDrag, { once: true, capture: true });
       setTimeout(() => resolve(drag !== null && !drag.defaultPrevented), 0);
@@ -33,12 +35,12 @@ const WATCH_DRAG = `() => {
     window.removeEventListener('dragstart', onDrag, { capture: true });
     return value;
   });
-}`;
+}
 
-const DRAG_STARTED = `() => { const check = Reflect.get(window, Symbol.for('e2e.drag')); return check === undefined ? false : check(); }`;
-
-function mouse(actions: Input.PointerSourceAction[]): Input.PointerSourceActions {
-  return { type: 'pointer', id: 'mouse', parameters: { pointerType: 'mouse' }, actions };
+/** Whether the move `watchDrag` watched started a drag. */
+function dragStarted(): Promise<boolean> | boolean {
+  const check = Reflect.get(window, Symbol.for('e2e.drag')) as (() => Promise<boolean>) | undefined;
+  return check === undefined ? false : check();
 }
 
 /**
@@ -70,7 +72,7 @@ export async function chromiumDrag(
       actions: [mouse([{ type: 'pointerMove', x: from.x, y: from.y, origin: 'viewport' }, { type: 'pointerDown', button: 0 }])],
     });
     // Armed after the press: armed before, it latches onto the move to the press point and misses the drag.
-    await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, WATCH_DRAG), undefined)));
+    await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, watchDrag), undefined)));
     await cdp('Input.setInterceptDrags', { enabled: true });
     try {
       await connection.send('input.performActions', {
@@ -78,7 +80,7 @@ export async function chromiumDrag(
         // One discrete move, as Playwright's: an interpolated one would be checked before it passed the drag threshold.
         actions: [mouse([{ type: 'pointerMove', x: first.x, y: first.y, origin: 'viewport' }])],
       });
-      const started = await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, DRAG_STARTED, [], { awaitPromise: true }), false)));
+      const started = await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, dragStarted, [], { awaitPromise: true }), false)));
       if (started.includes(true)) data = await dragData;
     } finally {
       await releaseQuietly(cdp('Input.setInterceptDrags', { enabled: false }));
