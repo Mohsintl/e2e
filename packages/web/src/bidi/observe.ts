@@ -16,6 +16,7 @@ import {
   type LocatorExpression,
   type ObservationPixels,
   type SemanticNode,
+  type SemanticQuery,
   type TextPattern,
   type ViewportSize,
   withTimeout,
@@ -28,7 +29,7 @@ import { SECURE_FIELD_SELECTOR, type RawNodeData } from '../read-node.ts';
 import { cancelled } from '../support.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
 import { contentContext, inViewport, resolveFrames, selectElements, withinFrame, type NodeTarget } from './frames.ts';
-import { domReady, LOCATE_READ, maskSecureFields, READ_TREE, unmaskSecureFields, type LocateMetadata, type TreeMetadata } from './page.ts';
+import { domReady, LOCATE_READ, type PlaywrightAria, maskSecureFields, READ_TREE, unmaskSecureFields, type LocateMetadata, type TreeMetadata } from './page.ts';
 import { ElementRef, type PageArgument } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -102,9 +103,9 @@ export async function traceScreen(session: BidiSession, signal: AbortSignal): Pr
  * Resolves one expression with the contract's reference semantics
  * (`resolveExpression`) over node-mode reads of the elements its queries
  * could match, in the document its frame chain names; a `selector` is
- * answered by `browsingContext.locateNodes`, a label query by any one of a
- * control's labels, and a display-value query by controls that display
- * their value, as the Playwright driver reads both.
+ * answered by `browsingContext.locateNodes`; text, label, display-value,
+ * and role queries and text filters follow Playwright's own engines
+ * (`playwrightMatches`), so both drivers answer one locator alike.
  */
 export async function locate(session: BidiSession, expression: LocatorExpression): Promise<SemanticNode[]> {
   const chain = frameSelectors(expression);
@@ -118,18 +119,17 @@ export async function locate(session: BidiSession, expression: LocatorExpression
   let [metadata, elements] = await readLocated(false);
   if (metadata === null) [metadata, elements] = await readLocated(true);
   // oxlint-disable-next-line e2e/no-unchecked-json -- page-reported reads; the alignment below is checked
-  const { nodes, parents, valued } = typeof metadata === 'string' ? (JSON.parse(metadata) as LocateMetadata) : (metadata as LocateMetadata);
-  if (!Array.isArray(nodes) || !Array.isArray(parents) || !Array.isArray(valued) || nodes.length !== elements.length || parents.length !== nodes.length || valued.length !== nodes.length) {
+  const { nodes, parents, valued, aria } = typeof metadata === 'string' ? (JSON.parse(metadata) as LocateMetadata) : (metadata as LocateMetadata);
+  if (!Array.isArray(nodes) || !Array.isArray(parents) || !Array.isArray(valued) || !Array.isArray(aria) || [parents, valued, aria, elements].some((list) => list.length !== nodes.length)) {
     throw new EngineError('ENGINE_FAILURE', 'located reads do not align with their elements', { retryable: false });
   }
   const first = session.refs.reserveIds(nodes.length);
   const ids = nodes.map((_node, index) => `n${first + index}`);
   const sharedIds = new Map(ids.map((id, index) => [id, elements[index]!.sharedId]));
-  const labels = new Map(nodes.map((node, index) => [ids[index]!, node.labels ?? []]));
-  const displayed = new Set(ids.filter((_id, index) => valued[index]));
+  const reads = new Map(ids.map((id, index) => [id, { labels: nodes[index]!.labels ?? [], valued: valued[index]!, aria: aria[index]! }]));
   const matches = resolveExpression(inner, buildForest(nodes, parents, ids), {
-    label: (node, pattern) => (labels.get(node.ref.id) ?? []).some((label) => matchesText(label, pattern)),
-    displayValue: (node, pattern) => displayed.has(node.ref.id) && node.value !== undefined && matchesText(node.value, pattern),
+    matches: (node, query) => playwrightMatches(node, query, reads.get(node.ref.id)),
+    hasText: (node, pattern) => matchesText(reads.get(node.ref.id)?.aria.text ?? '', pattern),
     selector: (selector, candidates) => {
       const hits = selected.get(selector) ?? new Set<string>();
       return candidates.filter((node) => hits.has(sharedIds.get(node.ref.id) ?? ''));
@@ -140,6 +140,46 @@ export async function locate(session: BidiSession, expression: LocatorExpression
     const { children: _children, ...rest } = node;
     return inViewport(rest, frameBox, chain);
   });
+}
+
+/** What `playwrightMatches` reads of one located element. */
+interface LocatedRead {
+  readonly labels: readonly string[];
+  readonly valued: boolean;
+  readonly aria: PlaywrightAria;
+}
+
+/**
+ * Whether `node` matches `query` by Playwright's engines, the Playwright
+ * driver's semantics: a text query on the element's joined text, a label
+ * query on any one of its labels, a display value on controls that display
+ * one, and a role query that skips what is hidden from the accessibility
+ * tree (not merely unrendered) and tells a `mixed` or absent state from
+ * false. Other kinds keep the reference rules.
+ */
+function playwrightMatches(node: SemanticNode, query: SemanticQuery, read: LocatedRead | undefined): boolean | undefined {
+  if (read === undefined) return undefined;
+  switch (query.kind) {
+    case 'text':
+      return matchesText(read.aria.text, query.value);
+    case 'label':
+      return read.labels.some((label) => matchesText(label, query.value));
+    case 'displayValue':
+      return read.valued && node.value !== undefined && matchesText(node.value, query.value);
+    case 'role': {
+      if (query.value.kind !== 'string' || (node.role ?? '') !== query.value.value || read.aria.hidden) return false;
+      if (query.name !== undefined && !matchesText(node.name ?? '', query.name)) return false;
+      const states = query.states ?? {};
+      if (states.checked !== undefined && read.aria.checked !== states.checked) return false;
+      if (states.pressed !== undefined && read.aria.pressed !== states.pressed) return false;
+      if (states.expanded !== undefined && read.aria.expanded !== states.expanded) return false;
+      if (states.selected !== undefined && read.aria.selected !== states.selected) return false;
+      if (states.disabled !== undefined && (node.states?.disabled ?? false) !== states.disabled) return false;
+      return query.level === undefined || node.level === query.level;
+    }
+    default:
+      return undefined;
+  }
 }
 
 /** The shared ids every `selector` in the expression matches in `context`, read before the elements so one pass answers them all. */

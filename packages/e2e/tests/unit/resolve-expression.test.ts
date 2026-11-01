@@ -65,19 +65,19 @@ function ids(expression: LocatorExpression, nodes: readonly SemanticNode[] = SET
 }
 
 describe('resolveExpression', () => {
-  it('answers a display-value query through the engine’s predicate when it gives one', () => {
-    const matches = resolveExpression(query('displayValue', 'wifi'), SETTINGS, { displayValue: () => false });
-    expect(matches).toEqual([]);
-    expect(ids(query('displayValue', 'wifi'))).toEqual(['search']);
+  it('lets the engine decide a query, and leaves it to the reference rules when the engine has no answer', () => {
+    const labels: Record<string, string[]> = { search: ['Find', 'Search'] };
+    const matches = (candidate: SemanticNode, query: SemanticQuery): boolean | undefined =>
+      query.kind === 'label' ? (labels[candidate.ref.id] ?? []).some((label) => query.value.kind === 'string' && label === query.value.value) : undefined;
+    expect(resolveExpression(query('label', 'Find'), SETTINGS, { matches }).map((match) => match.ref.id)).toEqual(['search']);
+    expect(ids(query('label', 'Find'))).toEqual([]);
+    expect(resolveExpression(query('role', 'switch'), SETTINGS, { matches }).map((match) => match.ref.id)).toEqual(['airplane']);
   });
 
-  it('answers a label query through the engine’s label predicate when it gives one', () => {
-    const labels: Record<string, string[]> = { search: ['Find', 'Search'] };
-    const matches = resolveExpression(query('label', 'Find'), SETTINGS, {
-      label: (candidate, pattern) => (labels[candidate.ref.id] ?? []).some((label) => pattern.kind === 'string' && label === pattern.value),
-    });
-    expect(matches.map((match) => match.ref.id)).toEqual(['search']);
-    expect(ids(query('label', 'Find'))).toEqual([]);
+  it('lets the engine decide a hasText filter', () => {
+    const filtered: LocatorExpression = { kind: 'filter', source: { kind: 'query', query: { kind: 'role', value: exact('listitem') } }, hasText: exact('About') };
+    expect(resolveExpression(filtered, SETTINGS).map((match) => match.ref.id)).toEqual(['about']);
+    expect(resolveExpression(filtered, SETTINGS, { hasText: () => false })).toEqual([]);
   });
 
   it('answers role queries with name filters and skips hidden nodes', () => {

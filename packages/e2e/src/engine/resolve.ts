@@ -26,17 +26,14 @@ export interface ResolveExpressionOptions {
    */
   readonly selector?: (selector: string, candidates: readonly SemanticNode[]) => readonly SemanticNode[];
   /**
-   * Whether `node` is labelled by `pattern`, for a platform whose nodes carry
-   * labels beside their name (a control with two `<label>`s answers to each).
-   * Without it a label query matches the name.
+   * The platform's own answer for whether `node` matches `query`, for a
+   * platform whose query engine reads more than the tree carries (a
+   * browser's text, hidden, and state rules); undefined leaves the query to
+   * the reference rules below.
    */
-  readonly label?: (node: SemanticNode, pattern: TextPattern) => boolean;
-  /**
-   * Whether `node`'s displayed value matches `pattern`, for a platform where
-   * only some nodes with a value display it (a checkbox's submission value
-   * is no display value). Without it a display-value query matches any value.
-   */
-  readonly displayValue?: (node: SemanticNode, pattern: TextPattern) => boolean;
+  readonly matches?: (node: SemanticNode, query: SemanticQuery) => boolean | undefined;
+  /** Whether a `filter({ hasText })` keeps `node`, for the same kind of platform; without it, any text of the node or a descendant counts. */
+  readonly hasText?: (node: SemanticNode, pattern: TextPattern) => boolean;
 }
 
 /**
@@ -107,12 +104,10 @@ function resolve(
     case 'filter': {
       const source = resolve(expression.source, candidates, tree, options);
       return source.filter((node) => {
-        if (expression.hasText !== undefined && !subtreeHasText(node, candidates, tree, expression.hasText)) {
-          return false;
-        }
-        if (expression.hasNotText !== undefined && subtreeHasText(node, candidates, tree, expression.hasNotText)) {
-          return false;
-        }
+        const hasText = (pattern: TextPattern): boolean =>
+          options.hasText === undefined ? subtreeHasText(node, candidates, tree, pattern) : options.hasText(node, pattern);
+        if (expression.hasText !== undefined && !hasText(expression.hasText)) return false;
+        if (expression.hasNotText !== undefined && hasText(expression.hasNotText)) return false;
         if (expression.has !== undefined || expression.hasNot !== undefined) {
           const within = descendantsOf([node], candidates, tree);
           if (expression.has !== undefined && resolve(expression.has, within, tree, options).length === 0) return false;
@@ -205,6 +200,8 @@ const STATE_KEYS = ['checked', 'disabled', 'selected', 'expanded', 'pressed'] as
  */
 function matchesQuery(node: SemanticNode, query: SemanticQuery, options: ResolveExpressionOptions): boolean {
   if (query.visible === true && node.states?.hidden === true) return false;
+  const decided = options.matches?.(node, query);
+  if (decided !== undefined) return decided;
   switch (query.kind) {
     case 'role': {
       if (query.value.kind !== 'string') {
@@ -223,7 +220,6 @@ function matchesQuery(node: SemanticNode, query: SemanticQuery, options: Resolve
       return true;
     }
     case 'label':
-      if (options.label !== undefined) return options.label(node, query.value);
       return node.name !== undefined && matchesText(node.name, query.value);
     case 'placeholder': {
       const placeholder = node.attributes?.['placeholder'];
@@ -235,7 +231,6 @@ function matchesQuery(node: SemanticNode, query: SemanticQuery, options: Resolve
         (node.text !== undefined && matchesText(node.text, query.value))
       );
     case 'displayValue':
-      if (options.displayValue !== undefined) return options.displayValue(node, query.value);
       return node.value !== undefined && matchesText(node.value, query.value);
     case 'testId':
       return node.testId !== undefined && matchesText(node.testId, query.value);
