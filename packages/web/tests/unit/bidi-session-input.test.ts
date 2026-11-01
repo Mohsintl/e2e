@@ -1,15 +1,15 @@
-/** Input on a BiDi session: a modifier `keyboard.down` holds stays held through chords and modifier clicks until its `keyboard.up`. */
+/** A BiDi session's own state: held keys through chords and modifier clicks until their `keyboard.up`, and a user context that opens after the attempt closed. */
 
 import { describe, expect, it } from 'vitest';
 import { clickSources, fixtureKeySource } from '../../src/bidi/input.ts';
 import { BidiSession, ContextOwners } from '../../src/bidi/session.ts';
-import { FakeBidi } from '../helpers/bidi-fake.ts';
+import { FakeBidi, settle } from '../helpers/bidi-fake.ts';
 
 const SHIFT = '';
 
 /** A session on `fake` with its tab open. */
 function session(fake: FakeBidi): BidiSession {
-  const settings = { siteHeaders: () => undefined, holdRequests: false, media: {}, viewport: null };
+  const settings = { siteHeaders: () => undefined, holdRequests: false, media: {}, viewport: null, browser: 'chromium', initScripts: { forAttempt: () => [] }, permissions: [] };
   const attempt = { credentials: undefined };
   const created = new BidiSession({ connection: fake.connection, exclusive: true } as never, settings as never, attempt as never, new ContextOwners());
   created.context = 'tab';
@@ -56,5 +56,22 @@ describe('BidiSession.sendInput', () => {
     await held.sendInput([fixtureKeySource('Shift', 'keyDown', false)]);
     const last = fake.commands('input.performActions').at(-1)!.params['actions'] as { actions: { type: string; value?: string }[] }[];
     expect(last[0]!.actions).toEqual([{ type: 'keyDown', value: SHIFT }]);
+  });
+});
+
+describe('BidiSession.close', () => {
+  it('removes a user context that a reset opened after the attempt closed', async () => {
+    let created: (reply: { result: unknown }) => void = () => undefined;
+    const fake = new FakeBidi()
+      .on('browser.createUserContext', () => new Promise((resolve) => (created = resolve)))
+      .on('network.addDataCollector', { result: { collector: 'c' } });
+    const closing = session(fake);
+    const opening = closing.openUserContext();
+    await settle();
+    await closing.close();
+    created({ result: { userContext: 'late' } });
+    await expect(opening).rejects.toMatchObject({ code: 'CANCELLED' });
+    expect(fake.commands('browser.removeUserContext').map((command) => command.params['userContext'])).toEqual(['late']);
+    expect(fake.commands('script.addPreloadScript')).toEqual([]);
   });
 });

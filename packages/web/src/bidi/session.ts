@@ -12,7 +12,7 @@ import { CLOSED_SHADOW_ROOTS_INIT_SCRIPT } from '../closed-shadow.ts';
 import { DialogRouter } from '../dialogs.ts';
 import type { ConfiguredInitScripts } from '../init-scripts.ts';
 import type { WebMedia } from '../media.ts';
-import { ErrorLatch, invalidState, sanitizeFilename } from '../support.ts';
+import { cancelled, ErrorLatch, invalidState, sanitizeFilename } from '../support.ts';
 import type { WebScreencastOptions } from '../surface.ts';
 import type { BidiConnection } from './connection.ts';
 import { AttemptDownloads } from './downloads.ts';
@@ -178,6 +178,8 @@ export class BidiSession {
   /** The viewport `browser.setViewport` set for the rest of the attempt; the configured one until then. */
   private viewport: ViewportSize | null;
   private creating: Promise<string> | undefined;
+  /** Set by `close`: a user context that opens after it (a reset or restore the attempt gave up on) is removed at once. */
+  private closed = false;
   private preloads: string[] = [];
   private readonly addedScripts: string[] = [];
   private readonly granted = new Map<string, Promise<void>>();
@@ -231,6 +233,10 @@ export class BidiSession {
   async openUserContext(): Promise<void> {
     const connection = this.connection;
     const { userContext } = await connection.send('browser.createUserContext', {});
+    if (this.closed) {
+      await releaseQuietly(connection.send('browser.removeUserContext', { userContext }));
+      throw cancelled('the attempt closed while its user context opened');
+    }
     this.userContext = userContext;
     this.granted.clear();
     this.visited.clear();
@@ -256,6 +262,10 @@ export class BidiSession {
     ]);
     const failed = steps.find((step) => step.status === 'rejected');
     if (failed !== undefined) throw failed.reason;
+    if (this.closed) {
+      await releaseQuietly(this.dropUserContext());
+      throw cancelled('the attempt closed while its user context opened');
+    }
   }
 
   /**
@@ -265,7 +275,9 @@ export class BidiSession {
    */
   async dropUserContext(): Promise<void> {
     await this.video?.contextClosing();
-    await this.connection.send('browser.removeUserContext', { userContext: this.userContext });
+    const userContext = this.userContext;
+    this.userContext = '';
+    if (userContext !== '') await this.connection.send('browser.removeUserContext', { userContext });
     await Promise.all(this.preloads.map((script) => releaseQuietly(this.connection.send('script.removePreloadScript', { script }))));
     this.preloads = [];
     this.retireContext();
@@ -512,9 +524,11 @@ export class BidiSession {
   /**
    * Ends the attempt: its video, user context, network, and download
    * directory, each attempted whatever the others did; the first failure is
-   * reported once all ran. A browser already gone leaves only local work.
+   * reported once all ran. A browser already gone leaves only local work. A
+   * replacement user context still opening removes itself when it lands.
    */
   async close(): Promise<void> {
+    this.closed = true;
     const gone = this.connection.isClosed;
     const results = await settleEach([
       () => this.video?.stop(),

@@ -38,7 +38,9 @@ const ABORTED = new Set(['net::ERR_ABORTED', 'NS_BINDING_ABORTED']);
  * unsubscribe. A prompt in a context of another session (a browser shared
  * over CDP) is left for that session to answer. Where the app went is told
  * as the Playwright driver tells it (`app-log.ts`): its own navigations, the
- * tabs it opens, and the frames it loads, never the driver's.
+ * tabs it opens, and the frames it loads, never the driver's. Every origin a
+ * document starts or lands at (after a redirect) is visited, for its
+ * permissions and a saved session's storage.
  */
 export function routeEvents(connection: BidiConnection, owners: ContextOwners, current: () => BidiSession | undefined): () => void {
   const report = (entry: AppLogEntry): void => {
@@ -64,6 +66,7 @@ export function routeEvents(connection: BidiConnection, owners: ContextOwners, c
   const navigated = (event: { readonly context: string; readonly url: string }): void => {
     const session = ours(event.context);
     if (session === undefined || NO_PLACE.has(event.url) || event.url.startsWith('data:')) return;
+    void session.visit(event.url).catch((cause: unknown) => session.latch.latch(asError(cause)));
     if (owners.top(event.context) !== event.context) {
       went(`frame loaded ${event.url}`);
       return;

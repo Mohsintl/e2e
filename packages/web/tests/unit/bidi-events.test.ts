@@ -97,7 +97,7 @@ describe('routeEvents', () => {
     expect(log).toEqual([{ source: 'console', level: 'error', text: 'boom' }]);
   });
 
-  it('tells where the app went, never the driver’s own navigations, and grants each started navigation', async () => {
+  it('tells where the app went, never the driver’s own navigations, and visits every document it starts or lands at', async () => {
     const fake = new FakeBidi();
     const owners = new ContextOwners();
     const { session, state, lines, visited } = attempt(owners, 'mine');
@@ -128,6 +128,6 @@ describe('routeEvents', () => {
       'the app opened a new tab; the test stays on its page',
       'the new tab navigated to http://app.test/help/2',
     ]);
-    expect(visited).toEqual(['http://app.test/checkout']);
+    expect(new Set(visited)).toEqual(new Set(['http://app.test/', 'http://app.test/checkout', 'http://app.test/checkout?step=2', 'http://pay.test/embed', 'http://app.test/help', 'http://app.test/help/2']));
   });
 });
