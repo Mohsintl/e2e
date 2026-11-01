@@ -10,6 +10,7 @@ import { runRouteHandler, type RouteAdapter } from '../../src/browser-calls.ts';
 
 const context = { app: { resolveUrl: (url: string) => new URL(url, 'http://app.test').href } } as EngineFixtureContext;
 
+/** A route adapter that records what the route decided. */
 function adapter() {
   const calls: string[] = [];
   const held: RouteAdapter = {

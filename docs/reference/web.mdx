@@ -411,6 +411,7 @@ limits:
 | --- | --- |
 | No `'webkit'` | WebKit has no BiDi endpoint. |
 | `connect` is Chromium only | It attaches over CDP. |
+| Selectors are plain CSS or XPath: no `>>` chains or other Playwright selector engines, and no CSS combinator across a shadow root | The browser runs the selector itself, one shadow root at a time. |
 | `INVALID_CONFIG` for `connect.reconnectEndpoint` or a provider with `scope: 'attempt'` | Each attempt runs in its own user context, not a persistent one. |
 | HTML5 drag and drop drops no data on Firefox | [Firefox bug 1515879](https://bugzilla.mozilla.org/show_bug.cgi?id=1515879). Pointer drags work. |
 | `browser.emulateMedia` throws `UNSUPPORTED_CAPABILITY` on Firefox before 159 | [Firefox bug 2064354](https://bugzilla.mozilla.org/show_bug.cgi?id=2064354). `colorScheme` and `reducedMotion` in `web()` work. |
@@ -554,7 +555,8 @@ const conditions = browser.locator(
 ```
 
 - The selector is CSS by default, XPath with `xpath=` or a leading `//`, and
-  takes `>>` chains, so the example scopes CSS to one row.
+  takes `>>` chains, so the example scopes CSS to one row. The
+  [BiDi driver](#driver) takes plain CSS and XPath only.
 - Use `filter({ has })` for an element that contains another.
 
 | Throws | When |

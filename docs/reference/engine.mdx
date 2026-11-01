@@ -1535,6 +1535,12 @@ async locate(expression) {
 - An engine whose tree is the whole truth (a device) calls it; a browser
   engine reproduces it.
 - A `selector` expression needs the `selector` option.
+- A `label` query matches a node's `name`, unless the `label` option
+  `(node, pattern) => boolean` decides. Pass it when a node carries labels
+  beside its name, such as a control with two `<label>`s.
+- A `displayValue` query matches a node's `value`, unless the `displayValue`
+  option `(node, pattern) => boolean` decides. Pass it when some nodes carry
+  a value they don't display, such as a checkbox's submission value.
 - A `frame` expression is `FRAME_NOT_FOUND`.
 - A `union` expression matches either branch in document order, without duplicate nodes.
 

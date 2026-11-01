@@ -225,12 +225,14 @@ class ResourceMeter {
     this.baseline = processTree().cpu;
   }
 
+  /** Records the tree's memory now, and each process's CPU so far. */
   sample(): void {
     const { rssMb, cpu } = processTree();
     this.peakRss = Math.max(this.peakRss, rssMb);
     for (const [pid, seconds] of cpu) this.seen.set(pid, Math.max(this.seen.get(pid) ?? 0, seconds));
   }
 
+  /** The peak memory, and the CPU every process used since the meter started. */
   result(): { peakRssMb: number; cpuSeconds: number } {
     let total = 0;
     for (const [pid, seconds] of this.seen) total += seconds - (this.baseline.get(pid) ?? 0);
