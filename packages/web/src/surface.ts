@@ -261,11 +261,12 @@ export interface WebOptions {
    * The automation protocol that drives the browser: `playwright` (the
    * default) or `bidi`, WebDriver BiDi, for chromium and firefox. When unset,
    * the `E2E_WEB_DRIVER` environment variable picks it. The BiDi driver is
-   * experimental: it serves observation, locators, actions, the keyboard,
-   * navigation, and screenshots, and refuses the options and capabilities it
-   * does not implement yet (the `browser` fixture, video, saved sessions,
-   * request headers, basic auth, emulation, permissions, `connect`, and
-   * browser providers).
+   * experimental. It takes every option and fixture, except that `connect`
+   * is chromium only and has no `reconnectEndpoint` (nor a provider of
+   * `'attempt'` scope), downloads and uploads refuse a browser provider's
+   * remote browser, Firefox drops no HTML5 drag data and refuses
+   * `browser.emulateMedia` before version 159, and a saved session refuses an
+   * IndexedDB value that is not JSON or a date.
    */
   readonly driver?: WebDriverName;
 }

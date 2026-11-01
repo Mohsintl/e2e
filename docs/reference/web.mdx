@@ -61,6 +61,7 @@ web({ viewport: { width: 390, height: 844 }, locale: 'de-DE' });
 | [`colorScheme`](#media-emulation) | `'light' \| 'dark' \| 'no-preference'` | the browser's own |
 | [`reducedMotion`](#media-emulation) | `'reduce' \| 'no-preference'` | the browser's own |
 | [`initScripts`](#init-scripts) | `WebInitScript[]` | - |
+| [`driver`](#driver) | `'playwright' \| 'bidi'` | `'playwright'` |
 
 - A `web()` target needs `app.url` and refuses the device keys (`bundleId`,
   `appPath`, `launchArguments`). Its `app.permissions` takes `'grant'` only,
@@ -392,6 +393,29 @@ await app.open('/raffle');
 /** JavaScript source, a file relative to the project root, or a function. */
 export type WebInitScript = string | { readonly path: string } | (() => unknown);
 ```
+
+#### `driver`
+
+The protocol that drives the browser. `'bidi'` drives Chromium and Firefox
+over WebDriver BiDi instead of Playwright. It is experimental. When the
+option is unset, the `E2E_WEB_DRIVER` environment variable sets it.
+
+```ts
+web({ browser: 'firefox', driver: 'bidi' })
+```
+
+The BiDi driver runs the same tests, fixtures, and options, with these
+limits:
+
+| Limit | Why |
+| --- | --- |
+| No `'webkit'` | WebKit has no BiDi endpoint. |
+| `connect` is Chromium only | It attaches over CDP. |
+| `INVALID_CONFIG` for `connect.reconnectEndpoint` or a provider with `scope: 'attempt'` | Each attempt runs in its own user context, not a persistent one. |
+| HTML5 drag and drop drops no data on Firefox | [Firefox bug 1515879](https://bugzilla.mozilla.org/show_bug.cgi?id=1515879). Pointer drags work. |
+| `browser.emulateMedia` throws `UNSUPPORTED_CAPABILITY` on Firefox before 159 | [Firefox bug 2064354](https://bugzilla.mozilla.org/show_bug.cgi?id=2064354). `colorScheme` and `reducedMotion` in `web()` work. |
+| Downloads and `setInputFiles` throw `UNSUPPORTED_CAPABILITY` with a browser provider | The files are on another machine. |
+| A saved session throws `UNSUPPORTED_CAPABILITY` for an IndexedDB value that is not JSON or a `Date` | A `Blob` or class instance can't be restored. |
 
 ### The browser fixture
 
