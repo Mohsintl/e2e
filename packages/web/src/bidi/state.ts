@@ -1,23 +1,43 @@
-/** Saved sessions on the BiDi driver: a user context's cookies and its pages' localStorage. */
+/**
+ * Saved sessions on the BiDi driver: a user context's cookies, and the
+ * localStorage and IndexedDB of every web origin its documents were at.
+ * Each origin's storage is read and written from a blank document served at
+ * that origin in a scratch tab, so the app's server sees no request and the
+ * attempt's tab is untouched.
+ */
 
 import type { Network } from 'webdriver-bidi-protocol';
 import { EngineError, type EngineState } from 'e2e/engine';
 import { releaseQuietly } from './errors.ts';
+import type { PageJson } from './script.ts';
 import type { BidiSession } from './session.ts';
 
 const STATE_FORMAT = 'bidi-storage-state';
 
-/** One origin's localStorage in a saved state. */
-interface StoredOrigin {
+/** A stored value as JSON, a date or a non-finite number tagged. */
+type StoredValue = PageJson;
+
+/** One IndexedDB object store: its shape and records; a key is kept only for a store with no key path. */
+type StoredObjectStore = {
+  readonly name: string;
+  readonly keyPath: string | string[] | null;
+  readonly autoIncrement: boolean;
+  readonly indexes: { readonly name: string; readonly keyPath: string | string[]; readonly unique: boolean; readonly multiEntry: boolean }[];
+  readonly records: { readonly key: StoredValue; readonly value: StoredValue }[];
+};
+
+/** One origin's storage in a saved state. */
+type StoredOrigin = {
   readonly origin: string;
   readonly localStorage: readonly { readonly name: string; readonly value: string }[];
-}
+  readonly indexedDB: readonly { readonly name: string; readonly version: number; readonly stores: StoredObjectStore[] }[];
+};
 
-/** What a saved BiDi state holds: the user context's cookies and each saved origin's localStorage. */
-interface BidiStorageState {
+/** What a saved BiDi state holds. */
+type BidiStorageState = {
   readonly cookies: readonly Network.Cookie[];
   readonly origins: readonly StoredOrigin[];
-}
+};
 
 /** True for the saved-state shape; anything else is refused before it reaches the browser. */
 function isStorageState(data: unknown): data is BidiStorageState {
@@ -29,65 +49,148 @@ function isStorageState(data: unknown): data is BidiStorageState {
   );
 }
 
-const READ_LOCAL_STORAGE = `() => /^https?:$/.test(location.protocol)
-  ? { origin: location.origin, localStorage: Object.keys(localStorage).map((name) => ({ name, value: localStorage.getItem(name) })) }
-  : null`;
+/**
+ * Reads the document origin's localStorage and IndexedDB. A record value
+ * is kept as JSON with dates tagged; one that is neither (a Blob, a class
+ * instance) is refused by name, since restoring it would lose it.
+ */
+async function readOriginStorage(): Promise<StoredOrigin | string> {
+  const encode = (value: unknown, where: string): StoredValue => {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : { $number: String(value) };
+    if (value instanceof Date) return { $date: value.getTime() };
+    if (Array.isArray(value)) return value.map((each) => encode(each, where));
+    if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+      return Object.fromEntries(Object.entries(value).map(([key, each]) => [key, encode(each, where)]));
+    }
+    if (value === undefined) return { $undefined: true };
+    throw new Error(`${where} holds a ${Object.prototype.toString.call(value).slice(8, -1)}, which a saved session cannot keep`);
+  };
+  const request = <T>(op: IDBRequest<T>): Promise<T> => new Promise((resolve, reject) => {
+    op.addEventListener('success', () => resolve(op.result));
+    op.addEventListener('error', () => reject(op.error));
+  });
+  const localItems = Object.keys(localStorage).map((name) => ({ name, value: localStorage.getItem(name) ?? '' }));
+  const databases: StoredOrigin['indexedDB'][number][] = [];
+  try {
+    for (const info of await indexedDB.databases()) {
+      if (info.name === undefined) continue;
+      const db = await request(indexedDB.open(info.name));
+      try {
+        const stores: StoredObjectStore[] = [];
+        for (const storeName of db.objectStoreNames) {
+          const store = db.transaction(storeName, 'readonly').objectStore(storeName);
+          const keys = await request(store.getAllKeys());
+          const values = await request(store.getAll());
+          const where = `IndexedDB ${info.name}/${storeName}`;
+          stores.push({
+            name: storeName,
+            keyPath: store.keyPath,
+            autoIncrement: store.autoIncrement,
+            indexes: [...store.indexNames].map((indexName) => {
+              const index = store.index(indexName);
+              return { name: indexName, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry };
+            }),
+            records: keys.map((key, at) => ({ key: store.keyPath === null ? encode(key, where) : null, value: encode(values[at], where) })),
+          });
+        }
+        databases.push({ name: info.name, version: db.version, stores });
+      } finally {
+        db.close();
+      }
+    }
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause);
+  }
+  return { origin: location.origin, localStorage: localItems, indexedDB: databases };
+}
 
-const WRITE_LOCAL_STORAGE = '(items) => { localStorage.clear(); for (const { name, value } of items) localStorage.setItem(name, value); }';
+/** Writes one saved origin's localStorage and IndexedDB into the document's origin, replacing what it held. */
+async function writeOriginStorage(origin: StoredOrigin): Promise<void> {
+  const decode = (value: StoredValue): unknown => {
+    if (Array.isArray(value)) return value.map(decode);
+    if (value === null || typeof value !== 'object') return value;
+    if (typeof value['$date'] === 'number') return new Date(value['$date']);
+    if (typeof value['$number'] === 'string') return Number(value['$number']);
+    if (value['$undefined'] === true) return undefined;
+    return Object.fromEntries(Object.entries(value).map(([key, each]) => [key, decode(each)]));
+  };
+  localStorage.clear();
+  for (const { name, value } of origin.localStorage) localStorage.setItem(name, value);
+  for (const saved of origin.indexedDB) {
+    await new Promise<void>((resolve, reject) => {
+      const deleting = indexedDB.deleteDatabase(saved.name);
+      deleting.addEventListener('success', () => resolve());
+      deleting.addEventListener('error', () => reject(deleting.error));
+    });
+    const opening = indexedDB.open(saved.name, saved.version);
+    opening.addEventListener('upgradeneeded', () => {
+      for (const stored of saved.stores) {
+        const store = opening.result.createObjectStore(stored.name, { keyPath: stored.keyPath, autoIncrement: stored.autoIncrement });
+        for (const index of stored.indexes) store.createIndex(index.name, index.keyPath, { unique: index.unique, multiEntry: index.multiEntry });
+        for (const record of stored.records) {
+          if (stored.keyPath === null) store.put(decode(record.value), decode(record.key) as IDBValidKey);
+          else store.put(decode(record.value));
+        }
+      }
+    });
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      opening.addEventListener('success', () => resolve(opening.result));
+      opening.addEventListener('error', () => reject(opening.error));
+    });
+    db.close();
+  }
+}
 
-/** The user context's cookies and the open page's localStorage. */
+/** The user context's cookies and the storage of every web origin the attempt's documents were at. */
 export async function captureState(session: BidiSession): Promise<EngineState> {
   const { cookies } = await session.connection.send('storage.getCookies', { partition: session.partition() });
   const origins: StoredOrigin[] = [];
-  if (session.context !== undefined) {
-    const local = await session.read<StoredOrigin | null>(READ_LOCAL_STORAGE, [], { maxObjectDepth: null });
-    if (local !== null && local.localStorage.length > 0) origins.push(local);
-  }
+  await atEachOrigin(session, [...session.visited], async (origin, context) => {
+    const stored = await session.run(readOriginStorage, [], context);
+    if (typeof stored === 'string') throw new EngineError('UNSUPPORTED_CAPABILITY', `state capture: ${origin}: ${stored}`, { retryable: false });
+    if (stored.localStorage.length > 0 || stored.indexedDB.length > 0) origins.push(stored);
+  });
   const data: BidiStorageState = { cookies, origins };
   return { format: STATE_FORMAT, version: 1, data };
 }
 
-/**
- * Replaces the user context with a clean one holding the snapshot: cookies
- * through `storage.setCookie`, and each origin's localStorage written from
- * a blank document served at that origin through a network intercept, so
- * the app's server sees no request.
- */
+/** Replaces the user context with a clean one holding the snapshot: cookies through `storage.setCookie`, each origin's storage from its blank document. */
 export async function restoreState(session: BidiSession, state: EngineState): Promise<void> {
   if (state.format !== STATE_FORMAT || state.version !== 1 || !isStorageState(state.data)) {
     throw new EngineError('INVALID_STATE', `unsupported state format ${state.format}@${String(state.version)}`, { retryable: false });
   }
-  const connection = session.connection;
+  const { cookies, origins } = state.data;
   await session.replaceUserContext();
-  for (const { size: _size, ...cookie } of state.data.cookies) {
-    await connection.send('storage.setCookie', { cookie, partition: session.partition() });
+  for (const { size: _size, ...cookie } of cookies) {
+    await session.connection.send('storage.setCookie', { cookie, partition: session.partition() });
   }
-  if (state.data.origins.length === 0) return;
-  const context = await session.ensureContext();
-  const { intercept } = await connection.send('network.addIntercept', { phases: ['beforeRequestSent'], contexts: [context] });
-  const { subscription } = await connection.send('session.subscribe', { events: ['network.beforeRequestSent'], contexts: [context] });
-  let served: Error | undefined;
-  const off = connection.on('network.beforeRequestSent', (event) => {
-    if (event.context !== context || !event.isBlocked) return;
-    connection.send('network.provideResponse', {
-      request: event.request.request,
-      statusCode: 200,
-      headers: [{ name: 'content-type', value: { type: 'string', value: 'text/html' } }],
-      body: { type: 'string', value: '<!doctype html><title></title>' },
-    }).catch((cause: unknown) => {
-      served ??= cause instanceof Error ? cause : new Error(String(cause));
-    });
+  const byOrigin = new Map(origins.map((origin) => [origin.origin, origin]));
+  await atEachOrigin(session, [...byOrigin.keys()], async (origin, context) => {
+    await session.run(writeOriginStorage, [byOrigin.get(origin)!], context);
+  });
+}
+
+/** Runs `work` in a scratch tab of the user context at each origin in turn, on a blank document the network serves; the tab is closed after. */
+async function atEachOrigin(session: BidiSession, origins: readonly string[], work: (origin: string, context: string) => Promise<void>): Promise<void> {
+  if (origins.length === 0) return;
+  const connection = session.connection;
+  const { context } = await connection.send('browsingContext.create', {
+    type: session.settings.browser === 'firefox' ? 'window' : 'tab',
+    userContext: session.userContext,
+    background: true,
   });
   try {
-    for (const origin of state.data.origins) {
-      await connection.send('browsingContext.navigate', { context, url: `${origin.origin}/`, wait: 'complete' });
-      if (served !== undefined) throw served;
-      await session.call(WRITE_LOCAL_STORAGE, [origin.localStorage.map(({ name, value }) => ({ name, value }))]);
+    const undo = await session.network.serveBlank(context);
+    try {
+      for (const origin of origins) {
+        await connection.send('browsingContext.navigate', { context, url: `${origin}/`, wait: 'complete' });
+        await work(origin, context);
+      }
+    } finally {
+      await undo();
     }
   } finally {
-    off();
-    await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
-    await releaseQuietly(connection.send('network.removeIntercept', { intercept }));
+    await releaseQuietly(connection.send('browsingContext.close', { context }));
   }
-  await connection.send('browsingContext.navigate', { context, url: 'about:blank', wait: 'complete' });
 }
