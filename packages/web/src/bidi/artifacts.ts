@@ -4,6 +4,7 @@ import { writeFileSync } from 'node:fs';
 import type { VideoSegment } from 'e2e/engine';
 import { ProviderVideo } from '../provider-video.ts';
 import type { LeaseRecording } from '../provider.ts';
+import { releaseQuietly } from './errors.ts';
 import { maskedPixels } from './observe.ts';
 import type { BidiSession } from './session.ts';
 import { BidiVideo } from './video.ts';
@@ -22,7 +23,8 @@ export async function screenshot(session: BidiSession, label: string | undefined
 /**
  * Starts the attempt's video: the provider's recording of the browser when
  * `recorder` is given, else the open tab now and every tab the attempt opens
- * until it stops.
+ * until it stops. A start that finishes after `signal` aborted is stopped
+ * again, so no recording outlives the step that gave up on it.
  */
 export async function startVideo(session: BidiSession, recorder: ((signal: AbortSignal) => Promise<LeaseRecording>) | undefined, signal: AbortSignal): Promise<void> {
   if (recorder !== undefined) {
@@ -33,6 +35,10 @@ export async function startVideo(session: BidiSession, recorder: ((signal: Abort
   session.video ??= new BidiVideo(session.connection, session.settings.browser, session.attempt.artifactsDir, session.settings.screencast);
   const size = session.context === undefined ? (session.settings.viewport ?? DEFAULT_VIDEO_SIZE) : await session.viewportSize();
   await session.video.arm(session.context, size);
+  if (signal.aborted) {
+    await releaseQuietly(session.video.stop());
+    signal.throwIfAborted();
+  }
 }
 
 /** Finishes the attempt's recording and returns its segments. */

@@ -43,6 +43,10 @@ export class BidiVideo {
   private count = 0;
   private finished: VideoFile[] = [];
   private lost: { readonly relative: string; readonly cause: unknown } | undefined;
+  /** Bumped by every `stop`, so a segment whose start outlived the stop ends at once instead of recording on. */
+  private generation = 0;
+  /** Segment starts in flight, which `stop` waits out. */
+  private readonly starting = new Set<Promise<void>>();
 
   constructor(
     private readonly connection: BidiConnection,
@@ -54,12 +58,22 @@ export class BidiVideo {
   /** Starts recording `context`, unless a segment already records, and arms the recorder. */
   async arm(context: string | undefined, viewport: { width: number; height: number }): Promise<void> {
     this.armed = true;
-    if (this.current === undefined && context !== undefined) await this.begin(context, viewport);
+    if (this.current === undefined && context !== undefined) await this.tracked(this.begin(context, viewport));
   }
 
   /** A tab the attempt opened: the next segment, when armed. */
   async contextOpened(context: string, viewport: { width: number; height: number }): Promise<void> {
-    if (this.armed) await this.begin(context, viewport);
+    if (this.armed) await this.tracked(this.begin(context, viewport));
+  }
+
+  /** Keeps a segment start visible to `stop` until it settles. */
+  private async tracked(start: Promise<void>): Promise<void> {
+    this.starting.add(start);
+    try {
+      await start;
+    } finally {
+      this.starting.delete(start);
+    }
   }
 
   /** The recorded tab is about to close: its segment ends while it can still flush. */
@@ -75,6 +89,8 @@ export class BidiVideo {
    */
   async stop(): Promise<readonly VideoFile[]> {
     this.armed = false;
+    this.generation += 1;
+    await Promise.allSettled(this.starting);
     await this.end();
     const lost = this.lost;
     this.lost = undefined;
@@ -87,6 +103,7 @@ export class BidiVideo {
   /** Ends any segment in progress and starts the next on `context`. */
   private async begin(context: string, viewport: { width: number; height: number }): Promise<void> {
     await this.end();
+    const generation = this.generation;
     this.count += 1;
     const name = this.count === 1 ? 'video' : `video-part${String(this.count)}`;
     const relative = path.posix.join('video', `${name}.webm`);
@@ -97,7 +114,13 @@ export class BidiVideo {
     const finish = this.browser === 'firefox'
       ? await this.firefoxSegment(context, size, absolute)
       : await this.chromiumSegment(context, size, absolute);
-    this.current = { relative, absolute, startedAt, finish };
+    const segment = { relative, absolute, startedAt, finish };
+    if (generation !== this.generation || !this.armed) {
+      this.current = segment;
+      await this.end();
+      return;
+    }
+    this.current = segment;
   }
 
   /** Ends the segment in progress. A finish that failed keeps a file it left; one that left none lost the segment, which `stop` reports. */
@@ -176,11 +199,15 @@ export class BidiVideo {
     }
     const subscribed = subscription;
     return async () => {
-      await encoder.firstFrameOrGrace();
-      off();
-      await unlessStale(connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.stopScreencast', params: {}, session }), undefined);
-      await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscribed] }));
-      await encoder.close();
+      try {
+        await encoder.firstFrameOrGrace();
+        off();
+        await unlessStale(connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.stopScreencast', params: {}, session }), undefined);
+        await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscribed] }));
+      } finally {
+        off();
+        await encoder.close();
+      }
       if (unacknowledged !== undefined && !isStale(unacknowledged)) throw classify(unacknowledged, 'video');
     };
   }
@@ -193,6 +220,8 @@ export class BidiVideo {
  * needs a moment on the final screen.
  */
 const FRAME_GRACE_MS = 1_000;
+/** How long ffmpeg gets to take the queued frames and write the file before it is killed. */
+const CLOSE_TIMEOUT_MS = 10_000;
 /** How much of ffmpeg's error output a failed encode reports. */
 const STDERR_TAIL = 2_000;
 
@@ -265,10 +294,10 @@ class FrameEncoder {
       await this.abort();
       return;
     }
+    const timer = setTimeout(() => this.process.kill('SIGKILL'), CLOSE_TIMEOUT_MS);
     this.fill(this.due(FRAME_GRACE_MS));
-    await this.writing;
+    await Promise.race([this.writing, this.exited]);
     this.process.stdin?.end();
-    const timer = setTimeout(() => this.process.kill('SIGKILL'), 10_000);
     const { code, signal } = await this.exited.finally(() => clearTimeout(timer));
     if (this.failure !== undefined) throw new Error(`ffmpeg failed: ${this.failure.message}`);
     if (code !== 0) throw new Error(`ffmpeg ${signal === null ? `exited with ${String(code)}` : `was killed (${signal})`}${this.stderr === '' ? '' : `: ${this.stderr.trim()}`}`);
