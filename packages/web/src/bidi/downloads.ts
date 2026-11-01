@@ -17,6 +17,7 @@ export interface FinishedDownload {
   readonly filepath: string;
 }
 
+/** One attempt's downloads: their directory, and waits for the downloads a trigger starts. */
 export class AttemptDownloads {
   readonly dir = mkdtempSync(path.join(os.tmpdir(), 'e2e-bidi-downloads-'));
 

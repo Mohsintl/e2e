@@ -79,6 +79,7 @@ export function typeSource(text: string): Input.KeySourceActions {
 /** Pointer button numbers: the primary and the secondary (context-menu) button. */
 export type PointerButton = 0 | 2;
 
+/** How a click presses: which button, how many times, how long, with which modifiers held. */
 export interface ClickOptions {
   readonly button?: PointerButton;
   readonly clicks?: number;
@@ -202,6 +203,7 @@ export function wheelSources(x: number, y: number, deltaX: number, deltaY: numbe
   return [{ type: 'wheel', id: 'wheel', actions: [{ type: 'scroll', x, y, deltaX, deltaY, origin: 'viewport' }] }];
 }
 
+/** The one mouse pointer source every pointer action of the driver goes through. */
 export function mouse(actions: Input.PointerSourceAction[]): Input.PointerSourceActions {
   return { type: 'pointer', id: 'mouse', parameters: { pointerType: 'mouse' }, actions };
 }

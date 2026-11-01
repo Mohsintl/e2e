@@ -12,9 +12,11 @@ export interface BidiTransport {
   close(): void;
 }
 
+/** A BiDi command's method name, and its parameters and result. */
 export type BidiMethod = keyof Commands;
 export type BidiParams<M extends BidiMethod> = Commands[M]['params'];
 export type BidiResult<M extends BidiMethod> = Commands[M]['returnType'];
+/** A BiDi event's name, and its parameters. */
 export type BidiEventName = BidiEvent['method'];
 export type BidiEventParams<E extends BidiEventName> = Extract<BidiEvent, { method: E }>['params'];
 
@@ -37,6 +39,11 @@ export class BidiError extends Error {
   }
 }
 
+/**
+ * One WebDriver BiDi session over a transport: commands matched to their
+ * responses by id, events fanned out to listeners, and every pending command
+ * rejected once the transport closes.
+ */
 export class BidiConnection {
   private nextId = 0;
   private closed = false;

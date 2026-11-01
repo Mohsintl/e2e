@@ -97,6 +97,7 @@ export class FrameRegistry {
     return box;
   }
 
+  /** Forgets every frame, when the documents that held them are gone. */
   clear(): void {
     this.holders.clear();
   }

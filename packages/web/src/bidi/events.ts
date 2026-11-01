@@ -139,6 +139,7 @@ function isMissingFavicon(url: string, status: number): boolean {
   return status === 404 && URL.canParse(url) && new URL(url).pathname === '/favicon.ico';
 }
 
+/** A thrown value as an Error, for the latch. */
 function asError(cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
 }

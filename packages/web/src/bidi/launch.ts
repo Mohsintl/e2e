@@ -34,6 +34,7 @@ export interface BidiBrowser {
   close(): Promise<void>;
 }
 
+/** How to launch a browser for the BiDi driver. */
 export interface BidiLaunchOptions {
   readonly headed: boolean;
   readonly timeoutMs: number;

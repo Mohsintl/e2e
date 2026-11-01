@@ -22,6 +22,7 @@ import type { BidiBrowserName } from './launch.ts';
 /** Frames a second of the encoded video. */
 const FPS = 25;
 
+/** The recording's size and JPEG quality, as configured. */
 export interface VideoOptions {
   readonly size?: { readonly width: number; readonly height: number };
   readonly quality?: number;
@@ -35,6 +36,7 @@ interface Segment {
   finish(): Promise<void>;
 }
 
+/** The attempt's video on the BiDi driver: one segment per tab it shows, and the segments it lost. */
 export class BidiVideo {
   private armed = false;
   private current: Segment | undefined;
@@ -87,6 +89,7 @@ export class BidiVideo {
     return this.finished.splice(0);
   }
 
+  /** Ends any segment in progress and starts the next on `context`. */
   private async begin(context: string, viewport: { width: number; height: number }): Promise<void> {
     await this.end();
     this.count += 1;
@@ -294,6 +297,7 @@ class FrameEncoder {
     while (this.written < due) this.write(this.last);
   }
 
+  /** Queues one frame for the next tick. */
   private write(jpeg: Buffer): void {
     this.written += 1;
     this.writing = this.writing.then(() => this.push(jpeg));

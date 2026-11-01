@@ -70,11 +70,13 @@ export class ContextOwners {
     else if (parent != null) this.owners.set(context, this.owners.get(parent) ?? '');
   }
 
+  /** Forgets a closed context. */
   destroyed(context: string): void {
     this.owners.delete(context);
     this.parents.delete(context);
   }
 
+  /** The user context `context` belongs to; undefined for one never seen. */
   owner(context: string): string | undefined {
     return this.owners.get(context);
   }
@@ -86,6 +88,7 @@ export class ContextOwners {
     return top;
   }
 
+  /** Forgets everything recorded, for a new user context. */
   clear(): void {
     this.owners.clear();
     this.parents.clear();
@@ -131,12 +134,17 @@ class BidiRefs {
     return target;
   }
 
+  /** Forgets everything recorded, for a new user context. */
   clear(): void {
     this.observation = new Map();
     this.located.clear();
   }
 }
 
+/**
+ * One attempt on a BiDi browser: its user context and tab, and the refs,
+ * frames, network, downloads, dialogs, and video scoped to it.
+ */
 export class BidiSession {
   userContext = '';
   context: string | undefined;
@@ -187,6 +195,7 @@ export class BidiSession {
     this.downloads = new AttemptDownloads(browser.connection);
   }
 
+  /** The browser's BiDi connection. */
   get connection(): BidiConnection {
     return this.browser.connection;
   }
@@ -293,6 +302,7 @@ export class BidiSession {
     return this.creating;
   }
 
+  /** Opens the attempt's tab in its user context, refusing one that opened after the user context was replaced. */
   private async createContext(): Promise<string> {
     const connection = this.connection;
     const userContext = this.userContext;
@@ -406,6 +416,7 @@ export class BidiSession {
     return this.run(viewportSize, []);
   }
 
+  /** The tab's URL, as the browser reports it. */
   async currentUrl(): Promise<string> {
     const { contexts } = await this.connection.send('browsingContext.getTree', { root: this.requireContext(), maxDepth: 0 });
     return contexts[0]?.url ?? '';

@@ -36,6 +36,7 @@ export type Wire<T> = T extends PageJson ? T : T extends Node ? ElementRef : T e
 /** A typed page function: self-contained, so its source runs in the page alone. */
 export type TypedPageFunction = (...args: never[]) => unknown;
 
+/** How `callFunction` runs a page function. */
 export interface CallOptions {
   readonly awaitPromise?: boolean;
   /** Object depth serialized back, `null` for all of it; the default reads two levels, which an array of elements needs. */

@@ -56,6 +56,7 @@ export interface ObservedResponse {
   body(): Promise<Buffer>;
 }
 
+/** What an attempt's network applies, and how it tells the attempt's events and failures. */
 export interface AttemptNetworkOptions {
   /** Headers for every request bound for the app's site; names lowercased. */
   readonly siteHeaders: (url: string) => Readonly<Record<string, string>> | undefined;
@@ -96,6 +97,7 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
   '.woff2': 'font/woff2',
 };
 
+/** One attempt's network: its intercepts, routes, auth answers, in-flight count, and response waits. */
 export class AttemptNetwork {
   private routes: NetworkRoute[] = [];
   private userContext: string | undefined;
@@ -128,14 +130,17 @@ export class AttemptNetwork {
     this.holding = options.holdAll;
   }
 
+  /** Whether anything needs the request events: held requests, credentials, or a listener already installed. */
   private get needsEvents(): boolean {
     return this.holds || this.options.credentials !== undefined || this.listeners.length > 0;
   }
 
+  /** Whether requests are held: for headers or routes, or for a blank-served tab. */
   private get holds(): boolean {
     return this.holding || this.blank.size > 0;
   }
 
+  /** Runs `work` after every earlier change; a failed change rejects its caller and lets the next run. */
   private change(work: () => Promise<void>): Promise<void> {
     const next = this.changes.then(work);
     this.changes = releaseQuietly(next);
@@ -273,6 +278,11 @@ export class AttemptNetwork {
     this.routes = this.routes.filter((route) => !match(route));
   }
 
+  /**
+   * Counts the attempt's request in flight and, when one of this network's
+   * intercepts holds it, decides it; a held request of another user context
+   * goes on untouched.
+   */
   private onRequest(event: BidiEventParams<'network.beforeRequestSent'>): void {
     const blocked = event.isBlocked && (event.intercepts ?? []).some((intercept) => this.intercepts.has(intercept));
     if (!this.options.ours(event)) {
@@ -392,6 +402,7 @@ export class AttemptNetwork {
     await this.connection.send('network.provideResponse', { request, statusCode: response.status, headers: wireHeaders(headers), body });
   }
 
+  /** Answers the attempt's basic-auth challenge with the credentials once; a second one for the same request means they were refused, and lets the 401 through. */
   private onAuth(event: BidiEventParams<'network.authRequired'>): void {
     const credentials = this.options.credentials;
     if (!this.options.ours(event) || !event.isBlocked || credentials === undefined) return;
@@ -405,6 +416,7 @@ export class AttemptNetwork {
       .catch((cause: unknown) => this.fail(cause));
   }
 
+  /** A request finished: once none is in flight, the idle window starts. */
   private settle(event: { readonly request: Network.RequestData; readonly userContext?: string | null; readonly context: string | null }): void {
     if (!this.inflight.delete(event.request.request)) return;
     if (this.inflight.size === 0) this.lastSettled = Date.now();
@@ -543,6 +555,7 @@ function bytesText(value: Network.BytesValue): string {
 }
 
 
+/** A header record as BiDi headers. */
 function wireHeaders(headers: Readonly<Record<string, string>>): Network.Header[] {
   return Object.entries(headers).map(([name, value]) => ({ name, value: { type: 'string', value } }));
 }

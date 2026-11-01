@@ -57,6 +57,7 @@ import { goto, reload, reset, restart, traverse, type WaitUntil } from './steeri
 /** Browser launch budget when the harness init budget is not otherwise expressed. */
 const BROWSER_LAUNCH_TIMEOUT_MS = 60_000;
 
+/** What a BiDi surface is configured with, from `web()`. */
 export interface BidiSurfaceOptions {
   readonly browser: BidiBrowserName;
   readonly viewport: ViewportSize | null;
@@ -76,6 +77,11 @@ export interface BidiSurfaceOptions {
   readonly leases: LeasedBrowsers | undefined;
 }
 
+/**
+ * The engine surface on WebDriver BiDi: one browser per worker, one
+ * attempt at a time on it, and every engine hook guarded by the operation's
+ * budget and the attempt's error latch.
+ */
 export class BidiSurface {
   private browser: BidiBrowser | undefined;
   private session: BidiSession | undefined;
@@ -210,6 +216,7 @@ export class BidiSurface {
     if (failed !== undefined) throw classify(failed.reason, 'dispose');
   }
 
+  /** The running attempt; `INVALID_STATE` between attempts. */
   private requireSession(): BidiSession {
     if (this.session === undefined) throw invalidState('no attempt is running');
     return this.session;
@@ -243,42 +250,52 @@ export class BidiSurface {
     return result;
   }
 
+  /** Opens `url` in the attempt's tab, creating it on first use. */
   open(url: string, operation: OperationContext): Promise<void> {
     return this.goto(url, 'load', operation);
   }
 
+  /** Goes back one history entry. */
   back(operation: OperationContext): Promise<void> {
     return this.guard(operation, 'navigation', (session, budget) => traverse(session, -1, budget.timeoutMs, budget.signal), { traced: true });
   }
 
+  /** Goes forward one history entry. */
   forward(operation: OperationContext): Promise<void> {
     return this.guard(operation, 'navigation', (session, budget) => traverse(session, 1, budget.timeoutMs, budget.signal), { traced: true });
   }
 
+  /** Closes the tab, keeping the attempt's storage. */
   restart(operation: OperationContext): Promise<void> {
     return this.guard(operation, 'restart', (session) => restart(session));
   }
 
+  /** Starts the attempt over in a clean user context. */
   reset(operation: OperationContext): Promise<void> {
     return this.guard(operation, 'state reset', (session) => reset(session));
   }
 
+  /** `browser.goto`: navigates and waits as `waitUntil` says. */
   goto(url: string, waitUntil: WaitUntil, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'navigation', (session, budget) => goto(session, url, waitUntil, budget.signal), { traced: true });
   }
 
+  /** Reloads the tab. */
   reload(operation: OperationContext): Promise<void> {
     return this.guard(operation, 'navigation', (session) => reload(session), { traced: true });
   }
 
+  /** One observation of the tab, its frames and, when asked, masked pixels. */
   observe(operation: OperationContext, options?: EngineObserveOptions): Promise<EngineSnapshot> {
     return this.guard(operation, 'observe', (session, budget) => observe(session, budget.timeoutMs, budget.signal, options));
   }
 
+  /** The nodes `expression` matches now, each a ref an action can take. */
   locate(expression: LocatorExpression, operation: OperationContext): Promise<readonly SemanticNode[]> {
     return this.guard(operation, 'locate', (session) => locate(session, expression));
   }
 
+  /** One action on a node, failing as may-have-committed once its input went out. */
   perform(ref: NodeRef, action: LocatorAction, operation: OperationContext): Promise<void> {
     return this.guard(operation, action.kind, (session, budget) => perform(session, ref, action, budget.timeoutMs, budget.signal), {
       input: true,
@@ -287,14 +304,17 @@ export class BidiSurface {
     });
   }
 
+  /** One pointer action at a viewport point. */
   performAt(point: ViewportPoint, action: PointerAction, operation: OperationContext): Promise<void> {
     return this.guard(operation, `${action.kind} at point`, (session, budget) => performAt(session, point, action, budget.signal), { input: true, traced: true });
   }
 
+  /** Types into whatever holds focus. */
   typeText(text: string, options: { readonly replace: boolean }, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'keyboard.type', (session, budget) => typeText(session, text, options.replace, budget.signal), { input: true, traced: true });
   }
 
+  /** Presses one key of the contract grammar. */
   pressKey(key: string, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'keyboard.press', (session, budget) => session.sendInput([pressSource(key)], budget.signal), { input: true, traced: true });
   }
@@ -309,10 +329,12 @@ export class BidiSurface {
     return this.requireSession().pointer;
   }
 
+  /** The tab's URL. */
   url(operation: OperationContext): Promise<string> {
     return this.guard(operation, 'url', (session) => session.currentUrl());
   }
 
+  /** The tab's document title. */
   title(operation: OperationContext): Promise<string> {
     return this.guard(operation, 'title', (session) => session.run(documentTitle, []));
   }
@@ -322,6 +344,7 @@ export class BidiSurface {
     return this.guard(operation, 'evaluate', (session) => session.call(declaration, arg === undefined ? [] : [arg], { awaitPromise: true, maxObjectDepth: null }));
   }
 
+  /** Runs `source` in every document the attempt opens from now on. */
   addInitScript(source: string, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'addInitScript', (session) => session.addInitScript(source));
   }
@@ -331,10 +354,12 @@ export class BidiSurface {
     return path.resolve(this.settings?.projectRoot ?? '', file);
   }
 
+  /** Registers a test route. */
   route(route: NetworkRoute, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'route', (session) => session.network.addRoute(route));
   }
 
+  /** Removes the test routes `match` selects. */
   unroute(match: (route: NetworkRoute) => boolean, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'unroute', async (session) => session.network.removeRoutes(match));
   }
@@ -354,6 +379,7 @@ export class BidiSurface {
     this.requireSession().latch.latch(error);
   }
 
+  /** The next response of the tab whose URL `matches`. */
   waitForResponse(matches: (url: string) => boolean, operation: OperationContext): Promise<ObservedResponse> {
     return this.guard(operation, 'waitForResponse', (session, budget) => session.network.waitForResponse(matches, budget.signal));
   }
@@ -398,10 +424,12 @@ export class BidiSurface {
     });
   }
 
+  /** The attempt's cookies. */
   cookies(operation: OperationContext): Promise<Network.Cookie[]> {
     return this.guard(operation, 'cookies', async (session) => (await session.connection.send('storage.getCookies', { partition: session.partition() })).cookies);
   }
 
+  /** Stores cookies in the attempt's user context. */
   setCookies(cookies: readonly Storage.PartialCookie[], operation: OperationContext): Promise<void> {
     return this.guard(operation, 'setCookies', async (session) => {
       for (const cookie of cookies) await session.connection.send('storage.setCookie', { cookie, partition: session.partition() });
@@ -415,26 +443,32 @@ export class BidiSurface {
     });
   }
 
+  /** Resizes the tab, and every tab the attempt opens after. */
   setViewport(size: ViewportSize, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'setViewport', (session) => session.setViewport(size));
   }
 
+  /** The attempt's saved-session state. */
   captureState(operation: OperationContext): Promise<EngineState> {
     return this.guard(operation, 'state capture', (session) => captureState(session));
   }
 
+  /** Replaces the attempt's storage with a saved session's. */
   restoreState(state: EngineState, operation: OperationContext): Promise<void> {
     return this.guard(operation, 'state restore', (session) => restoreState(session, state));
   }
 
+  /** A masked viewport screenshot, saved under the attempt directory. */
   screenshot(label: string | undefined, operation: OperationContext): Promise<string> {
     return this.guard(operation, 'screenshot', (session) => screenshot(session, label));
   }
 
+  /** Starts the attempt's video: the provider's recording when it records, else the driver's own. */
   startVideo(operation: OperationContext): Promise<void> {
     return this.guard(operation, 'video', (session, budget) => startVideo(session, this.options.leases?.recorder(session.attempt.attemptId), budget.signal));
   }
 
+  /** Ends the attempt's video and returns its segments. */
   stopVideo(operation: OperationContext): Promise<readonly VideoSegment[]> {
     return this.guard(operation, 'video', (session, budget) => stopVideo(session, budget.signal));
   }
