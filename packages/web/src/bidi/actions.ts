@@ -24,7 +24,7 @@ import { unlessStale } from './errors.ts';
 import type { NodeTarget } from './frames.ts';
 import { clickSources, dragPath, dragSources, dragStepMs, moveSources, pressSource, typeSource, wheelSources, type ClickOptions } from './input.ts';
 import { ACTION_POINT, CHECK_STATE, FILE_INPUT, FILL, FOCUS, NEXT_FRAME, SELECT_OPTION, type ActionPoint } from './page.ts';
-import type { PageArgument } from './script.ts';
+import { ElementRef, type PageArgument } from './script.ts';
 import type { BidiSession } from './session.ts';
 
 /** How long a long press holds the button when the action names no duration. */
@@ -220,7 +220,7 @@ async function setInputFiles(session: BidiSession, target: NodeTarget, paths: re
   const connection = session.connection;
   const files = paths.map((file) => path.resolve(session.settings.projectRoot, file));
   const input = await session.call(FILE_INPUT, [target.element], undefined, target.context);
-  if (input !== null && typeof input === 'object' && 'sharedId' in input && typeof input.sharedId === 'string') {
+  if (input instanceof ElementRef) {
     await connection.send('input.setFiles', { context: target.context, element: { sharedId: input.sharedId }, files });
     return;
   }

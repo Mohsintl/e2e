@@ -28,7 +28,7 @@ import { BidiError } from './connection.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
 import { contentContext, inViewport, resolveFrames, withinFrame, type NodeTarget } from './frames.ts';
 import { DOM_READY, FRAME_INSET, LOCATE_READ, MASK, READ_TREE, UNMASK, type LocateMetadata, type TreeMetadata } from './page.ts';
-import type { ElementRef, PageArgument } from './script.ts';
+import { ElementRef, type PageArgument } from './script.ts';
 import type { BidiSession } from './session.ts';
 
 /** Shared node budget of one observation, as the Playwright surface's. */
@@ -102,7 +102,7 @@ export async function locate(session: BidiSession, expression: LocatorExpression
     },
   });
   return matches.map((node) => {
-    session.refs.storeLocated(node.ref.id, { element: { sharedId: sharedIds.get(node.ref.id) ?? '' }, context });
+    session.refs.storeLocated(node.ref.id, { element: new ElementRef(sharedIds.get(node.ref.id) ?? ''), context });
     const { children: _children, ...rest } = node;
     return inViewport(rest, frameBox, chain);
   });

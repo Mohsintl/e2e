@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { EngineError } from 'e2e/engine';
+import { EngineError, withTimeout } from 'e2e/engine';
 import { browserType } from '../browser-connection.ts';
 import { headlessShellExecutable } from '../install.ts';
 import { BidiConnection, webSocketTransport, type BidiTransport } from './connection.ts';
@@ -193,7 +193,10 @@ export async function launchBidiBrowser(name: BidiBrowserName, options: BidiLaun
         ? await webSocketTransport(`${await endpointLine(child, FIREFOX_ENDPOINT, options.timeoutMs)}/session`, options.timeoutMs)
         : await chromiumMapper(endpointLine(child, CHROMIUM_ENDPOINT, options.timeoutMs), options.timeoutMs);
     const connection = new BidiConnection(transport);
-    const version = await openSession(connection);
+    const version = await openSession(connection, options.timeoutMs).catch((cause: unknown) => {
+      connection.close();
+      throw cause;
+    });
     return {
       name,
       version,
@@ -211,11 +214,7 @@ export async function launchBidiBrowser(name: BidiBrowserName, options: BidiLaun
   } catch (cause) {
     await killed(child);
     removeProfile();
-    if (cause instanceof EngineError) throw cause;
-    throw new EngineError('ENGINE_FAILURE', `BiDi ${name} launch failed: ${cause instanceof Error ? cause.message : String(cause)}`, {
-      retryable: false,
-      cause,
-    });
+    throw launchFailure(`BiDi ${name} launch failed`, cause);
   }
 }
 
@@ -226,26 +225,30 @@ export async function launchBidiBrowser(name: BidiBrowserName, options: BidiLaun
  * host.
  */
 export async function connectBidiOverCdp(endpoint: string, timeoutMs: number): Promise<BidiBrowser> {
+  let connection: BidiConnection | undefined;
   try {
-    const transport = await chromiumMapper(webSocketDebuggerUrl(endpoint, timeoutMs), timeoutMs);
-    const connection = new BidiConnection(transport);
-    const version = await openSession(connection);
+    connection = new BidiConnection(await chromiumMapper(webSocketDebuggerUrl(endpoint, timeoutMs), timeoutMs));
+    const open = connection;
+    const version = await openSession(open, timeoutMs);
     return {
       name: 'chromium',
       version,
-      connection,
+      connection: open,
       close: async () => {
-        await Promise.race([releaseQuietly(connection.send('session.end', {})), new Promise((resolve) => setTimeout(resolve, 2_000))]);
-        connection.close();
+        await Promise.race([releaseQuietly(open.send('session.end', {})), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+        open.close();
       },
     };
   } catch (cause) {
-    if (cause instanceof EngineError) throw cause;
-    throw new EngineError('ENGINE_FAILURE', `BiDi attach over CDP failed: ${cause instanceof Error ? cause.message : String(cause)}`, {
-      retryable: false,
-      cause,
-    });
+    connection?.close();
+    throw launchFailure('BiDi attach over CDP failed', cause);
   }
+}
+
+/** A launch or attach failure as the engine reports it: a classified error passes, anything else names what failed. */
+function launchFailure(what: string, cause: unknown): EngineError {
+  if (cause instanceof EngineError) return cause;
+  return new EngineError('ENGINE_FAILURE', `${what}: ${cause instanceof Error ? cause.message : String(cause)}`, { retryable: false, cause });
 }
 
 /** The browser-wide DevTools WebSocket URL of `endpoint`: as given for `ws(s)://`, read from `/json/version` for `http(s)://`. */
@@ -259,14 +262,18 @@ async function webSocketDebuggerUrl(endpoint: string, timeoutMs: number): Promis
 }
 
 /**
- * Opens the session and returns the browser's version. A user prompt stays
- * open for the driver to route (`browsingContext.userPromptOpened`), as
- * Playwright hands each dialog to its listener.
+ * Opens the session within `timeoutMs` and returns the browser's version. A
+ * user prompt stays open for the driver to route
+ * (`browsingContext.userPromptOpened`), as Playwright hands each dialog to
+ * its listener; certificate errors fail navigation, as Playwright's default
+ * `ignoreHTTPSErrors: false` does.
  */
-async function openSession(connection: BidiConnection): Promise<string> {
-  const session = await connection.send('session.new', {
-    capabilities: { alwaysMatch: { acceptInsecureCerts: true, unhandledPromptBehavior: { default: 'ignore' } } },
-  });
+async function openSession(connection: BidiConnection, timeoutMs: number): Promise<string> {
+  const session = await withTimeout(
+    connection.send('session.new', { capabilities: { alwaysMatch: { acceptInsecureCerts: false, unhandledPromptBehavior: { default: 'ignore' } } } }),
+    timeoutMs,
+    () => new EngineError('ENGINE_FAILURE', `the browser opened no BiDi session within ${timeoutMs}ms`, { retryable: false }),
+  );
   return session.capabilities.browserVersion;
 }
 
@@ -281,6 +288,7 @@ function executableFor(name: BidiBrowserName, options: BidiLaunchOptions): strin
   return full;
 }
 
+/** Spawns Firefox on a fresh profile with the driver's preferences, its BiDi endpoint on a free port. */
 function spawnFirefox(profile: string, options: BidiLaunchOptions): ChildProcess {
   const prefs = Object.entries({ ...FIREFOX_PREFS, ...options.firefoxPrefs }).map(([key, value]) => `user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`);
   writeFileSync(path.join(profile, 'user.js'), `${prefs.join('\n')}\n`);
@@ -288,6 +296,7 @@ function spawnFirefox(profile: string, options: BidiLaunchOptions): ChildProcess
   return spawn(executableFor('firefox', options), args, { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
 }
 
+/** Spawns Chromium on a fresh profile with Playwright's switches, its DevTools endpoint on a free port. */
 function spawnChromium(profile: string, options: BidiLaunchOptions): ChildProcess {
   const args = [
     ...CHROMIUM_ARGS,
@@ -340,53 +349,52 @@ async function chromiumMapper(cdpUrl: Promise<string>, timeoutMs: number): Promi
   const child = spawn(process.execPath, [MAPPER_ENTRY], { stdio: ['pipe', 'pipe', 'pipe'] });
   let errors = '';
   child.stderr.on('data', (chunk: Buffer) => {
-    errors = `${errors}${chunk.toString()}`.slice(-2_000);
+    errors = `${errors}${chunk.toString()}`.slice(-4_000);
   });
   child.stdin.on('error', () => undefined);
-  const closeHandlers: (() => void)[] = [];
-  child.once('exit', () => {
-    for (const handler of closeHandlers) handler();
+  const why = (code: number | null, signal: NodeJS.Signals | null): string =>
+    `the chromium-bidi mapper exited (${signal ?? `code ${String(code)}`})${errors.trim() === '' ? '' : `: ${errors.trim()}`}`;
+  const exited = new Promise<string>((resolve) => {
+    child.once('error', (cause) => resolve(`the chromium-bidi mapper could not start: ${cause.message}`));
+    child.once('exit', (code, signal) => resolve(why(code, signal)));
+  });
+  const closeHandlers: ((reason?: string) => void)[] = [];
+  void exited.then((reason) => {
+    for (const handler of closeHandlers) handler(reason);
   });
   let deliver: (message: string) => void = () => undefined;
-  let url: string;
+  let ready: () => void = () => undefined;
+  const started = new Promise<void>((resolve) => (ready = resolve));
+  createInterface({ input: child.stdout }).on('line', (line) => {
+    if (line === MAPPER_READY) ready();
+    else deliver(line);
+  });
   try {
-    url = await cdpUrl;
+    const url = await Promise.race([cdpUrl, exited.then((reason) => Promise.reject(new Error(reason)))]);
+    child.stdin.write(`${url}\n`);
+    await withTimeout(
+      Promise.race([started, exited.then((reason) => Promise.reject(new Error(reason)))]),
+      timeoutMs,
+      () => new Error(`the chromium-bidi mapper did not start within ${timeoutMs}ms`),
+    );
   } catch (cause) {
     child.kill('SIGKILL');
     throw cause;
   }
-  child.stdin.write(`${url}\n`);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(`the chromium-bidi mapper did not start within ${timeoutMs}ms`));
-    }, timeoutMs);
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`the chromium-bidi mapper exited with code ${String(code)}: ${errors.trim()}`));
-    });
-    const lines = createInterface({ input: child.stdout });
-    lines.on('line', (line) => {
-      if (line !== MAPPER_READY) {
-        deliver(line);
-        return;
-      }
-      clearTimeout(timer);
-      resolve({
-        send: (message) => {
-          if (child.stdin.writable) child.stdin.write(`${message}\n`);
-        },
-        onMessage: (handler) => {
-          deliver = handler;
-        },
-        onClose: (handler) => closeHandlers.push(handler),
-        close: () => {
-          child.stdin.end();
-          setTimeout(() => child.kill('SIGKILL'), 2_000).unref();
-        },
-      });
-    });
-  });
+  return {
+    send: (message) => {
+      if (!child.stdin.writable) throw new Error('the chromium-bidi mapper is gone');
+      child.stdin.write(`${message}\n`);
+    },
+    onMessage: (handler) => {
+      deliver = handler;
+    },
+    onClose: (handler) => closeHandlers.push(handler),
+    close: () => {
+      child.stdin.end();
+      setTimeout(() => child.kill('SIGKILL'), 2_000).unref();
+    },
+  };
 }
 
 /** Kills the browser's process group and resolves once it exited. */

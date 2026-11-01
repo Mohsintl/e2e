@@ -12,13 +12,27 @@
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
+/**
+ * The rejection the mapper leaves unhandled when a tab closes while its
+ * auto-attach is in flight: `CdpTargetManager` sends `Target.setAutoAttach`
+ * for a tab target in a `void` async call with no catch, and the closed
+ * session rejects it with chromium-bidi's `CloseError`. Nothing waits on that
+ * call, so the attempt it belonged to has ended anyway.
+ */
+function isCloseRace(reason: unknown): boolean {
+  return reason instanceof Error && reason.constructor.name === 'CloseError' && reason.message.startsWith('Target.setAutoAttach ');
+}
+
 /** First line on stdout once the mapper serves, so the parent knows when to send. */
 export const MAPPER_READY = '{"e2e":"ready"}';
 
 /** Loads the mapper (here, so the driver importing `MAPPER_READY` never does), then serves the CDP URL the first stdin line names until the parent or the browser goes away. */
 async function serve(): Promise<void> {
-  // The mapper's own faults are logged and survived, never thrown: this process exists to absorb them.
-  process.on('unhandledRejection', (reason) => process.stderr.write(`chromium-bidi: ${String(reason)}\n`));
+  process.on('unhandledRejection', (reason) => {
+    if (isCloseRace(reason)) return;
+    process.stderr.write(`chromium-bidi: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}\n`);
+    process.exit(1);
+  });
   const loading = Promise.all([
     import('chromium-bidi/out/Default/gen/src/bidiMapper/BidiMapper.js'),
     import('chromium-bidi/out/Default/gen/src/cdp/CdpConnection.js'),

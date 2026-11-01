@@ -4,16 +4,28 @@ import type { Script } from 'webdriver-bidi-protocol';
 import { EngineError } from 'e2e/engine';
 import type { BidiConnection } from './connection.ts';
 
-/** A DOM element held by its BiDi shared id, valid for as long as the element lives in its document. */
-export interface ElementRef {
-  readonly sharedId: string;
+/**
+ * A DOM element held by its BiDi shared id, valid for as long as the element
+ * lives in its document. A class, so JSON data that happens to carry a
+ * `sharedId` is never taken for one.
+ */
+export class ElementRef {
+  constructor(readonly sharedId: string) {}
+}
+
+/** A browsing context a page function returned as a window. */
+export class WindowRef {
+  constructor(readonly context: string) {}
 }
 
 /** What a page function may take: JSON values and element references. */
 export type PageArgument = string | number | boolean | null | ElementRef | readonly PageArgument[] | { readonly [key: string]: PageArgument };
 
-/** What a page function hands back: JSON values, with each DOM node as its reference and each window as its browsing context. */
-export type PageValue = string | number | boolean | null | undefined | ElementRef | PageValue[] | { [key: string]: PageValue };
+/** What a page function hands back: JSON values, each DOM node as its reference, each window as its browsing context. */
+export type PageValue = string | number | boolean | null | undefined | ElementRef | WindowRef | PageValue[] | { [key: string]: PageValue };
+
+/** A page function: a self-contained function serialized with `toString()`, or source composed from one. */
+export type PageFunction = string | ((...args: never[]) => unknown);
 
 export interface CallOptions {
   readonly awaitPromise?: boolean;
@@ -22,19 +34,19 @@ export interface CallOptions {
 }
 
 /**
- * Calls `declaration` (a function's source) in the context's main world with
- * `args`, and resolves with its return value. A page exception rejects as a
- * script error the caller classifies.
+ * Calls `fn` in the context's main world with `args` and resolves with its
+ * return value. A page exception rejects as a `ScriptError` the caller
+ * classifies.
  */
 export async function callFunction(
   connection: BidiConnection,
   context: string,
-  declaration: string,
+  fn: PageFunction,
   args: readonly PageArgument[] = [],
   options: CallOptions = {},
 ): Promise<PageValue> {
   const result = await connection.send('script.callFunction', {
-    functionDeclaration: declaration,
+    functionDeclaration: typeof fn === 'string' ? fn : fn.toString(),
     target: { context },
     arguments: args.map(toLocalValue),
     awaitPromise: options.awaitPromise ?? false,
@@ -53,22 +65,22 @@ export class ScriptError extends Error {
   }
 }
 
-function isElementRef(value: unknown): value is ElementRef {
-  return typeof value === 'object' && value !== null && 'sharedId' in value && Object.keys(value).length === 1;
-}
-
 /** One argument as a BiDi local value. */
 function toLocalValue(value: PageArgument): Script.LocalValue {
   if (value === null) return { type: 'null' };
   if (typeof value === 'string') return { type: 'string', value };
   if (typeof value === 'boolean') return { type: 'boolean', value };
   if (typeof value === 'number') return Number.isFinite(value) ? { type: 'number', value } : { type: 'number', value: String(value) as 'NaN' };
+  if (value instanceof ElementRef) return { sharedId: value.sharedId };
   if (Array.isArray(value)) return { type: 'array', value: value.map(toLocalValue) };
-  if (isElementRef(value)) return { sharedId: value.sharedId };
   return { type: 'object', value: Object.entries(value).map(([key, entry]) => [key, toLocalValue(entry as PageArgument)]) };
 }
 
-/** One serialized result as a plain value; a node becomes its reference, anything else unreadable becomes undefined. */
+/**
+ * One serialized result as a plain value: a node becomes its reference, a
+ * window its context, anything unreadable undefined. Object keys are
+ * defined as own properties, so a `__proto__` key in page data is a key.
+ */
 function fromRemoteValue(value: Script.RemoteValue): PageValue {
   switch (value.type) {
     case 'undefined':
@@ -85,15 +97,15 @@ function fromRemoteValue(value: Script.RemoteValue): PageValue {
     case 'object': {
       const out: Record<string, PageValue> = {};
       for (const [key, entry] of value.value ?? []) {
-        if (typeof key === 'string') out[key] = fromRemoteValue(entry);
+        if (typeof key === 'string') Object.defineProperty(out, key, { value: fromRemoteValue(entry), enumerable: true, writable: true, configurable: true });
       }
       return out;
     }
     case 'window':
-      return { context: value.value.context };
+      return new WindowRef(value.value.context);
     case 'node':
       if (value.sharedId === undefined) throw new EngineError('NODE_STALE', 'a returned node has no shared id', { retryable: true });
-      return { sharedId: value.sharedId };
+      return new ElementRef(value.sharedId);
     default:
       return undefined;
   }

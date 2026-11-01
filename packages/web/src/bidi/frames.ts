@@ -9,7 +9,7 @@
 import { EngineError, type LocatorExpression, type SemanticNode } from 'e2e/engine';
 import { contentBox, frameContentInset, placeRectInFrame } from '../observation.ts';
 import type { BidiConnection } from './connection.ts';
-import { callFunction, type ElementRef } from './script.ts';
+import { callFunction, ElementRef, WindowRef } from './script.ts';
 
 /** An element and the browsing context whose document holds it. */
 export interface NodeTarget {
@@ -19,12 +19,15 @@ export interface NodeTarget {
 
 type Rect = NonNullable<SemanticNode['rect']>;
 
+/** An iframe element's window, which serializes as its browsing context. Runs in the page. */
+function contentWindow(element: HTMLIFrameElement): Window | null {
+  return element.contentWindow;
+}
+
 /** The child browsing context of an iframe element, or undefined when it has no document. */
 export async function contentContext(connection: BidiConnection, frame: NodeTarget): Promise<string | undefined> {
-  const window = await callFunction(connection, frame.context, '(element) => element.contentWindow', [frame.element]);
-  return typeof window === 'object' && window !== null && 'context' in window && typeof window.context === 'string'
-    ? window.context
-    : undefined;
+  const window = await callFunction(connection, frame.context, contentWindow, [frame.element]);
+  return window instanceof WindowRef ? window.context : undefined;
 }
 
 /** The iframe that holds each child context the surface entered, by child context. */
@@ -110,7 +113,7 @@ export async function resolveFrames(
     }
     const sharedId = iframes[0]!.sharedId;
     if (sharedId === undefined) throw new EngineError('FRAME_NOT_FOUND', `frame ${selector} has no element id`, { retryable: true });
-    const frame: NodeTarget = { element: { sharedId }, context };
+    const frame: NodeTarget = { element: new ElementRef(sharedId), context };
     const child = await contentContext(connection, frame);
     if (child === undefined) throw new EngineError('FRAME_NOT_FOUND', `frame ${selector} has no document yet`, { retryable: true });
     frames.enter(child, frame);

@@ -3,11 +3,12 @@
 import type { Commands, Event as BidiEvent, Message } from 'webdriver-bidi-protocol';
 import { EngineError } from 'e2e/engine';
 
-/** A text transport carrying BiDi messages: a WebSocket, or the in-process Chromium mapper. */
+/** A text transport carrying BiDi messages: a WebSocket, or the Chromium mapper's process. */
 export interface BidiTransport {
   send(message: string): void;
   onMessage(handler: (message: string) => void): void;
-  onClose(handler: () => void): void;
+  /** Runs `handler` once the transport is gone, with why when the transport knows. */
+  onClose(handler: (reason?: string) => void): void;
   close(): void;
 }
 
@@ -39,13 +40,14 @@ export class BidiError extends Error {
 export class BidiConnection {
   private nextId = 0;
   private closed = false;
+  private closeReason: string | undefined;
   private readonly pending = new Map<number, Pending>();
   private readonly listeners = new Map<string, Set<(params: unknown) => void>>();
   private readonly closeHandlers = new Set<() => void>();
 
   constructor(private readonly transport: BidiTransport) {
     transport.onMessage((raw) => this.receive(raw));
-    transport.onClose(() => this.drop());
+    transport.onClose((reason) => this.drop(reason));
   }
 
   /** Whether the transport is gone; every later command rejects. */
@@ -55,12 +57,17 @@ export class BidiConnection {
 
   /** Sends one command and resolves with its result; rejects with `BidiError` on an error response. */
   send<M extends BidiMethod>(method: M, params: BidiParams<M>): Promise<BidiResult<M>> {
-    if (this.closed) return Promise.reject(disconnected(method));
+    if (this.closed) return Promise.reject(disconnected(method, this.closeReason));
     this.nextId += 1;
     const id = this.nextId;
     return new Promise<BidiResult<M>>((resolve, reject) => {
       this.pending.set(id, { method, resolve: resolve as (result: unknown) => void, reject });
-      this.transport.send(JSON.stringify({ id, method, params }));
+      try {
+        this.transport.send(JSON.stringify({ id, method, params }));
+      } catch (cause) {
+        this.pending.delete(id);
+        reject(cause instanceof Error ? cause : new Error(String(cause)));
+      }
     });
   }
 
@@ -100,11 +107,13 @@ export class BidiConnection {
     this.closeHandlers.add(handler);
   }
 
+  /** Closes the transport; commands in flight fail as disconnected. */
   close(): void {
     this.transport.close();
     this.drop();
   }
 
+  /** Settles the command a response answers, or hands an event to its listeners. */
   private receive(raw: string): void {
     // oxlint-disable-next-line e2e/no-unchecked-json -- protocol messages from the browser the engine launched
     const message = JSON.parse(raw) as Message;
@@ -121,18 +130,20 @@ export class BidiConnection {
     else pending.reject(new BidiError(pending.method, message.error, message.message));
   }
 
-  private drop(): void {
+  /** Marks the connection gone and fails every command in flight, once. */
+  private drop(reason?: string): void {
     if (this.closed) return;
     this.closed = true;
-    for (const pending of this.pending.values()) pending.reject(disconnected(pending.method));
+    this.closeReason = reason;
+    for (const pending of this.pending.values()) pending.reject(disconnected(pending.method, reason));
     this.pending.clear();
     for (const handler of this.closeHandlers) handler();
   }
 }
 
 /** The error every command in flight, and every later one, fails with once the browser is gone. */
-function disconnected(method: string): EngineError {
-  return new EngineError('ENGINE_FAILURE', `${method}: the BiDi connection closed`, { retryable: false });
+function disconnected(method: string, reason?: string): EngineError {
+  return new EngineError('ENGINE_FAILURE', `${method}: the BiDi connection closed${reason === undefined ? '' : `: ${reason}`}`, { retryable: false });
 }
 
 /** A transport over a WebSocket URL, opened with Node's built-in client. */
