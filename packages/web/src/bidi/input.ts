@@ -117,14 +117,51 @@ export function releaseSources(): Input.SourceActions[] {
   return [mouse([{ type: 'pointerUp', button: 0 }])];
 }
 
-/** The key source that presses one key of the grammar and holds it (`keyboard.down`), or releases it (`keyboard.up`). */
-export function holdKeySources(key: string, phase: 'keyDown' | 'keyUp'): Input.SourceActions[] {
-  const parsed = parseKey(key);
-  if (parsed === undefined || parsed.modifiers.length > 0) {
-    throw new TestError('INVALID_ARGUMENT', `keyboard.down and keyboard.up take one key, got "${key}"`);
+/**
+ * The key source of one `browser.keyboard` call, which takes Playwright's
+ * key names (a bare modifier, `KeyB`, `Digit1`, a named key, one
+ * character) and, for `press`, `+`-joined modifiers before the key. A
+ * letter is upper case while Shift is held, by this call or a
+ * `keyboard.down` before it, as Playwright types it.
+ */
+export function fixtureKeySource(key: string, phase: 'press' | 'keyDown' | 'keyUp', shiftHeld: boolean): Input.KeySourceActions {
+  const parts = key === '+' ? ['+'] : key.endsWith('++') ? [...key.slice(0, -2).split('+'), '+'] : key.split('+');
+  if (parts.some((part) => part === '') || (phase !== 'press' && parts.length > 1)) {
+    throw new TestError('INVALID_ARGUMENT', `keyboard.${phase === 'press' ? 'press' : phase === 'keyDown' ? 'down' : 'up'} cannot read the key "${key}"`);
   }
-  const value = parsed.key.kind === 'named' ? KEY_CODES[parsed.key.name] : parsed.key.char;
-  return [{ type: 'key', id: 'keyboard', actions: [{ type: phase, value }] }];
+  const modifiers = parts.slice(0, -1).map((part) => {
+    if (!isModifier(part)) throw new TestError('INVALID_ARGUMENT', `"${part}" in "${key}" is not a modifier`);
+    return modifierCode(part);
+  });
+  const value = fixtureKeyValue(parts.at(-1)!, shiftHeld || parts.slice(0, -1).includes('Shift'));
+  if (phase !== 'press') return { type: 'key', id: 'keyboard', actions: [{ type: phase, value }] };
+  return {
+    type: 'key',
+    id: 'keyboard',
+    actions: [
+      ...modifiers.map((code) => ({ type: 'keyDown' as const, value: code })),
+      { type: 'keyDown', value },
+      { type: 'keyUp', value },
+      ...modifiers.toReversed().map((code) => ({ type: 'keyUp' as const, value: code })),
+    ],
+  };
+}
+
+/** Whether `name` is a modifier key's name. */
+export function isModifier(name: string): name is KeyModifier {
+  return name === 'ControlOrMeta' || Object.hasOwn(MODIFIER_CODES, name);
+}
+
+/** One Playwright key name as a WebDriver key value. */
+function fixtureKeyValue(name: string, shifted: boolean): string {
+  if (isModifier(name)) return modifierCode(name);
+  if (Object.hasOwn(KEY_CODES, name)) return KEY_CODES[name as KeyName];
+  const letter = /^Key([A-Z])$/.exec(name)?.[1] ?? (/^[a-zA-Z]$/.test(name) ? name : undefined);
+  if (letter !== undefined) return shifted ? letter.toUpperCase() : letter.toLowerCase();
+  const digit = /^Digit([0-9])$/.exec(name)?.[1];
+  if (digit !== undefined) return digit;
+  if ([...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(name)].length === 1) return name;
+  throw new TestError('INVALID_ARGUMENT', `unknown key "${name}"`);
 }
 
 /** Steps a drag moves through between its press and its release, so drag-and-drop libraries see motion. */

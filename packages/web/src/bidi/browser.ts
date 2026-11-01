@@ -22,7 +22,7 @@ import {
 import { evaluateInPage } from '../evaluation.ts';
 import { testInitScriptSource } from '../init-scripts.ts';
 import { routePatternMatches, routePatternsEqual } from '../route-pattern.ts';
-import { holdKeySources, moveSources, pressDownSources, pressSource, releaseSources, typeSource, wheelSources } from './input.ts';
+import { fixtureKeySource, moveSources, pressDownSources, releaseSources, typeSource, wheelSources } from './input.ts';
 import type { InterceptedRequest, NetworkRoute, RouteDecisions } from './network.ts';
 import type { PageArgument } from './script.ts';
 import type { BidiSurface } from './surface.ts';
@@ -39,6 +39,7 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
     deadlineFor: (timeout) => new Deadline(context.operation(timeout ?? context.timeouts.assertion).timeoutMs),
     context,
   });
+  const heldKeys = new Set<string>();
   const routes: { readonly pattern: TextPattern; readonly route: NetworkRoute }[] = [];
   const removeRoutes = (match: (stored: (typeof routes)[number]) => boolean): Promise<void> => {
     const removed = new Set(routes.filter(match).map((stored) => stored.route));
@@ -119,7 +120,7 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
       const matches = (await surface.cookies(operation)).filter((cookie) =>
         fields.every((field) => {
           const wanted = options?.[field];
-          return wanted === undefined || (typeof wanted === 'string' ? cookie[field] === wanted : wanted.test(cookie[field]));
+          return wanted === undefined || (typeof wanted === 'string' ? cookie[field] === wanted : new RegExp(wanted.source, wanted.flags).test(cookie[field]));
         }),
       );
       return surface.deleteCookies(matches.map(({ name, domain, path }) => ({ name, domain, path })), operation);
@@ -140,20 +141,26 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
     },
     waitForDownloads: (trigger, options) => downloads(surface, context, trigger, requireDownloadCount(options), options.timeout, 'browser.waitForDownloads'),
     keyboard: {
-      down: (key) => surface.input('keyboard.down', holdKeySources(key, 'keyDown'), context.operation(), false),
-      up: (key) => surface.input('keyboard.up', holdKeySources(key, 'keyUp'), context.operation()),
-      press: (key) => surface.input('keyboard.press', [pressSource(key)], context.operation()),
+      down: async (key) => {
+        await surface.input('keyboard.down', [fixtureKeySource(key, 'keyDown', heldKeys.has('Shift'))], context.operation());
+        heldKeys.add(key);
+      },
+      up: async (key) => {
+        await surface.input('keyboard.up', [fixtureKeySource(key, 'keyUp', heldKeys.has('Shift'))], context.operation());
+        heldKeys.delete(key);
+      },
+      press: (key) => surface.input('keyboard.press', [fixtureKeySource(key, 'press', heldKeys.has('Shift'))], context.operation()),
       type: (text) => surface.input('keyboard.type', [typeSource(text)], context.operation()),
     },
     mouse: {
-      move: (x, y) => surface.input('mouse.move', moveSources(Math.round(x), Math.round(y)), context.operation(), false),
+      move: (x, y) => surface.input('mouse.move', moveSources(Math.round(x), Math.round(y)), context.operation()),
       wheel: (deltaX, deltaY) => {
         const at = surface.pointerPosition();
         return surface.input('mouse.wheel', wheelSources(at.x, at.y, deltaX, deltaY), context.operation());
       },
       down: () => {
         const at = surface.pointerPosition();
-        return surface.input('mouse.down', pressDownSources(at.x, at.y), context.operation(), false);
+        return surface.input('mouse.down', pressDownSources(at.x, at.y), context.operation());
       },
       up: () => surface.input('mouse.up', releaseSources(), context.operation()),
     },
