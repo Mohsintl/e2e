@@ -50,8 +50,9 @@ interface CapturedTree {
 }
 
 /**
- * One semantic observation, with masked pixels when asked. Pixels a capture
- * could not produce are left out, as the contract allows and the Playwright
+ * One semantic observation, with masked pixels when asked, taken after the
+ * tree so no screenshot mask is ever read into it. Pixels a capture could
+ * not produce are left out, as the contract allows and the Playwright
  * surface does; the tree is never.
  */
 export async function observe(session: BidiSession, timeoutMs: number, signal: AbortSignal, options?: EngineObserveOptions): Promise<EngineSnapshot> {
@@ -59,10 +60,8 @@ export async function observe(session: BidiSession, timeoutMs: number, signal: A
   const deadline = Date.now() + timeoutMs;
   await unlessStale(session.run(domReady, [Math.min(SETTLE_TIMEOUT_MS, timeoutMs / 2)]), undefined);
   const viewport = await session.viewportSize();
-  const [captured, pixels] = await Promise.all([
-    captureTree(session, context, [], MAX_OBSERVED_NODES, deadline),
-    options?.pixels === true ? maskedPixels(session, viewport).then((value) => value, () => undefined) : undefined,
-  ]);
+  const captured = await captureTree(session, context, [], MAX_OBSERVED_NODES, deadline);
+  const pixels = options?.pixels === true ? await maskedPixels(session, viewport).then((value) => value, () => undefined) : undefined;
   if (signal.aborted) throw cancelled('observe cancelled');
   session.refs.publish(captured.generation);
   return {

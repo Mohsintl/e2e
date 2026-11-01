@@ -16,6 +16,7 @@ import {
   type ViewportSize,
 } from 'e2e/engine';
 import { CLOSED_SHADOW_ROOTS_KEY } from '../closed-shadow.ts';
+import { SECURE_FIELD_SELECTOR } from '../read-node.ts';
 import { ROOT_NODE_ID } from '../observation.ts';
 import { focusTakesKeys } from '../focus.ts';
 import { nearestPixel, swipeDistance, wheelDelta } from '../support.ts';
@@ -23,7 +24,7 @@ import { chromiumDrag } from './drag.ts';
 import { unlessStale } from './errors.ts';
 import type { NodeTarget } from './frames.ts';
 import { clickSources, dragPath, dragSources, dragStepMs, moveSources, pressSource, typeSource, wheelSources, type ClickOptions } from './input.ts';
-import { actionPoint as readActionPoint, boxSize, checkState, fileInput, fill as fillElement, focus, hitBlocker, nextFrame, selectOption, type ActionPoint } from './page.ts';
+import { actionPoint as readActionPoint, ELEMENT_DISABLED, boxSize, checkState, fileInput, fill as fillElement, focus, hitBlocker, nextFrame, selectOption, type ActionPoint } from './page.ts';
 import { ElementRef } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -31,13 +32,6 @@ import type { BidiSession } from './session.ts';
 const DEFAULT_LONG_PRESS_MS = 500;
 /** Pause between actionability checks of an element that is not ready yet. */
 const POLL_MS = 50;
-/** The roles an inherited `aria-disabled` reaches: the shared reader's list (`read-semantics.ts`), which lives inside its serialized function. */
-const ARIA_DISABLED_ROLES = [
-  'application', 'button', 'composite', 'gridcell', 'group', 'input', 'link', 'menuitem', 'scrollbar',
-  'separator', 'tab', 'checkbox', 'columnheader', 'combobox', 'grid', 'listbox', 'menu', 'menubar',
-  'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'radiogroup', 'row', 'rowheader', 'searchbox',
-  'select', 'slider', 'spinbutton', 'switch', 'tablist', 'textbox', 'toolbar', 'tree', 'treegrid', 'treeitem',
-];
 /** How a retry scrolls a covered element into view, as Playwright cycles them: as needed, then to the end, the centre, the start. */
 const SCROLL_ALIGNMENTS = [
   undefined,
@@ -171,12 +165,14 @@ async function settledPoint(
 ): Promise<{ x: number; y: number }> {
   if (checks.scroll) {
     for (const frame of session.frames.chain(target.context)) {
-      await session.run(readActionPoint, [frame.element, { enabled: false, scroll: true, key: CLOSED_SHADOW_ROOTS_KEY, ariaDisabledRoles: ARIA_DISABLED_ROLES }], frame.context);
+      await session.run(readActionPoint, [frame.element, { scroll: true, key: CLOSED_SHADOW_ROOTS_KEY }], frame.context);
     }
   }
   for (;;) {
     signal.throwIfAborted();
-    const point = await session.run(readActionPoint, [target.element, { ...checks, key: CLOSED_SHADOW_ROOTS_KEY, ariaDisabledRoles: ARIA_DISABLED_ROLES }], target.context);
+    const { enabled, ...placing } = checks;
+    const disabled = enabled && (await session.read<boolean>(ELEMENT_DISABLED, [target.element, readerOptions(session)], undefined, target.context));
+    const point: ActionPoint = disabled ? { state: 'disabled' } : await session.run(readActionPoint, [target.element, { ...placing, key: CLOSED_SHADOW_ROOTS_KEY }], target.context);
     if (point.state === 'ok') return point;
     if (point.state === 'detached') throw new EngineError('NODE_STALE', 'element is not attached to the DOM', { retryable: true });
     if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${blocker(point)}`, { retryable: false });
@@ -217,6 +213,11 @@ async function pointerPoint(session: BidiSession, target: NodeTarget, deadline: 
     if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${blocked}`, { retryable: false });
     await sleep(POLL_MS, undefined, { signal });
   }
+}
+
+/** What the shared reader takes besides its mode. */
+function readerOptions(session: BidiSession): { testIdAttribute: string; secureFieldSelector: string } {
+  return { testIdAttribute: session.settings.testIdAttribute, secureFieldSelector: SECURE_FIELD_SELECTOR };
 }
 
 /** What kept an element from being acted on, in Playwright's words. */
@@ -344,7 +345,7 @@ async function setInputFiles(session: BidiSession, target: NodeTarget, paths: re
 async function dragTo(session: BidiSession, source: NodeTarget, target: NodeTarget, deadline: Deadline, signal: AbortSignal): Promise<void> {
   await pointerPoint(session, target, deadline, false, signal);
   const from = await pointerPoint(session, source, deadline, true, signal);
-  const local = await session.run(readActionPoint, [target.element, { enabled: false, scroll: false, key: CLOSED_SHADOW_ROOTS_KEY, ariaDisabledRoles: ARIA_DISABLED_ROLES }], target.context);
+  const local = await session.run(readActionPoint, [target.element, { scroll: false, key: CLOSED_SHADOW_ROOTS_KEY }], target.context);
   if (local.state !== 'ok') throw new EngineError('NOT_ACTIONABLE', `dragTo: the target cannot be shown with the source: ${blocker(local)}`, { retryable: false });
   const box = await session.frames.viewportBox(session.connection, target.context);
   if (box === null) throw new EngineError('NOT_ACTIONABLE', 'dragTo: the target is in a frame that lays out no box, or is rotated', { retryable: false });

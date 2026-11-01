@@ -9,6 +9,7 @@
 import type { BrowsingContext } from 'webdriver-bidi-protocol';
 import { EngineError, TestError, type LocatorExpression, type SemanticNode } from 'e2e/engine';
 import { message } from '../support.ts';
+import { CLOSED_SHADOW_ROOTS_KEY } from '../closed-shadow.ts';
 import { frameContentInset } from '../observation.ts';
 import { BidiError, type BidiConnection } from './connection.ts';
 import { callFunction, ElementRef, WindowRef } from './script.ts';
@@ -156,7 +157,7 @@ export class FrameRegistry {
   async frameSteps(connection: BidiConnection, context: string): Promise<FrameStep[] | null> {
     const steps: FrameStep[] = [];
     for (const frame of this.chain(context)) {
-      const measured = await callFunction(connection, frame.context, FRAME_BOX, [frame.element]);
+      const measured = await callFunction(connection, frame.context, FRAME_BOX, [frame.element, CLOSED_SHADOW_ROOTS_KEY]);
       if (!isFrameBox(measured)) return null;
       steps.push(measured);
     }
@@ -200,12 +201,20 @@ function isFrameBox(value: unknown): value is FrameStep {
  * An iframe's content box in its own document's viewport, and the scale its
  * transforms (its own and its ancestors') apply to the document inside it;
  * null for a frame that lays out no box, or one a rotation, skew,
- * reflection, or 3D transform (its own or an ancestor's, `transform` or the
- * `rotate` and `scale` properties) turns, whose points no scale maps.
+ * reflection, or 3D transform (its own or a composed ancestor's, through
+ * slots and recorded closed roots; `transform` or the `rotate` and `scale`
+ * properties) turns, whose points no scale maps.
  */
-const FRAME_BOX = `(element) => {
+const FRAME_BOX = `(element, key) => {
   if (element.getClientRects().length === 0) return null;
-  for (let at = element; at !== null; at = at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? at.getRootNode().host : null)) {
+  const recorded = Reflect.get(globalThis, Symbol.for(key));
+  const parentOf = (at) => {
+    if (at.assignedSlot !== null) return at.assignedSlot;
+    const closed = at.parentElement === null ? undefined : recorded?.get(at.parentElement);
+    for (const slot of closed?.querySelectorAll('slot') ?? []) if (slot.assignedElements({ flatten: true }).includes(at)) return slot;
+    return at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? at.getRootNode().host : null);
+  };
+  for (let at = element; at !== null; at = parentOf(at)) {
     const style = getComputedStyle(at);
     if (style.rotate !== 'none' || style.scale.includes('-')) return null;
     if (style.transform !== 'none') {

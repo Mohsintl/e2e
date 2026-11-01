@@ -134,6 +134,17 @@ export const LOCATE_READ = `(options, wants, key, structured) => {
 }`;
 
 
+/**
+ * Whether an element is disabled as the shared reader decides it (its
+ * `:disabled` state, and `aria-disabled` on it or inherited by its role),
+ * so an action refuses exactly what an observation reports disabled.
+ */
+export const ELEMENT_DISABLED = `(element, options) => {
+  const read = (${readSemanticsFunction.toString()});
+  const [node] = read(document.documentElement, { ...options, mode: { kind: 'nodes', elements: [element] } });
+  return node === undefined ? false : node.states.disabled === true;
+}`;
+
 /** What `LOCATE_READ` reports beside the elements: each read, the index of its nearest read ancestor, and whether it displays its value (an input but a checkbox or radio, a textarea, a select). */
 export interface LocateMetadata {
   readonly nodes: RawNodeData[];
@@ -153,15 +164,8 @@ export type ActionPoint =
   | { readonly state: 'ok'; readonly x: number; readonly y: number }
   | { readonly state: 'detached' | 'hidden' | 'disabled' | 'moving' | 'outside' };
 
-/**
- * What `actionPoint` checks: `enabled` for an action a disabled control
- * refuses, `scroll` to bring the element into view first, `key` the
- * closed-roots registry. `ariaDisabledRoles` are the roles an inherited
- * `aria-disabled` reaches, as the shared reader reads it.
- */
+/** What `actionPoint` checks: `scroll` to bring the element into view first; `key` names the closed-roots registry. */
 export interface ActionPointOptions {
-  readonly enabled: boolean;
-  readonly ariaDisabledRoles: readonly string[];
   readonly scroll: boolean;
   /** How to scroll the element into view, for a retry after an overlay covered it; unset, only when its point is clipped. */
   readonly align?: { readonly block: ScrollLogicalPosition; readonly inline: ScrollLogicalPosition };
@@ -169,10 +173,8 @@ export interface ActionPointOptions {
 }
 
 /**
- * The checks Playwright runs before a pointer action, but the hit test:
- * attached, visible, enabled (`:disabled`, or the nearest `aria-disabled`
- * across shadow hosts on the element itself or on a widget, as the shared
- * reader decides), scrolled into view when its point is clipped by the
+ * The checks Playwright runs before a pointer action, but the hit test and
+ * the enabled check (`ELEMENT_DISABLED`): attached, visible, scrolled into view when its point is clipped by the
  * viewport or a scrolling ancestor (or as `align` says), and holding still
  * for a frame. The point is the centre of the element's first client rect
  * that shows at least a pixel, as Playwright's clickable point, in whole
@@ -184,19 +186,6 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
   const style = getComputedStyle(element);
   const box = element.getBoundingClientRect();
   if (box.width === 0 || box.height === 0 || style.visibility === 'hidden') return { state: 'hidden' };
-  if (options.enabled) {
-    const widget = ['button', 'a', 'input', 'select', 'textarea', 'option'].includes(element.localName) || options.ariaDisabledRoles.includes(element.getAttribute('role') ?? '');
-    let inherited = false;
-    for (let at: Element | null = element; at !== null; at = at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? (at.getRootNode() as ShadowRoot).host : null)) {
-      const aria = (at.getAttribute('aria-disabled') ?? '').toLowerCase();
-      if (aria === 'false') break;
-      if (aria === 'true') {
-        inherited = at === element || widget;
-        break;
-      }
-    }
-    if (element.matches(':disabled') || inherited) return { state: 'disabled' };
-  }
   type Area = { left: number; top: number; right: number; bottom: number };
   const viewport = (): { width: number; height: number } => ({
     width: document.documentElement.clientWidth || innerWidth,
@@ -422,7 +411,7 @@ export function boxSize(element: Element): { width: number; height: number } {
  * Covers every secure field of the document, through open and recorded
  * closed shadow roots, with an opaque box, and hides the caret, for one
  * screenshot; returns how many fields it covered. A field inside a top-layer
- * element (a modal dialog, an open popover, a fullscreen element) gets its
+ * element (found through the composed tree, slots included) (a modal dialog, an open popover, a fullscreen element) gets its
  * box inside that element, in its scaled coordinates, so the box moves with
  * it however the app reorders the top layer; any other field's box (and one
  * in a top-layer element turned or mirrored) sits in a manual popover of its
@@ -447,7 +436,12 @@ export function maskSecureFields(selector: string, key: string, token: string): 
     element.style.setProperty('all', 'initial', 'important');
     for (const [name, value] of Object.entries(styles)) element.style.setProperty(name, value, 'important');
   };
-  const parentOf = (at: Element): Element | null => at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? (at.getRootNode() as ShadowRoot).host : null);
+  const parentOf = (at: Element): Element | null => {
+    if (at.assignedSlot !== null) return at.assignedSlot;
+    const closed = at.parentElement === null ? undefined : recorded?.get(at.parentElement);
+    for (const slot of closed?.querySelectorAll('slot') ?? []) if (slot.assignedElements({ flatten: true }).includes(at)) return slot;
+    return at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? (at.getRootNode() as ShadowRoot).host : null);
+  };
   const scalesOnly = (from: Element): boolean => {
     for (let at: Element | null = from; at !== null; at = parentOf(at)) {
       const style = getComputedStyle(at);
