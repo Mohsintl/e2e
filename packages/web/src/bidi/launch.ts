@@ -28,6 +28,8 @@ export interface BidiBrowser {
   /** The browser's version, as the session reports it. */
   readonly version: string;
   readonly connection: BidiConnection;
+  /** Whether no other client drives this browser: a launch is, a browser attached over CDP may not be. */
+  readonly exclusive: boolean;
   /** Ends the session; a launched browser's process is killed and its profile removed, an attached one is left running. */
   close(): Promise<void>;
 }
@@ -201,6 +203,7 @@ export async function launchBidiBrowser(name: BidiBrowserName, options: BidiLaun
       name,
       version,
       connection,
+      exclusive: true,
       close: async () => {
         await Promise.race([
           releaseQuietly(connection.send('browser.close', {})),
@@ -234,6 +237,7 @@ export async function connectBidiOverCdp(endpoint: string, timeoutMs: number): P
       name: 'chromium',
       version,
       connection: open,
+      exclusive: false,
       close: async () => {
         await Promise.race([releaseQuietly(open.send('session.end', {})), new Promise((resolve) => setTimeout(resolve, 2_000))]);
         open.close();

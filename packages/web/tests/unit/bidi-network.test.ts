@@ -11,7 +11,10 @@ import { FakeBidi, settle } from '../helpers/bidi-fake.ts';
 
 const SITE = 'http://app.test';
 
-function network(fake: FakeBidi, options: { holdAll?: boolean; credentials?: { username: string; password: string } } = {}) {
+function network(
+  fake: FakeBidi,
+  options: { holdAll?: boolean; credentials?: { username: string; password: string }; exclusive?: boolean; ours?: (context: string | null) => boolean; onPage?: (context: string | null) => boolean } = {},
+) {
   const failures: Error[] = [];
   let intercepts = 0;
   fake.on('network.addIntercept', () => ({ result: { intercept: `intercept-${(intercepts += 1)}` } }));
@@ -20,7 +23,9 @@ function network(fake: FakeBidi, options: { holdAll?: boolean; credentials?: { u
   const net = new AttemptNetwork(fake.connection, {
     siteHeaders: (url) => (url.startsWith(SITE) ? { 'x-preview': 'token' } : undefined),
     credentials: options.credentials,
-    ours: () => true,
+    ours: (event) => options.ours?.(event.context) ?? true,
+    onPage: (context) => options.onPage?.(context) ?? true,
+    exclusive: options.exclusive ?? false,
     onFailure: (error) => failures.push(error),
     holdAll: options.holdAll ?? false,
   });
@@ -158,21 +163,106 @@ describe('AttemptNetwork', () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(690);
   });
 
-  it('resolves a response wait with the first matching response and reads its collected body', async () => {
+  it('resolves a response wait on the headers of the first match in the tab, and reads its body once loaded', async () => {
     const fake = new FakeBidi().on('network.getData', { result: { bytes: { type: 'string', value: '[1,2,3]' } } });
-    const { net } = network(fake);
+    const { net } = network(fake, { onPage: (context) => context === 'tab' });
     await net.bind('user-1');
     const waiting = net.waitForResponse((url) => url.endsWith('/api/users'), AbortSignal.timeout(5_000));
     await settle();
-    const completed = (id: string, url: string) => ({
+    const started = (id: string, url: string, context = 'tab') => ({
       ...request(id, url, []),
+      context,
       response: { url, status: 200, headers: [{ name: 'Content-Type', value: { type: 'string', value: 'application/json' } }] },
     });
-    fake.emit('network.responseCompleted', completed('other', `${SITE}/other`));
-    fake.emit('network.responseCompleted', completed('users', `${SITE}/api/users`));
+    fake.emit('network.responseStarted', started('other', `${SITE}/other`));
+    fake.emit('network.responseStarted', started('popup', `${SITE}/api/users`, 'popup'));
+    fake.emit('network.responseStarted', started('users', `${SITE}/api/users`));
     const response = await waiting;
     expect(response).toMatchObject({ url: `${SITE}/api/users`, status: 200, headers: { 'content-type': 'application/json' } });
-    expect((await response.body()).toString()).toBe('[1,2,3]');
+    let read = false;
+    const body = response.body().then((bytes) => {
+      read = true;
+      return bytes.toString();
+    });
+    await settle();
+    expect(read).toBe(false);
+    fake.emit('network.responseCompleted', started('users', `${SITE}/api/users`));
+    await expect(body).resolves.toBe('[1,2,3]');
     expect(fake.commands('network.getData')[0]?.params).toEqual({ dataType: 'response', request: 'users', collector: 'collector-1' });
+    expect(fake.commands('session.unsubscribe')).toHaveLength(1);
+  });
+
+  it('rejects a body read with the browser’s error when the load failed', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake);
+    await net.bind('user-1');
+    const waiting = net.waitForResponse(() => true, AbortSignal.timeout(5_000));
+    await settle();
+    fake.emit('network.responseStarted', { ...request('cut', `${SITE}/cut`, []), response: { url: `${SITE}/cut`, status: 200, headers: [] } });
+    const response = await waiting;
+    fake.emit('network.fetchError', { ...request('cut', `${SITE}/cut`, []), errorText: 'net::ERR_CONTENT_LENGTH_MISMATCH' });
+    await expect(response.body()).rejects.toThrow('net::ERR_CONTENT_LENGTH_MISMATCH');
+  });
+
+  it('adds one response collector for concurrent waits', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake);
+    await net.bind('user-1');
+    const first = net.waitForResponse(() => true, AbortSignal.timeout(5_000));
+    const second = net.waitForResponse(() => true, AbortSignal.timeout(5_000));
+    await settle();
+    fake.emit('network.responseStarted', { ...request('r', `${SITE}/r`, []), response: { url: `${SITE}/r`, status: 200, headers: [] } });
+    await Promise.all([first, second]);
+    expect(fake.commands('network.addDataCollector')).toHaveLength(1);
+    await net.bind('user-2');
+    expect(fake.commands('network.removeDataCollector')).toHaveLength(1);
+  });
+
+  it('on a browser of its own, holds every tab with one intercept and lets another user context’s requests go untouched', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake, { holdAll: true, exclusive: true, ours: (context) => context !== 'foreign' });
+    await net.bind('user-1');
+    await net.addContext('tab-1');
+    await net.addContext('tab-2');
+    expect(fake.commands('network.addIntercept').map((command) => command.params)).toEqual([{ phases: ['beforeRequestSent'] }]);
+    fake.emit('network.beforeRequestSent', { ...request('popup', `${SITE}/popup`), context: 'popup' });
+    fake.emit('network.beforeRequestSent', { ...request('foreign', `${SITE}/x`), context: 'foreign' });
+    await settle();
+    expect(fake.commands('network.continueRequest').map((command) => command.params)).toEqual([
+      { request: 'popup', headers: [{ name: 'accept', value: { type: 'string', value: '*/*' } }, { name: 'x-preview', value: { type: 'string', value: 'token' } }] },
+      { request: 'foreign' },
+    ]);
+  });
+
+  it('decides a request an intercept it since replaced still holds', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake, { holdAll: true });
+    await net.bind('user-1');
+    await net.addContext('tab-1');
+    await net.addContext('tab-2');
+    fake.emit('network.beforeRequestSent', request('held', `${SITE}/held`, ['intercept-1']));
+    await settle();
+    expect(fake.commands('network.continueRequest').map((command) => command.params['request'])).toEqual(['held']);
+  });
+
+  it('answers a blank-served tab’s documents before any route, and fails its other requests', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake);
+    await net.bind('user-1');
+    let routed = 0;
+    await net.addRoute(route(() => true, async () => {
+      routed += 1;
+    }));
+    const undo = await net.serveBlank('scratch');
+    fake.emit('network.beforeRequestSent', { ...request('doc', `${SITE}/`), context: 'scratch', navigation: 'nav-1' });
+    fake.emit('network.beforeRequestSent', { ...request('img', `${SITE}/a.png`), context: 'scratch' });
+    await settle();
+    expect(routed).toBe(0);
+    expect(fake.commands('network.provideResponse').map((command) => command.params['request'])).toEqual(['doc']);
+    expect(fake.commands('network.failRequest').map((command) => command.params['request'])).toEqual(['img']);
+    await undo();
+    fake.emit('network.beforeRequestSent', { ...request('later', `${SITE}/`), context: 'scratch', navigation: 'nav-2' });
+    await settle();
+    expect(routed).toBe(1);
   });
 });

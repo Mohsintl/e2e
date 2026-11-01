@@ -27,8 +27,11 @@ export type PageValue = string | number | boolean | null | undefined | ElementRe
 /** A page function: a self-contained function serialized with `toString()`, or source composed from one. */
 export type PageFunction = string | ((...args: never[]) => unknown);
 
+/** Plain JSON, which crosses the wire as it is. */
+export type PageJson = string | number | boolean | null | PageJson[] | { [key: string]: PageJson };
+
 /** A page value as it crosses the wire: each node as its reference, each window as its browsing context. */
-export type Wire<T> = T extends Node ? ElementRef : T extends Window ? WindowRef : T extends readonly unknown[] ? { [K in keyof T]: Wire<T[K]> } : T extends object ? { [K in keyof T]: Wire<T[K]> } : T;
+export type Wire<T> = T extends PageJson ? T : T extends Node ? ElementRef : T extends Window ? WindowRef : T extends readonly unknown[] ? { [K in keyof T]: Wire<T[K]> } : T extends object ? { [K in keyof T]: Wire<T[K]> } : T;
 
 /** A typed page function: self-contained, so its source runs in the page alone. */
 export type TypedPageFunction = (...args: never[]) => unknown;

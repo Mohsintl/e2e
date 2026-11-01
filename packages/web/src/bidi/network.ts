@@ -25,6 +25,10 @@ export interface InterceptedRequest {
   readonly headers: Readonly<Record<string, string>>;
   /** The request body, when it has one the browser collected. */
   readonly postData?: string;
+  /** The same body as the browser sent it, byte for byte. */
+  readonly body?: Buffer;
+  /** The cookies the browser sends with it, as one `cookie` header value. */
+  readonly cookie?: string;
 }
 
 /** What a route does with one held request; exactly one of these runs. */
@@ -47,7 +51,7 @@ export interface ObservedResponse {
   readonly url: string;
   readonly status: number;
   readonly headers: Readonly<Record<string, string>>;
-  /** The body the browser collected; rejects when it kept none (a redirect, an evicted body). */
+  /** The body once it finished loading; rejects when the load failed or the browser kept none (a redirect, an evicted body). */
   body(): Promise<Buffer>;
 }
 
@@ -57,6 +61,10 @@ export interface AttemptNetworkOptions {
   readonly credentials: { readonly username: string; readonly password: string } | undefined;
   /** Whether an event belongs to the attempt. */
   readonly ours: (event: { readonly userContext?: string | null; readonly context: string | null }) => boolean;
+  /** Whether a context is the attempt's tab or a frame in it, which a response wait listens to. */
+  readonly onPage: (context: string | null) => boolean;
+  /** Whether no other client drives the browser, so one intercept can cover every tab from its first request. */
+  readonly exclusive: boolean;
   /** Takes a failure on a path no step awaits (deciding a held request, answering a challenge), for the next step to fail with. */
   readonly onFailure: (error: Error) => void;
 }
@@ -94,11 +102,17 @@ export class AttemptNetwork {
   private readonly tops = new Set<string>();
   /** Whether every request is held: site headers to add, or a route registered. */
   private holding: boolean;
+  /** Top-level tabs whose every document request is answered with a blank page (`serveBlank`), before any route. */
+  private readonly blank = new Set<string>();
   private intercept: string | undefined;
   private authIntercept: string | undefined;
+  /** Every intercept this network added to the bound user context, so a request a replaced one still holds is decided. */
+  private readonly intercepts = new Set<string>();
   private subscription: string | undefined;
-  private collector: string | undefined;
+  private collector: Promise<string> | undefined;
   private requestCollector: string | undefined;
+  /** Listeners of response bodies still loading, ended with the network. */
+  private readonly pendingBodies = new Set<() => void>();
   private readonly inflight = new Set<string>();
   private lastSettled = Date.now();
   private readonly answered = new Set<string>();
@@ -114,7 +128,11 @@ export class AttemptNetwork {
   }
 
   private get needsEvents(): boolean {
-    return this.holding || this.options.credentials !== undefined || this.listeners.length > 0;
+    return this.holds || this.options.credentials !== undefined || this.listeners.length > 0;
+  }
+
+  private get holds(): boolean {
+    return this.holding || this.blank.size > 0;
   }
 
   private change(work: () => Promise<void>): Promise<void> {
@@ -178,19 +196,49 @@ export class AttemptNetwork {
     }
   }
 
-  /** Replaces the intercepts with ones over the current tabs; with no tab, none. A new one is in place before the old goes. */
+  /**
+   * Brings the intercepts in line with what the attempt needs. On a browser
+   * no other client drives, one intercept covers every tab, so a tab the app
+   * opens is held from its first request; otherwise each covers the current
+   * tabs exactly, so other clients keep their own requests, and is replaced,
+   * the new one in place before the old goes.
+   */
   private async refreshIntercepts(): Promise<void> {
     const connection = this.connection;
     const contexts = [...this.tops];
+    const add = async (phase: 'beforeRequestSent' | 'authRequired'): Promise<string> => {
+      const { intercept } = await connection.send('network.addIntercept', {
+        phases: [phase],
+        ...(this.options.exclusive ? {} : { contexts: contexts as [string, ...string[]] }),
+      });
+      this.intercepts.add(intercept);
+      return intercept;
+    };
     const replace = async (wanted: boolean, phase: 'beforeRequestSent' | 'authRequired', old: string | undefined): Promise<string | undefined> => {
-      const next = wanted && contexts.length > 0
-        ? (await connection.send('network.addIntercept', { phases: [phase], contexts: contexts as [string, ...string[]] })).intercept
-        : undefined;
+      if (this.options.exclusive) return wanted ? (old ?? (await add(phase))) : old;
+      const next = wanted && contexts.length > 0 ? await add(phase) : undefined;
       if (old !== undefined) await releaseQuietly(connection.send('network.removeIntercept', { intercept: old }));
       return next;
     };
-    this.intercept = await replace(this.holding, 'beforeRequestSent', this.intercept);
+    this.intercept = await replace(this.holds, 'beforeRequestSent', this.intercept);
     this.authIntercept = await replace(this.options.credentials !== undefined, 'authRequired', this.authIntercept);
+  }
+
+  /**
+   * Answers every document request of `context`, a tab of the attempt, with
+   * a blank page before any route sees it, so a page at an origin can run
+   * script without the app's server seeing a request. Returns the undo.
+   */
+  async serveBlank(context: string): Promise<() => Promise<void>> {
+    await this.change(async () => {
+      this.blank.add(context);
+      this.tops.add(context);
+      await this.subscribe();
+      await this.refreshIntercepts();
+    });
+    return () => this.change(async () => {
+      this.blank.delete(context);
+    });
   }
 
   /**
@@ -225,13 +273,32 @@ export class AttemptNetwork {
   }
 
   private onRequest(event: BidiEventParams<'network.beforeRequestSent'>): void {
-    if (!this.options.ours(event)) return;
+    const blocked = event.isBlocked && (event.intercepts ?? []).some((intercept) => this.intercepts.has(intercept));
+    if (!this.options.ours(event)) {
+      if (blocked) void this.connection.send('network.continueRequest', { request: event.request.request }).catch((cause: unknown) => this.fail(cause));
+      return;
+    }
     this.inflight.add(event.request.request);
-    const intercepts: readonly string[] = event.intercepts ?? [];
-    if (!event.isBlocked || this.intercept === undefined || !intercepts.includes(this.intercept)) return;
-    void this.route(event).catch(async (cause: unknown) => {
+    if (!blocked) return;
+    const decide = event.context !== null && this.blank.has(event.context) ? this.answerBlank(event) : this.route(event);
+    void decide.catch(async (cause: unknown) => {
       await releaseQuietly(this.connection.send('network.failRequest', { request: event.request.request }));
       this.fail(cause);
+    });
+  }
+
+  /** Answers a document request with an empty page; any other request of a blank-served tab fails. */
+  private async answerBlank(event: BidiEventParams<'network.beforeRequestSent'>): Promise<void> {
+    const request = event.request.request;
+    if (event.navigation === null) {
+      await this.connection.send('network.failRequest', { request });
+      return;
+    }
+    await this.connection.send('network.provideResponse', {
+      request,
+      statusCode: 200,
+      headers: [{ name: 'content-type', value: { type: 'string', value: 'text/html' } }],
+      body: { type: 'string', value: '<!doctype html><title></title>' },
     });
   }
 
@@ -254,6 +321,7 @@ export class AttemptNetwork {
       url: request.url,
       method: request.method,
       headers: headerRecord(request.headers),
+      ...(request.cookies.length === 0 ? {} : { cookie: request.cookies.map((cookie) => `${cookie.name}=${bytesText(cookie.value)}`).join('; ') }),
       ...(matching.length === 0 ? {} : await this.postData(request)),
     };
     for (const route of matching) {
@@ -273,12 +341,13 @@ export class AttemptNetwork {
     await this.continue(intercepted);
   }
 
-  /** The request's body when the collector kept one; a body it did not keep (too large, a stream) is none. */
-  private async postData(request: Network.RequestData): Promise<{ postData?: string }> {
+  /** The request's body when the collector kept one, as text and bytes; a body it did not keep (too large, a stream) is none. */
+  private async postData(request: Network.RequestData): Promise<{ postData?: string; body?: Buffer }> {
     if (this.requestCollector === undefined || (request.bodySize ?? 0) === 0) return {};
     try {
       const { bytes } = await this.connection.send('network.getData', { dataType: 'request', request: request.request, collector: this.requestCollector });
-      return { postData: bytes.type === 'string' ? bytes.value : Buffer.from(bytes.value, 'base64').toString() };
+      const body = bytes.type === 'string' ? Buffer.from(bytes.value) : Buffer.from(bytes.value, 'base64');
+      return { postData: body.toString(), body };
     } catch (cause) {
       if (cause instanceof BidiError && cause.error === 'no such network data') return {};
       throw cause;
@@ -355,48 +424,80 @@ export class AttemptNetwork {
   }
 
   /**
-   * Resolves with the first response whose URL `matches` that completes from
-   * now on. Its body is collected from the moment of the call, so start the
-   * wait before the action that triggers the response.
+   * Resolves with the first response of the attempt's tab whose URL
+   * `matches`, once its headers arrive. Its body is collected from the moment
+   * of the call, so start the wait before the action that triggers the
+   * response; reading it waits for the load to finish.
    */
   async waitForResponse(matches: (url: string) => boolean, signal: AbortSignal): Promise<ObservedResponse> {
-    const collecting = this.collectResponses();
+    const connection = this.connection;
     let off: () => void = () => undefined;
-    const completed = new Promise<BidiEventParams<'network.responseCompleted'>>((resolve) => {
-      off = this.connection.on('network.responseCompleted', (event) => {
-        if (this.options.ours(event) && matches(event.response.url)) resolve(event);
+    const started = new Promise<BidiEventParams<'network.responseStarted'>>((resolve) => {
+      off = connection.on('network.responseStarted', (event) => {
+        if (this.options.onPage(event.context) && matches(event.response.url)) resolve(event);
       });
     });
+    let subscription: string | undefined;
     try {
-      await collecting;
-      const event = await raceAbort(completed, signal, 'waitForResponse');
-      const collector = this.collector;
+      const collector = await this.collectResponses();
+      subscription = (await connection.send('session.subscribe', { events: ['network.responseStarted'], ...(this.userContext === undefined ? {} : { userContexts: [this.userContext] }) })).subscription;
+      const event = await raceAbort(started, signal, 'waitForResponse');
+      const loaded = this.loaded(event.request.request);
       return {
         url: event.response.url,
         status: event.response.status,
         headers: headerRecord(event.response.headers),
         body: async () => {
-          const data = await this.connection.send('network.getData', {
-            dataType: 'response',
-            request: event.request.request,
-            ...(collector === undefined ? {} : { collector }),
-          });
+          await loaded;
+          const data = await connection.send('network.getData', { dataType: 'response', request: event.request.request, collector });
           return data.bytes.type === 'string' ? Buffer.from(data.bytes.value) : Buffer.from(data.bytes.value, 'base64');
         },
       };
     } finally {
       off();
+      if (subscription !== undefined) await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
     }
   }
 
-  private async collectResponses(): Promise<void> {
-    if (this.collector !== undefined || this.userContext === undefined) return;
-    const { collector } = await this.connection.send('network.addDataCollector', {
+  /** Settles once `request` finished loading, rejecting with the browser's error text when it failed. */
+  private loaded(request: string): Promise<void> {
+    const connection = this.connection;
+    const done = new Promise<void>((resolve, reject) => {
+      const offs = [
+        connection.on('network.responseCompleted', (event) => {
+          if (event.request.request === request) end(() => resolve());
+        }),
+        connection.on('network.fetchError', (event) => {
+          if (event.request.request === request) end(() => reject(new Error(event.errorText)));
+        }),
+      ];
+      const stop = (): void => {
+        for (const each of offs) each();
+        this.pendingBodies.delete(stop);
+      };
+      const end = (settle: () => void): void => {
+        stop();
+        settle();
+      };
+      this.pendingBodies.add(stop);
+    });
+    done.catch(() => undefined);
+    return done;
+  }
+
+  /** The bound user context's response collector, added once however many waits ask at the same time. */
+  private collectResponses(): Promise<string> {
+    const userContext = this.userContext;
+    this.collector ??= this.connection.send('network.addDataCollector', {
       dataTypes: ['response'],
       maxEncodedDataSize: MAX_COLLECTED_BODY,
-      userContexts: [this.userContext],
+      ...(userContext === undefined ? {} : { userContexts: [userContext] }),
+    }).then(({ collector }) => collector);
+    const pending = this.collector;
+    pending.catch(() => {
+      if (this.collector === pending) this.collector = undefined;
     });
-    this.collector = collector;
+    return pending;
   }
 
   /** Removes the bound user context's intercepts, collectors, and subscription. */
@@ -405,17 +506,20 @@ export class AttemptNetwork {
     const removals = [
       this.intercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.intercept }),
       this.authIntercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.authIntercept }),
-      this.collector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.collector }),
+      this.collector?.then((collector) => connection.send('network.removeDataCollector', { collector })),
       this.requestCollector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.requestCollector }),
       this.subscription === undefined ? undefined : connection.send('session.unsubscribe', { subscriptions: [this.subscription] }),
     ];
     this.intercept = this.authIntercept = this.collector = this.requestCollector = this.subscription = undefined;
+    this.intercepts.clear();
+    this.blank.clear();
     await Promise.all(removals.map(releaseQuietly));
   }
 
   /** Ends the attempt's network: listeners, routes, intercepts, collectors, and subscription. */
   async dispose(): Promise<void> {
     for (const off of this.listeners.splice(0)) off();
+    for (const stop of this.pendingBodies) stop();
     this.routes = [];
     await this.change(() => this.release());
   }
@@ -426,10 +530,15 @@ function headerRecord(headers: readonly Network.Header[]): Record<string, string
   const out: Record<string, string> = {};
   for (const header of headers) {
     const name = header.name.toLowerCase();
-    const value = header.value.type === 'string' ? header.value.value : Buffer.from(header.value.value, 'base64').toString();
+    const value = bytesText(header.value);
     out[name] = out[name] === undefined ? value : `${out[name]}, ${value}`;
   }
   return out;
+}
+
+/** A BiDi bytes value as text. */
+function bytesText(value: Network.BytesValue): string {
+  return value.type === 'string' ? value.value : Buffer.from(value.value, 'base64').toString();
 }
 
 function lowercase(headers: Readonly<Record<string, string>>): Record<string, string> {

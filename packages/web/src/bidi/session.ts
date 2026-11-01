@@ -162,7 +162,9 @@ export class BidiSession {
   private creating: Promise<string> | undefined;
   private preloads: string[] = [];
   private readonly addedScripts: string[] = [];
-  private readonly granted = new Set<string>();
+  private readonly granted = new Map<string, Promise<void>>();
+  /** The web origins the attempt's documents have been at, whose storage a saved session keeps. */
+  readonly visited = new Set<string>();
   private artifactCounter = 0;
 
   constructor(
@@ -177,6 +179,8 @@ export class BidiSession {
       siteHeaders: settings.siteHeaders,
       credentials: attempt.credentials,
       ours: (event) => this.owns(event.context),
+      onPage: (context) => this.onPage(context),
+      exclusive: browser.exclusive,
       onFailure: (error) => this.latch.latch(error),
       holdAll: settings.holdRequests,
     });
@@ -208,6 +212,7 @@ export class BidiSession {
     const { userContext } = await connection.send('browser.createUserContext', {});
     this.userContext = userContext;
     this.granted.clear();
+    this.visited.clear();
     const scoped = { userContexts: [userContext] as [string] };
     const sources = [CLOSED_SHADOW_ROOTS_INIT_SCRIPT, ...this.settings.initScripts.forAttempt(), ...this.addedScripts];
     const { userAgent, locale, timezoneId } = this.settings;
@@ -337,7 +342,7 @@ export class BidiSession {
    * converted back the same way; a promise it returns is awaited.
    */
   async run<F extends TypedPageFunction>(fn: F, args: Wire<Parameters<F>> & readonly PageArgument[], context?: string): Promise<Wire<Awaited<ReturnType<F>>>> {
-    const value = await callFunction(this.connection, context ?? this.requireContext(), fn, args, { awaitPromise: true });
+    const value = await callFunction(this.connection, context ?? this.requireContext(), fn, args, { awaitPromise: true, maxObjectDepth: null });
     return value as Wire<Awaited<ReturnType<F>>>;
   }
 
@@ -373,14 +378,26 @@ export class BidiSession {
     }
   }
 
-  /** Grants the configured permissions on `url`'s origin, once per origin and user context: BiDi grants per origin. */
-  async grantPermissions(url: string): Promise<void> {
-    if (this.settings.permissions.length === 0 || !URL.canParse(url)) return;
-    const { origin } = new URL(url);
-    if (origin === 'null' || this.granted.has(origin)) return;
-    this.granted.add(origin);
-    await Promise.all(this.settings.permissions.map((name) =>
-      this.connection.send('permissions.setPermission', { descriptor: { name }, state: 'granted', origin, userContext: this.userContext })));
+  /**
+   * Records a document of the attempt starting to load `url`: its origin is
+   * remembered for a saved session, and granted the configured permissions,
+   * once per origin and user context (BiDi grants per origin). Concurrent
+   * calls for one origin share its grant.
+   */
+  visit(url: string): Promise<void> {
+    if (!URL.canParse(url)) return Promise.resolve();
+    const { origin, protocol } = new URL(url);
+    if (protocol !== 'http:' && protocol !== 'https:') return Promise.resolve();
+    this.visited.add(origin);
+    if (this.settings.permissions.length === 0) return Promise.resolve();
+    let grant = this.granted.get(origin);
+    if (grant === undefined) {
+      const userContext = this.userContext;
+      grant = Promise.all(this.settings.permissions.map((name) =>
+        this.connection.send('permissions.setPermission', { descriptor: { name }, state: 'granted', origin, userContext }))).then(() => undefined);
+      this.granted.set(origin, grant);
+    }
+    return grant;
   }
 
   /** The viewport in CSS pixels: the attempt's, else the window's. */
