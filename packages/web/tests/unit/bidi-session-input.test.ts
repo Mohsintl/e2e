@@ -74,4 +74,13 @@ describe('BidiSession.close', () => {
     expect(fake.commands('browser.removeUserContext').map((command) => command.params['userContext'])).toEqual(['late']);
     expect(fake.commands('script.addPreloadScript')).toEqual([]);
   });
+
+  it('ends the attempt’s lifetime, so work it started that nothing awaits stops', async () => {
+    const fake = new FakeBidi();
+    const closing = session(fake);
+    const lifetime = closing.lifetime;
+    expect(lifetime.aborted).toBe(false);
+    await closing.close();
+    expect(lifetime.aborted).toBe(true);
+  });
 });

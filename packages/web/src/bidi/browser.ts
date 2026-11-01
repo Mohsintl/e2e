@@ -25,7 +25,7 @@ import { routePatternMatches, routePatternsEqual } from '../route-pattern.ts';
 import { fixtureKeySource, moveSources, pressDownSources, releaseSources, typeSource, wheelSources } from './input.ts';
 import type { InterceptedRequest, NetworkRoute, RouteDecisions } from './network.ts';
 import type { PageArgument } from './script.ts';
-import type { BidiSurface } from './surface.ts';
+import type { AttemptScope, BidiSurface } from './surface.ts';
 
 /** Builds the attempt's `browser` fixture over the BiDi surface. */
 export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFixtureContext): Browser {
@@ -39,7 +39,8 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
     deadlineFor: (timeout) => new Deadline(context.operation(timeout ?? context.timeouts.assertion).timeoutMs),
     context,
   });
-  const latch = surface.attemptLatch();
+  const scope = surface.attemptScope();
+  const { latch } = scope;
   const routes: { readonly pattern: TextPattern; readonly route: NetworkRoute }[] = [];
   const removeRoutes = (match: (stored: (typeof routes)[number]) => boolean): Promise<void> => {
     const removed = new Set(routes.filter(match).map((stored) => stored.route));
@@ -72,7 +73,7 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
       const route: NetworkRoute = {
         predicate: (url) => routePatternMatches(wirePattern, url.href),
         handle: (request, decisions) => {
-          const work = runRouteHandler(handler, routeAdapter(surface, context, request, decisions), (error) => latch.latch(error), context, (file) => surface.projectPath(file));
+          const work = runRouteHandler(handler, routeAdapter(surface, scope, context, request, decisions), (error) => latch.latch(error), context, (file) => surface.projectPath(file));
           latch.track('route', work);
           return work;
         },
@@ -163,7 +164,8 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
 }
 
 /**
- * A held request as the shared route contract drives it. `fetch` replays it
+ * A held request as the shared route contract drives it, bound to the
+ * attempt it was held in (`scope`). `fetch` replays it
  * from Node as the browser sent it (its body bytes, its cookies, and the
  * site headers) within the operation's budget, and stores the cookies the
  * response sets in the user context, as Playwright's `route.fetch` does. A
@@ -171,7 +173,7 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
  * credentials, as the browser answers its own. A body the browser did not
  * keep refuses the replay rather than send none.
  */
-function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, request: InterceptedRequest, decisions: RouteDecisions): RouteAdapter {
+function routeAdapter(surface: BidiSurface, scope: AttemptScope, context: EngineFixtureContext, request: InterceptedRequest, decisions: RouteDecisions): RouteAdapter {
   return {
     request: { url: request.url, method: request.method, headers: request.headers, ...(request.postData === undefined ? {} : { postData: request.postData }) },
     fetch: async () => {
@@ -179,7 +181,7 @@ function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, reque
         throw new TestError('ACTION_FAILED', 'route.fetch: the browser kept none of the request body (too large or streamed), so the request cannot be replayed');
       }
       const operation = context.operation();
-      const signal = AbortSignal.any([operation.signal, AbortSignal.timeout(operation.timeoutMs)]);
+      const signal = AbortSignal.any([operation.signal, AbortSignal.timeout(operation.timeoutMs), scope.lifetime]);
       const headers = { ...request.headers, ...(request.cookie === undefined ? {} : { cookie: request.cookie }), ...surface.siteHeaders(request.url) };
       const send = (extra: Record<string, string>): Promise<Response> => fetch(request.url, {
         method: request.method,
@@ -189,13 +191,13 @@ function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, reque
         ...(request.body === undefined ? {} : { body: new Uint8Array(request.body) }),
       });
       let fetched = await send({});
-      const credentials = surface.attemptCredentials();
+      const { credentials } = scope;
       if (fetched.status === 401 && credentials !== undefined && /^basic\b/i.test(fetched.headers.get('www-authenticate') ?? '')) {
         await fetched.body?.cancel();
         fetched = await send({ authorization: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}` });
       }
       const cookies = fetched.headers.getSetCookie().flatMap((header) => setCookieOf(header, new URL(request.url)) ?? []);
-      if (cookies.length > 0) await surface.setCookies(cookies, operation);
+      if (cookies.length > 0) await scope.storeCookies(cookies);
       const text = await readResponseBody('route.fetch', async () => Buffer.from(await fetched.arrayBuffer()));
       // oxlint-disable-next-line e2e/no-unchecked-json -- public API: the caller names T, unknown by default
       return { url: request.url, status: fetched.status, headers: Object.fromEntries(fetched.headers), json: async <T = unknown>() => JSON.parse(await text()) as T, text };

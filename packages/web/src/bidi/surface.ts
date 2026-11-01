@@ -218,12 +218,30 @@ export class BidiSurface {
     await this.session?.latch.settle(context);
   }
 
-  /** Ends the attempt's session. Idempotent. */
+  /**
+   * Ends the attempt's session. Idempotent. A close that fails or outlives
+   * the cleanup budget leaves resources the browser may still hold, so the
+   * browser is retired (the next attempt launches or attaches afresh) and the
+   * failure reported.
+   */
   async endAttempt(context: EngineCleanupContext): Promise<void> {
     const session = this.session;
     this.session = undefined;
     if (session === undefined) return;
-    await withinCleanupBudget(session.close(), context);
+    try {
+      await boundedCleanup(session.close(), context, 'attempt cleanup');
+    } catch (cause) {
+      await this.retireBrowser(context);
+      throw classify(cause, 'attempt cleanup');
+    }
+  }
+
+  /** Closes the browser, best effort, so the next attempt opens a fresh one. */
+  private async retireBrowser(context: EngineCleanupContext): Promise<void> {
+    const browser = this.browser;
+    this.browser = undefined;
+    this.unrouteEvents();
+    if (browser !== undefined) await withinCleanupBudget(browser.close(), context);
   }
 
   /** Ends the attempt, closes the browser, and releases a provider's lease, each attempted whatever the others did. */
@@ -233,7 +251,7 @@ export class BidiSurface {
     if (this.acquiring !== undefined) await releaseQuietly(withinCleanupBudget(this.acquiring, context));
     const browser = this.browser;
     this.browser = undefined;
-    if (browser !== undefined) results.push(...(await Promise.allSettled([withinCleanupBudget(browser.close(), context)])));
+    if (browser !== undefined) results.push(...(await Promise.allSettled([boundedCleanup(browser.close(), context, 'browser close')])));
     this.unrouteEvents();
     results.push(...(await Promise.allSettled([this.options.leases?.dispose(context)])));
     const failed = results.find((result) => result.status === 'rejected');
@@ -398,15 +416,27 @@ export class BidiSurface {
     return this.session?.isHeld(SHIFT_KEY) ?? false;
   }
 
-  /** The running attempt's basic-auth credentials, which a route's own `fetch` answers a challenge with. */
-  attemptCredentials(): { readonly username: string; readonly password: string } | undefined {
-    return this.requireSession().attempt.credentials;
+  /**
+   * What a fixture binds to the attempt it serves, once: its latch, its
+   * basic-auth credentials, its lifetime, and its cookie jar. A route handler
+   * that outlives the attempt then fails, reads, and writes only its own, and
+   * its work is cancelled when the attempt closes.
+   */
+  attemptScope(): AttemptScope {
+    const session = this.requireSession();
+    return {
+      latch: session.latch,
+      credentials: session.attempt.credentials,
+      lifetime: session.lifetime,
+      storeCookies: async (cookies) => {
+        for (const cookie of cookies) {
+          session.lifetime.throwIfAborted();
+          await session.connection.send('storage.setCookie', { cookie, partition: session.partition() });
+        }
+      },
+    };
   }
 
-  /** The running attempt's error latch, which a fixture binds once so a late handler failure never lands on a later attempt. */
-  attemptLatch(): ErrorLatch {
-    return this.requireSession().latch;
-  }
 
   /** The next response of the tab whose URL `matches`. */
   waitForResponse(matches: (url: string) => boolean, operation: OperationContext): Promise<ObservedResponse> {
@@ -501,6 +531,28 @@ export class BidiSurface {
   stopVideo(operation: OperationContext): Promise<readonly VideoSegment[]> {
     return this.guard(operation, 'video', (session, budget) => stopVideo(session, budget.signal));
   }
+}
+
+/** What `attemptScope` binds: the attempt's own latch, credentials, lifetime, and cookie jar. */
+export interface AttemptScope {
+  readonly latch: ErrorLatch;
+  readonly credentials: { readonly username: string; readonly password: string } | undefined;
+  /** Aborts when the attempt closes. */
+  readonly lifetime: AbortSignal;
+  storeCookies(cookies: readonly Storage.PartialCookie[]): Promise<void>;
+}
+
+/**
+ * Waits for a cleanup step within the cleanup budget, keeping its failure:
+ * one that outlives the budget fails as `OPERATION_TIMEOUT`, one cancelled
+ * as `CANCELLED`.
+ */
+function boundedCleanup(work: Promise<unknown>, budget: EngineCleanupContext, label: string): Promise<void> {
+  return withTimeout(
+    raceAbort(work.then(() => undefined), budget.signal, label),
+    budget.timeoutMs,
+    () => new EngineError('OPERATION_TIMEOUT', `${label} did not finish within ${budget.timeoutMs}ms`, { retryable: false }),
+  );
 }
 
 /** Firefox preferences that set the configured media features for every page, since Firefox before 159 has no BiDi media override. */

@@ -7,7 +7,7 @@
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import type { Emulation, Input, Storage } from 'webdriver-bidi-protocol';
-import { EngineError, obj, type AppLogEntry, type EngineSnapshot, type NodeRef, type ViewportPoint, type ViewportSize } from 'e2e/engine';
+import { EngineError, obj, withTimeout, type AppLogEntry, type EngineSnapshot, type NodeRef, type ViewportPoint, type ViewportSize } from 'e2e/engine';
 import { CLOSED_SHADOW_ROOTS_INIT_SCRIPT } from '../closed-shadow.ts';
 import { DialogRouter } from '../dialogs.ts';
 import type { ConfiguredInitScripts } from '../init-scripts.ts';
@@ -25,6 +25,9 @@ import { viewportSize } from './page.ts';
 import { callFunction, type CallOptions, type PageArgument, type PageValue, type TypedPageFunction, type Wire } from './script.ts';
 import type { BidiVideo } from './video.ts';
 import type { ProviderVideo } from '../provider-video.ts';
+
+/** How long one step of closing an attempt may take before the next runs. */
+const CLOSE_STEP_MS = 10_000;
 
 /**
  * Refuses service worker registration, as Playwright's `serviceWorkers:
@@ -180,6 +183,7 @@ export class BidiSession {
   private creating: Promise<string> | undefined;
   /** Set by `close`: a user context that opens after it (a reset or restore the attempt gave up on) is removed at once. */
   private closed = false;
+  private readonly ended = new AbortController();
   private preloads: string[] = [];
   private readonly addedScripts: string[] = [];
   private readonly granted = new Map<string, Promise<void>>();
@@ -205,6 +209,11 @@ export class BidiSession {
       holdAll: settings.holdRequests,
     });
     this.downloads = new AttemptDownloads(browser.connection);
+  }
+
+  /** Aborts when the attempt closes, ending work it started that nothing awaits any more. */
+  get lifetime(): AbortSignal {
+    return this.ended.signal;
   }
 
   /** The browser's BiDi connection. */
@@ -524,17 +533,21 @@ export class BidiSession {
   /**
    * Ends the attempt: its video, user context, network, and download
    * directory, each attempted whatever the others did; the first failure is
-   * reported once all ran. A browser already gone leaves only local work. A
+   * reported once all ran, each remote step bounded so a hung one never keeps
+   * the rest from running. A browser already gone leaves only local work. A
    * replacement user context still opening removes itself when it lands.
    */
   async close(): Promise<void> {
     this.closed = true;
+    this.ended.abort();
     const gone = this.connection.isClosed;
+    const step = (label: string, work: () => unknown): (() => Promise<unknown>) => () =>
+      withTimeout(Promise.resolve().then(work), CLOSE_STEP_MS, () => new EngineError('OPERATION_TIMEOUT', `${label} did not finish within ${CLOSE_STEP_MS}ms`, { retryable: false }));
     const results = await settleEach([
-      () => this.video?.stop(),
-      () => this.providerVideo?.abandon(AbortSignal.timeout(10_000)),
-      () => (gone ? undefined : this.dropUserContext()),
-      () => this.network.dispose(),
+      step('video stop', () => this.video?.stop()),
+      step('provider video', () => this.providerVideo?.abandon(AbortSignal.timeout(CLOSE_STEP_MS))),
+      step('user context removal', () => (gone ? undefined : this.dropUserContext())),
+      step('network release', () => this.network.dispose()),
       () => this.downloads.dispose(),
     ]);
     const failed = results.find((result) => result.status === 'rejected');
