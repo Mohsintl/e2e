@@ -244,14 +244,16 @@ export class AttemptNetwork {
         }
       }
     };
-    const replace = async (wanted: boolean, phase: 'beforeRequestSent' | 'authRequired', old: string | undefined): Promise<string | undefined> => {
-      if (this.options.exclusive) return wanted ? (old ?? (await add(phase))) : old;
-      const next = wanted && live().length > 0 ? await add(phase) : undefined;
+    const replace = async (wanted: boolean, phase: 'beforeRequestSent' | 'authRequired', old: string | undefined, keep: (intercept: string | undefined) => void): Promise<void> => {
+      if (this.options.exclusive) {
+        keep(wanted ? (old ?? (await add(phase))) : old);
+        return;
+      }
+      keep(wanted && live().length > 0 ? await add(phase) : undefined);
       if (old !== undefined) await alreadyGone(connection.send('network.removeIntercept', { intercept: old }), connection);
-      return next;
     };
-    this.intercept = await replace(this.holds, 'beforeRequestSent', this.intercept);
-    this.authIntercept = await replace(this.options.credentials !== undefined, 'authRequired', this.authIntercept);
+    await replace(this.holds, 'beforeRequestSent', this.intercept, (intercept) => (this.intercept = intercept));
+    await replace(this.options.credentials !== undefined, 'authRequired', this.authIntercept, (intercept) => (this.authIntercept = intercept));
   }
 
   /**
@@ -548,16 +550,16 @@ export class AttemptNetwork {
   }
 
   /**
-   * Removes the bound user context's intercepts, collectors, and
-   * subscription, every one attempted; one the browser no longer has is
+   * Removes the bound user context's intercepts (every one this network
+   * added, so one a failed replacement left behind goes too), collectors,
+   * and subscription, every one attempted; one the browser no longer has is
    * done, any other failure is thrown so the attempt's close reports it and
    * the browser is retired rather than reused with it in place.
    */
   private async release(): Promise<void> {
     const connection = this.connection;
     const removals = [
-      this.intercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.intercept }),
-      this.authIntercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.authIntercept }),
+      ...[...this.intercepts].map((intercept) => connection.send('network.removeIntercept', { intercept })),
       this.collector?.then((collector) => connection.send('network.removeDataCollector', { collector })),
       this.requestCollector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.requestCollector }),
       this.subscription === undefined ? undefined : connection.send('session.unsubscribe', { subscriptions: [this.subscription] }),

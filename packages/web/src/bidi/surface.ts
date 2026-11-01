@@ -191,10 +191,10 @@ export class BidiSurface {
 
   /**
    * Opens the attempt's session: its user context, network, downloads, and
-   * emulation. A setup that fails or is cancelled is closed at once, without
-   * waiting for a command that may never answer (a user context that lands
-   * later removes itself), and the browser is retired when that close cannot
-   * finish.
+   * emulation. A setup that fails or is cancelled is closed at once, and
+   * the setup itself is waited out within the same budget (a user context
+   * that lands later removes itself); when either cannot finish, or the late
+   * removal fails, the browser is retired.
    */
   async startAttempt(context: EngineAttemptContext): Promise<void> {
     if (this.session !== undefined) throw invalidState('an attempt is already running');
@@ -210,12 +210,17 @@ export class BidiSurface {
       { attemptId: context.attemptId, artifactsDir: context.artifactsDir, appLog: context.appLog, navigation: context.navigation, screen: context.screen, credentials },
       this.owners,
     );
+    const setup = session.openUserContext();
     try {
-      await raceAbort(session.openUserContext(), context.signal, 'attempt setup');
+      await raceAbort(setup, context.signal, 'attempt setup');
     } catch (cause) {
       const budget = { signal: AbortSignal.timeout(SETUP_CLEANUP_MS), timeoutMs: SETUP_CLEANUP_MS };
+      const landed = setup.then(() => undefined, (late: unknown) => {
+        if (!(late instanceof EngineError && late.code === 'CANCELLED')) throw late;
+      });
       try {
         await boundedCleanup(session.close(), budget, 'attempt setup cleanup');
+        await boundedCleanup(landed, budget, 'attempt setup');
       } catch {
         await this.retireBrowser(budget);
       }
@@ -443,7 +448,7 @@ export class BidiSurface {
       storeCookies: async (cookies, signal) => {
         const bound = AbortSignal.any([signal, session.lifetime]);
         for (const cookie of cookies) {
-          await raceAbort(session.connection.send('storage.setCookie', { cookie, partition: session.partition() }), bound, 'route.fetch cookies');
+          await raceAbort(() => session.connection.send('storage.setCookie', { cookie, partition: session.partition() }), bound, 'route.fetch cookies');
         }
       },
     };

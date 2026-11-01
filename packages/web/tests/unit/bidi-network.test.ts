@@ -65,7 +65,7 @@ describe('AttemptNetwork', () => {
     ]);
     expect(fake.commands('network.removeIntercept').map((command) => command.params['intercept'])).toEqual(['intercept-1']);
     await net.bind('user-2');
-    expect(fake.commands('network.removeIntercept').map((command) => command.params['intercept'])).toEqual(['intercept-1', 'intercept-2']);
+    expect(fake.commands('network.removeIntercept').map((command) => command.params['intercept']).slice(1).toSorted()).toEqual(['intercept-1', 'intercept-2']);
     expect(fake.commands('session.subscribe').at(-1)?.params).toEqual({ events: ['network.beforeRequestSent', 'network.authRequired'], userContexts: ['user-2'] });
   });
 
@@ -342,5 +342,17 @@ describe('AttemptNetwork', () => {
     await second.addContext('tab');
     again.on('network.removeIntercept', { error: 'no such intercept', message: 'gone' });
     await expect(second.dispose()).resolves.toBeUndefined();
+  });
+
+  it('removes a replacement intercept whose predecessor would not go, when the network is released', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake, { holdAll: true });
+    await net.bind('user-1');
+    await net.addContext('tab-1');
+    fake.on('network.removeIntercept', (params) => (params['intercept'] === 'intercept-1' ? { error: 'unknown error', message: 'stuck' } : { result: {} }));
+    await expect(net.addContext('tab-2')).rejects.toThrow('stuck');
+    fake.on('network.removeIntercept', { result: {} });
+    await net.dispose();
+    expect(fake.commands('network.removeIntercept').map((command) => command.params['intercept'])).toContain('intercept-2');
   });
 });

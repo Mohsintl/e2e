@@ -243,7 +243,7 @@ export class BidiSession {
     const connection = this.connection;
     const { userContext } = await connection.send('browser.createUserContext', {});
     if (this.closed) {
-      await releaseQuietly(connection.send('browser.removeUserContext', { userContext }));
+      await connection.send('browser.removeUserContext', { userContext });
       throw cancelled('the attempt closed while its user context opened');
     }
     this.userContext = userContext;
@@ -272,7 +272,7 @@ export class BidiSession {
     const failed = steps.find((step) => step.status === 'rejected');
     if (failed !== undefined) throw failed.reason;
     if (this.closed) {
-      await releaseQuietly(this.dropUserContext());
+      await this.dropUserContext();
       throw cancelled('the attempt closed while its user context opened');
     }
   }
