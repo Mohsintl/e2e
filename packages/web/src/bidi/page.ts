@@ -319,13 +319,14 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
     let bottom = Math.min(rect.bottom, height);
     let at: Element | null = element;
     let position = getComputedStyle(element).position;
-    while (at !== null && position !== 'fixed') {
+    while (at !== null) {
       const parent: Node | null = at.parentNode;
       at = parent instanceof ShadowRoot ? parent.host : parent instanceof Element ? parent : null;
       if (at === null || at === document.documentElement) break;
       const clip = getComputedStyle(at);
-      const containing = clip.position !== 'static' || clip.transform !== 'none' || clip.filter !== 'none' || clip.contain.includes('paint');
-      if (position === 'absolute' && !containing) continue;
+      const transformed = clip.transform !== 'none' || clip.filter !== 'none' || clip.perspective !== 'none' || clip.contain.includes('paint') || clip.contain.includes('layout');
+      if (position === 'fixed' && !transformed) continue;
+      if (position === 'absolute' && !transformed && clip.position === 'static') continue;
       position = clip.position;
       const bounds = at.getBoundingClientRect();
       if (clip.overflowX !== 'visible') {
@@ -709,50 +710,67 @@ export function documentTitle(): string {
 }
 
 /**
- * Watches the pointer input about to reach an element, as Playwright's hit
- * target interceptor does: the first press, release, or click event decides
- * whether the input reaches the element (retargeted to its button or link,
- * through slots and shadow hosts), and every later one is suppressed when it
- * did not, so a page that raised an overlay as the pointer arrived takes
- * nothing. `hitInterceptorResult` reads the decision under `token`.
+ * Installs, before the page's own scripts, the capture listeners the click
+ * watch (`armHitInterceptor`) decides through, so no listener of the app
+ * runs ahead of them. They do nothing until a watch is armed.
  */
-export function armHitInterceptor(element: Element, token: string): void {
-  const target = element.matches('input, textarea, select') || (element as HTMLElement).isContentEditable
-    ? element
-    : (element.closest('button, [role=button], a, [role=link]') ?? element);
-  const state: { verdict: string | null | undefined } = { verdict: undefined };
-  const listener = (event: Event): void => {
-    if (state.verdict === undefined) {
-      const reached = event.composedPath().includes(target);
-      const hit = event.composedPath()[0];
-      state.verdict = reached ? null : `${hit instanceof Element ? `<${hit.localName}${hit.id === '' ? '' : `#${hit.id}`}>` : 'another element'} intercepts pointer events`;
+export const HIT_INTERCEPTOR_INIT_SCRIPT = `(() => {
+  const active = Symbol.for('e2e.bidi.hit.active');
+  const recorded = () => Reflect.get(globalThis, Symbol.for('e2e.closedShadowRoots'));
+  const contains = (target, x, y) => {
+    let hit = document.elementFromPoint(x, y);
+    for (let root = hit && (hit.shadowRoot ?? recorded()?.get(hit)); hit && root; root = hit.shadowRoot ?? recorded()?.get(hit)) {
+      const inner = root.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
     }
-    if (state.verdict !== null) {
+    for (let at = hit; at; at = at.assignedSlot ?? at.parentElement ?? (at.parentNode && at.parentNode.nodeType === 11 ? at.parentNode.host : null)) if (at === target) return true;
+    return false;
+  };
+  const listener = (event) => {
+    const watch = globalThis[active];
+    if (!watch) return;
+    if (watch.verdict === undefined) {
+      const path = event.composedPath();
+      const reached = path.includes(watch.target) || ('clientX' in event && contains(watch.target, event.clientX, event.clientY));
+      const hit = path[0];
+      watch.verdict = reached ? null : (hit && hit.nodeType === 1 ? '<' + hit.localName + (hit.id ? '#' + hit.id : '') + '>' : 'another element') + ' intercepts pointer events';
+    }
+    if (watch.verdict !== null) {
       event.preventDefault();
       event.stopImmediatePropagation();
     }
   };
-  const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'auxclick', 'dblclick', 'contextmenu'];
-  for (const type of types) window.addEventListener(type, listener, { capture: true });
-  const interceptors = (Reflect.get(globalThis, Symbol.for('e2e.bidi.hit')) as Map<string, unknown> | undefined) ?? new Map<string, unknown>();
-  interceptors.set(token, { state, remove: () => { for (const type of types) window.removeEventListener(type, listener, { capture: true }); } });
-  Reflect.set(globalThis, Symbol.for('e2e.bidi.hit'), interceptors);
+  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'auxclick', 'dblclick', 'contextmenu']) window.addEventListener(type, listener, { capture: true });
+})();`;
+
+/**
+ * Arms the click watch the init script installed, for the input about to
+ * reach `element`, as Playwright's hit target interceptor: the first press,
+ * release, or click decides whether the input reaches the element
+ * (retargeted to its button or link, through slots, shadow hosts, and
+ * recorded closed roots), and every later one is suppressed when it did not.
+ * `hitInterceptorResult` reads the decision.
+ */
+export function armHitInterceptor(element: Element): void {
+  const target = element.matches('input, textarea, select') || (element as HTMLElement).isContentEditable
+    ? element
+    : (element.closest('button, [role=button], a, [role=link]') ?? element);
+  Reflect.set(globalThis, Symbol.for('e2e.bidi.hit.active'), { target, verdict: undefined });
 }
 
-/** Ends the watch `armHitInterceptor` started: null when the input reached the element, why not when it did not, `unseen` when no input arrived. */
-export function hitInterceptorResult(token: string): string | null {
-  const interceptors = Reflect.get(globalThis, Symbol.for('e2e.bidi.hit')) as Map<string, { state: { verdict: string | null | undefined }; remove: () => void }> | undefined;
-  const watch = interceptors?.get(token);
-  if (interceptors === undefined || watch === undefined) return 'unseen';
-  interceptors.delete(token);
-  watch.remove();
-  return watch.state.verdict === undefined ? 'unseen' : watch.state.verdict;
+/** Ends the click watch: null when the input reached the element, why not when it did not, `unseen` when no input reached this document. */
+export function hitInterceptorResult(): string | null {
+  const watch = Reflect.get(globalThis, Symbol.for('e2e.bidi.hit.active')) as { verdict: string | null | undefined } | undefined;
+  Reflect.deleteProperty(globalThis, Symbol.for('e2e.bidi.hit.active'));
+  return watch === undefined || watch.verdict === undefined ? 'unseen' : watch.verdict;
 }
 
 /**
  * Scrolls an element into view as Playwright's `scrollIntoViewIfNeeded`
  * does: once it holds still for a frame, and only when some of it is out of
- * the viewport or a scrolling ancestor, to the nearest edge then. Any element with a box counts, a zero-sized or
+ * the viewport (centred then) or a scrolling ancestor (to its nearest edge,
+ * as Playwright's rect scroll leaves it). Any element with a box counts, a zero-sized or
  * `visibility: hidden` one included; a `display: contents` element counts by
  * the boxes of its contents. Returns `detached`, `hidden` when nothing lays
  * out a box yet (it may appear), `moving`, or `ok`.
@@ -779,15 +797,17 @@ export async function scrollIntoViewIfNeeded(element: Element): Promise<'detache
   if (rect.x !== before.x || rect.y !== before.y || rect.width !== before.width || rect.height !== before.height) return 'moving';
   const outside = (area: { left: number; top: number; right: number; bottom: number }): boolean =>
     rect.left < area.left || rect.top < area.top || rect.right > area.right || rect.bottom > area.bottom;
-  let clipped = outside({ left: 0, top: 0, right: visualViewport?.width || innerWidth, bottom: visualViewport?.height || innerHeight });
-  for (let at = element.parentElement; !clipped && at !== null && at !== document.documentElement; at = at.parentElement) {
-    if (getComputedStyle(at).overflow !== 'visible') clipped = outside(at.getBoundingClientRect());
+  let container = false;
+  for (let at = element.parentElement; !container && at !== null && at !== document.documentElement; at = at.parentElement) {
+    if (getComputedStyle(at).overflow !== 'visible') container = outside(at.getBoundingClientRect());
   }
-  if (clipped) {
+  const viewport = outside({ left: 0, top: 0, right: visualViewport?.width || innerWidth, bottom: visualViewport?.height || innerHeight });
+  if (container || viewport) {
     const target = element.getClientRects().length > 0
       ? element
       : ([...element.querySelectorAll('*')].find((child) => child.getClientRects().length > 0) ?? element.parentElement);
-    target?.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+    const align: ScrollLogicalPosition = container ? 'nearest' : 'center';
+    target?.scrollIntoView({ block: align, inline: align, behavior: 'instant' });
   }
   return 'ok';
 }

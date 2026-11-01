@@ -4,7 +4,6 @@
  * checks Playwright runs, with points placed in the top-level viewport.
  */
 
-import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
@@ -141,22 +140,27 @@ export async function typeText(session: BidiSession, text: string, replace: bool
 /**
  * Waits until the element can take a pointer action, then clicks it with
  * the page watching where the input lands (`armHitInterceptor`): input an
- * overlay raised as the pointer arrived is suppressed in the page, counts as
- * never dispatched, and the click is tried again until the deadline. A page
- * that went away under the click counts as reached.
+ * overlay raised as the pointer arrived is suppressed in the page before any
+ * listener of the app sees it, counts as never dispatched, and the click is
+ * tried again until the deadline. Input no event of the element's document
+ * saw may have reached another document, so it is reported as may have
+ * committed, never replayed. A page that went away under the click counts as
+ * reached.
  */
 async function click(session: BidiSession, target: NodeTarget, deadline: Deadline, options: ClickOptions, signal: AbortSignal): Promise<void> {
   for (;;) {
     const point = await pointerPoint(session, target, deadline, true, signal);
-    const token = randomUUID();
-    await session.run(armHitInterceptor, [target.element, token], target.context);
+    await session.run(armHitInterceptor, [target.element], target.context);
     const dispatched = session.dispatches;
     const sent = await session.sendInput(clickSources(point.x, point.y, options), signal).then(() => undefined, (cause: unknown) => ({ cause }));
-    const verdict = await unlessStale(session.run(hitInterceptorResult, [token], target.context), null);
+    const verdict = await unlessStale(session.run(hitInterceptorResult, [], target.context), null);
     if (sent !== undefined) throw sent.cause;
     if (verdict === null) return;
+    if (verdict === 'unseen') {
+      throw new EngineError('ACTION_MAY_HAVE_COMMITTED', 'the click reached no event in the element\'s document, so another document (an overlay in a parent frame) may have taken it', { retryable: false });
+    }
     session.dispatches = dispatched;
-    if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${verdict === 'unseen' ? 'the input reached another document' : verdict}`, { retryable: false });
+    if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${verdict}`, { retryable: false });
     await sleep(POLL_MS, undefined, { signal });
   }
 }
