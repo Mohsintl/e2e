@@ -9,7 +9,7 @@
 import type { BrowsingContext } from 'webdriver-bidi-protocol';
 import { EngineError, TestError, type LocatorExpression, type SemanticNode } from 'e2e/engine';
 import { message } from '../support.ts';
-import { contentBox, frameContentInset } from '../observation.ts';
+import { frameContentInset } from '../observation.ts';
 import { BidiError, type BidiConnection } from './connection.ts';
 import { callFunction, ElementRef, WindowRef } from './script.ts';
 
@@ -21,10 +21,24 @@ export interface NodeTarget {
 
 type Rect = NonNullable<SemanticNode['rect']>;
 
-/** A frame's viewport in the top-level one: where its coordinates start, and the part of it its holders show. */
+type Point = { readonly x: number; readonly y: number };
+
+/** One iframe as its document lays it out: its content box, and the scale from the document inside it to that box. */
+export interface FrameStep {
+  readonly content: Rect;
+  readonly scale: Point;
+}
+
+/** A frame's viewport in the top-level one: where its coordinates start, how much they scale, and the part of it its holders show. */
 export interface FrameView {
-  readonly origin: { readonly x: number; readonly y: number };
+  readonly origin: Point;
+  readonly scale: Point;
   readonly clip: Rect;
+}
+
+/** A rect in a frame's viewport, in the viewport `view` places that frame's in. */
+function toParent(rect: Rect, view: Pick<FrameView, 'origin' | 'scale'>): Rect {
+  return { x: view.origin.x + rect.x * view.scale.x, y: view.origin.y + rect.y * view.scale.y, width: rect.width * view.scale.x, height: rect.height * view.scale.y };
 }
 
 /** `rect` cut to `bounds`; undefined when nothing of it is inside. */
@@ -135,39 +149,38 @@ export class FrameRegistry {
   }
 
   /**
-   * Each iframe's content box in the document that holds it, outermost
-   * first: the offsets a point in `context`'s viewport passes through on its
-   * way to the top-level one. Null when a frame on the way lays out no box.
+   * Each iframe holding `context`, outermost first, as its document lays it
+   * out (`FrameStep`). Null when a frame on the way lays out no box or is
+   * rotated.
    */
-  async contentBoxes(connection: BidiConnection, context: string): Promise<Rect[] | null> {
-    const boxes: Rect[] = [];
+  async frameSteps(connection: BidiConnection, context: string): Promise<FrameStep[] | null> {
+    const steps: FrameStep[] = [];
     for (const frame of this.chain(context)) {
       const measured = await callFunction(connection, frame.context, FRAME_BOX, [frame.element]);
       if (!isFrameBox(measured)) return null;
-      boxes.push(contentBox(measured.border, measured.inset));
+      steps.push(measured);
     }
-    return boxes;
+    return steps;
   }
 
   /**
-   * Where `context`'s viewport sits in the top-level one: `origin`, its
-   * content box's corner with every holding iframe's offset added, and
-   * `clip`, the part of it every holding iframe shows. Undefined for the top
-   * level, null when a frame on the way lays out no box or shows none of it.
+   * Where `context`'s viewport sits in the top-level one (`FrameView`).
+   * Undefined for the top level, null when a frame on the way lays out no
+   * box, is rotated, or shows none of it.
    */
   async viewportBox(connection: BidiConnection, context: string): Promise<FrameView | null | undefined> {
-    const boxes = await this.contentBoxes(connection, context);
-    if (boxes === null) return null;
+    const steps = await this.frameSteps(connection, context);
+    if (steps === null) return null;
     let view: FrameView | undefined;
-    for (const content of boxes) {
+    for (const { content, scale } of steps) {
       if (view === undefined) {
-        view = { origin: { x: content.x, y: content.y }, clip: content };
+        view = { origin: { x: content.x, y: content.y }, scale, clip: content };
         continue;
       }
-      const origin = { x: view.origin.x + content.x, y: view.origin.y + content.y };
-      const clip = clipTo({ ...origin, width: content.width, height: content.height }, view.clip);
+      const placed = toParent(content, view);
+      const clip = clipTo(placed, view.clip);
       if (clip === undefined) return null;
-      view = { origin, clip };
+      view = { origin: { x: placed.x, y: placed.y }, scale: { x: view.scale.x * scale.x, y: view.scale.y * scale.y }, clip };
     }
     return view;
   }
@@ -179,16 +192,32 @@ export class FrameRegistry {
 }
 
 /** True for what `FRAME_BOX` reports for a frame with a box. */
-function isFrameBox(value: unknown): value is { border: Rect; inset: Rect } {
-  return typeof value === 'object' && value !== null && 'border' in value && 'inset' in value;
+function isFrameBox(value: unknown): value is FrameStep {
+  return typeof value === 'object' && value !== null && 'content' in value && 'scale' in value;
 }
 
-/** An iframe's border box in its own document's viewport, and where its content box sits inside it. */
+/**
+ * An iframe's content box in its own document's viewport, and the scale its
+ * transforms (its own and its ancestors') apply to the document inside it;
+ * null for a frame that lays out no box, or one a rotation or skew turns,
+ * whose points no scale maps.
+ */
 const FRAME_BOX = `(element) => {
-  const inset = (${frameContentInset.toString()})(element);
   if (element.getClientRects().length === 0) return null;
+  for (let at = element; at !== null; at = at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? at.getRootNode().host : null)) {
+    const transform = getComputedStyle(at).transform;
+    if (transform !== 'none') {
+      const matrix = new DOMMatrixReadOnly(transform);
+      if (matrix.b !== 0 || matrix.c !== 0) return null;
+    }
+  }
+  const inset = (${frameContentInset.toString()})(element);
   const rect = element.getBoundingClientRect();
-  return { border: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, inset };
+  const scale = { x: element.offsetWidth > 0 ? rect.width / element.offsetWidth : 1, y: element.offsetHeight > 0 ? rect.height / element.offsetHeight : 1 };
+  return {
+    content: { x: rect.x + inset.x * scale.x, y: rect.y + inset.y * scale.y, width: inset.width * scale.x, height: inset.height * scale.y },
+    scale,
+  };
 }`;
 
 /**
@@ -251,13 +280,13 @@ export function withinFrame(expression: LocatorExpression): LocatorExpression {
 
 /**
  * A node read inside a frame, in the top-level viewport: its box shifted by
- * the frame's origin and clipped to what the frame shows, dropped when the
+ * the frame's origin and scale and clipped to what the frame shows, dropped when the
  * frame has no box or the node lies outside it, and its frame path set.
  */
 export function inViewport(node: SemanticNode, frame: FrameView | null | undefined, framePath: readonly string[]): SemanticNode {
   const withPath = framePath.length === 0 ? node : { ...node, framePath };
   if (frame === undefined || node.rect === undefined) return withPath;
   const { rect: _rect, ...rest } = withPath;
-  const placed = frame === null ? undefined : clipTo({ ...node.rect, x: node.rect.x + frame.origin.x, y: node.rect.y + frame.origin.y }, frame.clip);
+  const placed = frame === null ? undefined : clipTo(toParent(node.rect, frame), frame.clip);
   return placed === undefined ? rest : { ...rest, rect: placed };
 }

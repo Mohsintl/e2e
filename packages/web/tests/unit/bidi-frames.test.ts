@@ -45,40 +45,40 @@ describe('resolveFrames', () => {
   });
 });
 
+/** A peer whose `FRAME_BOX` reads answer each iframe's content box and scale by its shared id. */
+function measured(steps: Record<string, { content: Record<string, number>; scale?: Record<string, number> }>): FakeBidi {
+  const object = (values: Record<string, number>) => ({ type: 'object', value: Object.entries(values).map(([key, value]) => [key, { type: 'number', value }]) });
+  return new FakeBidi().on('script.callFunction', (params) => {
+    const element = (params['arguments'] as { sharedId: string }[])[0]!;
+    const step = steps[element.sharedId]!;
+    return { result: { type: 'success', realm: 'r', result: { type: 'object', value: [['content', object(step.content)], ['scale', object(step.scale ?? { x: 1, y: 1 })]] } } };
+  });
+}
+
+/** A registry holding `inner-doc` in `inner`, held by `outer` in the top document. */
+function nested(): FrameRegistry {
+  const registry = new FrameRegistry();
+  registry.enter('outer-doc', { element: new ElementRef('outer'), context: 'top' });
+  registry.enter('inner-doc', { element: new ElementRef('inner'), context: 'outer-doc' });
+  return registry;
+}
+
 describe('FrameRegistry.viewportBox', () => {
   it('nests each holding frame’s content box into the top-level viewport', async () => {
-    const boxes: Record<string, unknown> = {
-      outer: { border: { x: 100, y: 50, width: 400, height: 300 }, inset: { x: 2, y: 2, width: 396, height: 296 } },
-      inner: { border: { x: 10, y: 20, width: 100, height: 100 }, inset: { x: 0, y: 0, width: 100, height: 100 } },
-    };
-    const fake = new FakeBidi().on('script.callFunction', (params) => {
-      const element = (params['arguments'] as { sharedId: string }[])[0]!;
-      const box = boxes[element.sharedId] as { border: Record<string, number>; inset: Record<string, number> };
-      const rect = (values: Record<string, number>) => ({ type: 'object', value: Object.entries(values).map(([key, value]) => [key, { type: 'number', value }]) });
-      return { result: { type: 'success', realm: 'r', result: { type: 'object', value: [['border', rect(box.border)], ['inset', rect(box.inset)]] } } };
-    });
-    const registry = new FrameRegistry();
-    registry.enter('outer-doc', { element: new ElementRef('outer'), context: 'top' });
-    registry.enter('inner-doc', { element: new ElementRef('inner'), context: 'outer-doc' });
-    await expect(registry.viewportBox(fake.connection, 'inner-doc')).resolves.toEqual({ origin: { x: 112, y: 72 }, clip: { x: 112, y: 72, width: 100, height: 100 } });
+    const fake = measured({ outer: { content: { x: 102, y: 52, width: 396, height: 296 } }, inner: { content: { x: 10, y: 20, width: 100, height: 100 } } });
+    const registry = nested();
+    await expect(registry.viewportBox(fake.connection, 'inner-doc')).resolves.toEqual({ origin: { x: 112, y: 72 }, scale: { x: 1, y: 1 }, clip: { x: 112, y: 72, width: 100, height: 100 } });
     await expect(registry.viewportBox(fake.connection, 'top')).resolves.toBeUndefined();
   });
 
   it('keeps an inner frame’s origin where it lies when its parent clips it', async () => {
-    const boxes: Record<string, unknown> = {
-      outer: { border: { x: 100, y: 0, width: 400, height: 300 }, inset: { x: 0, y: 0, width: 400, height: 300 } },
-      inner: { border: { x: -50, y: 10, width: 200, height: 100 }, inset: { x: 0, y: 0, width: 200, height: 100 } },
-    };
-    const fake = new FakeBidi().on('script.callFunction', (params) => {
-      const element = (params['arguments'] as { sharedId: string }[])[0]!;
-      const box = boxes[element.sharedId] as { border: Record<string, number>; inset: Record<string, number> };
-      const rect = (values: Record<string, number>) => ({ type: 'object', value: Object.entries(values).map(([key, value]) => [key, { type: 'number', value }]) });
-      return { result: { type: 'success', realm: 'r', result: { type: 'object', value: [['border', rect(box.border)], ['inset', rect(box.inset)]] } } };
-    });
-    const registry = new FrameRegistry();
-    registry.enter('outer-doc', { element: new ElementRef('outer'), context: 'top' });
-    registry.enter('inner-doc', { element: new ElementRef('inner'), context: 'outer-doc' });
-    await expect(registry.viewportBox(fake.connection, 'inner-doc')).resolves.toEqual({ origin: { x: 50, y: 10 }, clip: { x: 100, y: 10, width: 150, height: 100 } });
+    const fake = measured({ outer: { content: { x: 100, y: 0, width: 400, height: 300 } }, inner: { content: { x: -50, y: 10, width: 200, height: 100 } } });
+    await expect(nested().viewportBox(fake.connection, 'inner-doc')).resolves.toEqual({ origin: { x: 50, y: 10 }, scale: { x: 1, y: 1 }, clip: { x: 100, y: 10, width: 150, height: 100 } });
+  });
+
+  it('scales an inner frame’s coordinates by the outer frame’s transform', async () => {
+    const fake = measured({ outer: { content: { x: 0, y: 0, width: 200, height: 200 }, scale: { x: 0.5, y: 0.5 } }, inner: { content: { x: 100, y: 40, width: 100, height: 100 } } });
+    await expect(nested().viewportBox(fake.connection, 'inner-doc')).resolves.toEqual({ origin: { x: 50, y: 20 }, scale: { x: 0.5, y: 0.5 }, clip: { x: 50, y: 20, width: 50, height: 50 } });
   });
 });
 
@@ -95,14 +95,14 @@ describe('inViewport', () => {
   const node: SemanticNode = { ref: { id: 'n1', revision: '' }, states: {}, attributes: {}, inputPurpose: 'none', rect: { x: 10, y: 10, width: 50, height: 20 } };
 
   it('shifts a box into the frame, clips it, and sets the frame path', () => {
-    expect(inViewport(node, { origin: { x: 100, y: 200 }, clip: { x: 100, y: 200, width: 40, height: 400 } }, ['#editor'])).toMatchObject({
+    expect(inViewport(node, { origin: { x: 100, y: 200 }, scale: { x: 1, y: 1 }, clip: { x: 100, y: 200, width: 40, height: 400 } }, ['#editor'])).toMatchObject({
       rect: { x: 110, y: 210, width: 30, height: 20 },
       framePath: ['#editor'],
     });
   });
 
   it('drops the box of a node outside its frame or in a frame with no box', () => {
-    expect(inViewport(node, { origin: { x: 0, y: 0 }, clip: { x: 0, y: 0, width: 5, height: 5 } }, ['#f']).rect).toBeUndefined();
+    expect(inViewport(node, { origin: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, clip: { x: 0, y: 0, width: 5, height: 5 } }, ['#f']).rect).toBeUndefined();
     expect(inViewport(node, null, ['#f']).rect).toBeUndefined();
     expect(inViewport(node, undefined, [])).toBe(node);
   });

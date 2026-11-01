@@ -187,17 +187,23 @@ async function pointerPoint(session: BidiSession, target: NodeTarget, deadline: 
   for (;;) {
     const local = await settledPoint(session, target, deadline, { enabled, scroll: true }, signal);
     const chain = session.frames.chain(target.context);
-    const boxes = await session.frames.contentBoxes(session.connection, target.context);
-    if (boxes === null) throw new EngineError('NOT_ACTIONABLE', 'element is in a frame that lays out no box', { retryable: false });
-    const offsets = boxes.map((_, index) => boxes.slice(index).reduce((sum, box) => ({ x: sum.x + box.x, y: sum.y + box.y }), { x: 0, y: 0 }));
+    const steps = await session.frames.frameSteps(session.connection, target.context);
+    if (steps === null) throw new EngineError('NOT_ACTIONABLE', 'element is in a frame that lays out no box, or is rotated', { retryable: false });
+    const points: { x: number; y: number }[] = [];
+    let point = { x: local.x, y: local.y };
+    for (let index = steps.length - 1; index >= 0; index -= 1) {
+      const { content, scale } = steps[index]!;
+      point = { x: content.x + point.x * scale.x, y: content.y + point.y * scale.y };
+      points[index] = point;
+    }
     const checks = [
       session.run(hitBlocker, [target.element, local.x, local.y, CLOSED_SHADOW_ROOTS_KEY], target.context),
       ...chain.map((frame, index) =>
-        session.run(hitBlocker, [frame.element, Math.round(local.x + offsets[index]!.x), Math.round(local.y + offsets[index]!.y), CLOSED_SHADOW_ROOTS_KEY], frame.context)),
+        session.run(hitBlocker, [frame.element, Math.round(points[index]!.x), Math.round(points[index]!.y), CLOSED_SHADOW_ROOTS_KEY], frame.context)),
     ];
     const blocked = (await Promise.all(checks)).find((reason) => reason !== null);
-    const top = offsets[0] ?? { x: 0, y: 0 };
-    if (blocked === undefined) return { x: Math.round(local.x + top.x), y: Math.round(local.y + top.y) };
+    const top = points[0] ?? local;
+    if (blocked === undefined) return { x: Math.round(top.x), y: Math.round(top.y) };
     if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${blocked}`, { retryable: false });
     await sleep(POLL_MS, undefined, { signal });
   }
@@ -331,8 +337,8 @@ async function dragTo(session: BidiSession, source: NodeTarget, target: NodeTarg
   const local = await session.run(readActionPoint, [target.element, { enabled: false, scroll: false, key: CLOSED_SHADOW_ROOTS_KEY, ariaDisabledRoles: ARIA_DISABLED_ROLES }], target.context);
   if (local.state !== 'ok') throw new EngineError('NOT_ACTIONABLE', `dragTo: the target cannot be shown with the source: ${blocker(local)}`, { retryable: false });
   const box = await session.frames.viewportBox(session.connection, target.context);
-  if (box === null) throw new EngineError('NOT_ACTIONABLE', 'dragTo: the target is in a frame that lays out no box', { retryable: false });
-  const to = box === undefined ? local : { x: Math.round(box.origin.x + local.x), y: Math.round(box.origin.y + local.y) };
+  if (box === null) throw new EngineError('NOT_ACTIONABLE', 'dragTo: the target is in a frame that lays out no box, or is rotated', { retryable: false });
+  const to = box === undefined ? local : { x: Math.round(box.origin.x + local.x * box.scale.x), y: Math.round(box.origin.y + local.y * box.scale.y) };
   await drag(session, from, to, 0, signal);
 }
 
