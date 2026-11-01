@@ -1,7 +1,8 @@
 /**
  * The attempt's recording on the BiDi driver, one segment per tab the
  * attempt shows, as the Playwright surface records it. Firefox records
- * natively (`browsingContext.startScreencast`, a webm). Chromium's mapper
+ * natively (`browsingContext.startScreencast`, a VP8 webm of the page's
+ * repaints, which ends at the last one). Chromium's mapper
  * does not implement that command, so its segment is the CDP screencast
  * reached through the mapper's `goog:cdp` passthrough, its JPEG frames
  * encoded to VP9 webm by the ffmpeg Playwright installs, as Playwright's own
@@ -118,8 +119,8 @@ export class BidiVideo {
 
   /**
    * Chromium's CDP screencast through the mapper: each JPEG frame is
-   * acknowledged and piped to ffmpeg, which stamps it with the time it
-   * arrived and writes a constant-frame-rate VP9 webm.
+   * acknowledged and handed to the encoder, which holds the last frame for
+   * the time until the next one, so the video plays at the page's own pace.
    */
   private async chromiumSegment(context: string, size: { width: number; height: number }, absolute: string): Promise<() => Promise<void>> {
     const ffmpeg = ffmpegExecutable();
@@ -128,13 +129,11 @@ export class BidiVideo {
     }
     const connection = this.connection;
     const { session } = (await connection.sendExtension('goog:cdp.getSession', { context })) as { session: string };
-    const encoder = startEncoder(ffmpeg, size, absolute);
-    let last: Buffer | undefined;
+    const encoder = new FrameEncoder(ffmpeg, size, absolute);
     const off = connection.onExtension('goog:cdp.Page.screencastFrame', (event) => {
       if (event['session'] !== session) return;
       const params = event['params'] as { data: string; sessionId: number };
-      last = Buffer.from(params.data, 'base64');
-      if (encoder.stdin?.writable === true) encoder.stdin.write(last);
+      encoder.frame(Buffer.from(params.data, 'base64'));
       void connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.screencastFrameAck', params: { sessionId: params.sessionId }, session }).catch(() => undefined);
     });
     // An extension event the spec's event names do not list.
@@ -149,42 +148,87 @@ export class BidiVideo {
       off();
       await connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.stopScreencast', params: {}, session }).catch(() => undefined);
       await connection.send('session.unsubscribe', { subscriptions: [subscription] }).catch(() => undefined);
-      // The last frame holds until the stop, so the video lasts as long as the segment did.
-      if (last !== undefined && encoder.stdin?.writable === true) encoder.stdin.write(last);
-      await closeEncoder(encoder);
+      await encoder.close();
     };
   }
 }
 
-/** ffmpeg reading JPEGs from stdin, each stamped with the wall clock as it arrives, writing VP9 webm at `FPS`. */
-function startEncoder(ffmpeg: string, size: { width: number; height: number }, output: string): ChildProcess {
-  const { width, height } = size;
-  const args = [
-    '-loglevel', 'error',
-    '-f', 'image2pipe', '-use_wallclock_as_timestamps', '1', '-c:v', 'mjpeg', '-i', 'pipe:0',
-    '-y', '-an', '-fps_mode', 'cfr', '-r', String(FPS),
-    '-c:v', 'libvpx-vp9', '-qmin', '0', '-qmax', '50', '-crf', '8', '-deadline', 'realtime', '-cpu-used', '8',
-    '-b:v', '1M', '-row-mt', '1',
-    '-vf', `pad=${width}:${height}:0:0:gray,crop=${width}:${height}:0:0`,
-    output,
-  ];
-  const child = spawn(ffmpeg, args, { stdio: ['pipe', 'ignore', 'ignore'] });
-  child.stdin.on('error', () => undefined);
-  return child;
-}
+/**
+ * How long a segment with no frame yet waits for one before it ends, and how
+ * long the last frame holds past the end, as Playwright's recorder does: a
+ * page that just painted may deliver its frame after the paint, and a viewer
+ * needs a moment on the final screen.
+ */
+const FRAME_GRACE_MS = 1_000;
 
-/** Closes the encoder's input and resolves once it has written the file. */
-function closeEncoder(encoder: ChildProcess): Promise<void> {
-  return new Promise((resolve) => {
-    if (encoder.exitCode !== null) return resolve();
-    const timer = setTimeout(() => {
-      encoder.kill('SIGKILL');
-      resolve();
-    }, 10_000);
-    encoder.once('exit', () => {
-      clearTimeout(timer);
-      resolve();
+/**
+ * Encodes screencast frames to a constant-rate VP9 webm with ffmpeg. A
+ * screencast sends a frame only when the page repaints, so each frame is
+ * written again for every tick of `FPS` until the next one arrives, and the
+ * last one until the segment ends.
+ */
+class FrameEncoder {
+  private readonly process: ChildProcess;
+  private last: Buffer | undefined;
+  private written = 0;
+  private readonly startedAt = performance.now();
+  private framed: () => void = () => undefined;
+  private readonly firstFrame = new Promise<void>((resolve) => (this.framed = resolve));
+
+  constructor(ffmpeg: string, size: { width: number; height: number }, output: string) {
+    const { width, height } = size;
+    const args = [
+      '-loglevel', 'error',
+      '-f', 'image2pipe', '-framerate', String(FPS), '-c:v', 'mjpeg', '-i', 'pipe:0',
+      '-y', '-an',
+      '-c:v', 'libvpx-vp9', '-qmin', '0', '-qmax', '50', '-crf', '8', '-deadline', 'realtime', '-cpu-used', '8',
+      '-b:v', '1M', '-row-mt', '1',
+      '-vf', `pad=${width}:${height}:0:0:gray,crop=${width}:${height}:0:0`,
+      output,
+    ];
+    this.process = spawn(ffmpeg, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    this.process.stdin?.on('error', () => undefined);
+  }
+
+  /** Takes the next frame: the one before it is held until now, then this one shows. */
+  frame(jpeg: Buffer): void {
+    this.fill();
+    this.last = jpeg;
+    this.write(jpeg);
+    this.framed();
+  }
+
+  /**
+   * Waits a moment for a first frame when none came, holds the last frame
+   * until now and a moment past it, then closes the input and resolves once
+   * ffmpeg wrote the file. A segment that never got a frame writes none.
+   */
+  async close(): Promise<void> {
+    await Promise.race([this.firstFrame, new Promise((resolve) => setTimeout(resolve, FRAME_GRACE_MS))]);
+    this.fill(FRAME_GRACE_MS);
+    await new Promise<void>((resolve) => {
+      if (this.process.exitCode !== null) return resolve();
+      const timer = setTimeout(() => {
+        this.process.kill('SIGKILL');
+        resolve();
+      }, 10_000);
+      this.process.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      this.process.stdin?.end();
     });
-    encoder.stdin?.end();
-  });
+  }
+
+  /** Writes the last frame again for every tick that passed since the last write, and for `holdMs` more. */
+  private fill(holdMs = 0): void {
+    if (this.last === undefined) return;
+    const due = Math.floor(((performance.now() + holdMs - this.startedAt) / 1000) * FPS);
+    while (this.written < due) this.write(this.last);
+  }
+
+  private write(jpeg: Buffer): void {
+    this.written += 1;
+    if (this.process.stdin?.writable === true) this.process.stdin.write(jpeg);
+  }
 }
