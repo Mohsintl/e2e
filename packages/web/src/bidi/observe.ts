@@ -17,6 +17,7 @@ import {
   type SemanticNode,
   type TextPattern,
   type ViewportSize,
+  withTimeout,
 } from 'e2e/engine';
 import { CLOSED_SHADOW_ROOTS_KEY } from '../closed-shadow.ts';
 import { frameSelectors } from '../locators.ts';
@@ -27,7 +28,7 @@ import { cancelled, message } from '../support.ts';
 import { BidiError } from './connection.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
 import { contentContext, inViewport, resolveFrames, withinFrame, type NodeTarget } from './frames.ts';
-import { DOM_READY, FRAME_INSET, LOCATE_READ, MASK, READ_TREE, UNMASK, type LocateMetadata, type TreeMetadata } from './page.ts';
+import { domReady, FRAME_INSET, LOCATE_READ, MASK, READ_TREE, UNMASK, type LocateMetadata, type TreeMetadata } from './page.ts';
 import { ElementRef, type PageArgument } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -56,7 +57,7 @@ interface CapturedTree {
 export async function observe(session: BidiSession, timeoutMs: number, signal: AbortSignal, options?: EngineObserveOptions): Promise<EngineSnapshot> {
   const context = session.requireContext();
   const deadline = Date.now() + timeoutMs;
-  await unlessStale(session.call(DOM_READY, [Math.min(SETTLE_TIMEOUT_MS, timeoutMs / 2)], { awaitPromise: true }), undefined);
+  await unlessStale(session.run(domReady, [Math.min(SETTLE_TIMEOUT_MS, timeoutMs / 2)]), undefined);
   const viewport = await session.viewportSize();
   const [captured, pixels] = await Promise.all([
     captureTree(session, context, [], MAX_OBSERVED_NODES, deadline),
@@ -71,6 +72,32 @@ export async function observe(session: BidiSession, timeoutMs: number, signal: A
     ...(captured.truncated ? { truncated: true } : {}),
     ...(pixels === undefined ? {} : { pixels: pixels.pixels, maskedRegionCount: pixels.maskedRegionCount }),
   };
+}
+
+/** How long the screen an action left may take for the trace before the step goes without one, as on the Playwright surface. */
+const TRACE_SCREEN_TIMEOUT_MS = 1_000;
+
+/**
+ * Hands the trace the screen an action left, when the attempt keeps one. The
+ * screen is read like an observation but never published, so every ref a
+ * test or model holds stays valid. The `screen` contract has the engine give
+ * up silently on a page that cannot answer within a second: the action
+ * already succeeded, and a trace screen never fails it.
+ */
+export async function traceScreen(session: BidiSession, signal: AbortSignal): Promise<void> {
+  const sink = session.attempt.screen;
+  if (sink === undefined || signal.aborted || session.context === undefined) return;
+  try {
+    const deadline = Date.now() + TRACE_SCREEN_TIMEOUT_MS;
+    const captured = await withTimeout(
+      captureTree(session, session.context, [], MAX_OBSERVED_NODES, deadline),
+      TRACE_SCREEN_TIMEOUT_MS,
+      () => new Error('trace screen timed out'),
+    );
+    sink({ location: await session.currentUrl(), root: captured.tree, viewport: await session.viewportSize(), ...(captured.truncated ? { truncated: true } : {}) });
+  } catch {
+    return;
+  }
 }
 
 /**

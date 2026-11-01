@@ -31,7 +31,7 @@ export class ProviderVideo implements AttemptVideo {
    * (a start that outlived its budget) is stopped at once and never kept, and
    * never replaces the handle of a recording started after it.
    */
-  async arm(_page: Page, signal: AbortSignal): Promise<void> {
+  async arm(_page: Page | undefined, signal: AbortSignal): Promise<void> {
     const started = await this.record(signal);
     if (!signal.aborted) {
       this.started = started;

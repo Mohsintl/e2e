@@ -1,7 +1,9 @@
 /** Evidence on the BiDi driver: masked screenshots and the attempt's video. */
 
 import { writeFileSync } from 'node:fs';
-import type { VideoFile } from 'e2e/engine';
+import type { VideoSegment } from 'e2e/engine';
+import { ProviderVideo } from '../provider-video.ts';
+import type { LeaseRecording } from '../provider.ts';
 import { capturePixels } from './observe.ts';
 import type { BidiSession } from './session.ts';
 import { BidiVideo } from './video.ts';
@@ -17,14 +19,24 @@ export async function screenshot(session: BidiSession, label: string | undefined
   return relative;
 }
 
-/** Starts the attempt's video: the open tab now, and every tab the attempt opens until it stops. */
-export async function startVideo(session: BidiSession): Promise<void> {
+/**
+ * Starts the attempt's video: the provider's recording of the browser when
+ * `recorder` is given, else the open tab now and every tab the attempt opens
+ * until it stops.
+ */
+export async function startVideo(session: BidiSession, recorder: ((signal: AbortSignal) => Promise<LeaseRecording>) | undefined, signal: AbortSignal): Promise<void> {
+  if (recorder !== undefined) {
+    session.providerVideo ??= new ProviderVideo(recorder, session.attempt.artifactsDir);
+    await session.providerVideo.arm(undefined, signal);
+    return;
+  }
   session.video ??= new BidiVideo(session.connection, session.settings.browser, session.attempt.artifactsDir, session.settings.screencast);
   const size = session.context === undefined ? (session.settings.viewport ?? DEFAULT_VIDEO_SIZE) : await session.viewportSize();
   await session.video.arm(session.context, size);
 }
 
 /** Finishes the attempt's recording and returns its segments. */
-export async function stopVideo(session: BidiSession): Promise<readonly VideoFile[]> {
+export async function stopVideo(session: BidiSession, signal: AbortSignal): Promise<readonly VideoSegment[]> {
+  if (session.providerVideo !== undefined) return session.providerVideo.stop(signal);
   return (await session.video?.stop()) ?? [];
 }

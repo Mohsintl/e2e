@@ -7,7 +7,7 @@
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import type { Emulation, Input, Storage } from 'webdriver-bidi-protocol';
-import { EngineError, obj, type AppLogEntry, type NodeRef, type ViewportPoint, type ViewportSize } from 'e2e/engine';
+import { EngineError, obj, type AppLogEntry, type EngineSnapshot, type NodeRef, type ViewportPoint, type ViewportSize } from 'e2e/engine';
 import { CLOSED_SHADOW_ROOTS_INIT_SCRIPT } from '../closed-shadow.ts';
 import { DialogRouter } from '../dialogs.ts';
 import type { ConfiguredInitScripts } from '../init-scripts.ts';
@@ -20,9 +20,10 @@ import { releaseQuietly } from './errors.ts';
 import { FrameRegistry, type NodeTarget } from './frames.ts';
 import type { BidiBrowser, BidiBrowserName } from './launch.ts';
 import { AttemptNetwork } from './network.ts';
-import { VIEWPORT_SIZE } from './page.ts';
-import { callFunction, type CallOptions, type PageArgument, type PageValue } from './script.ts';
+import { viewportSize } from './page.ts';
+import { callFunction, type CallOptions, type PageArgument, type PageValue, type TypedPageFunction, type Wire } from './script.ts';
 import type { BidiVideo } from './video.ts';
+import type { ProviderVideo } from '../provider-video.ts';
 
 /** What every attempt of a worker is configured with. */
 export interface SessionSettings {
@@ -38,6 +39,8 @@ export interface SessionSettings {
   readonly site: string | undefined;
   readonly projectRoot: string;
   readonly permissions: readonly string[];
+  /** Whether the browser runs on another machine (a provider's lease), whose filesystem local paths do not reach. */
+  readonly remoteFiles: boolean;
   /** Whether every request is held for the configured site headers. */
   readonly holdRequests: boolean;
   readonly siteHeaders: (url: string) => Readonly<Record<string, string>> | undefined;
@@ -45,31 +48,47 @@ export interface SessionSettings {
 
 /** What one attempt starts with. */
 export interface AttemptSettings {
+  readonly attemptId: string;
   readonly artifactsDir: string;
   readonly appLog: (entry: AppLogEntry) => void;
+  /** Tells the trace where the app went on its own. */
+  readonly navigation: (line: string) => void;
+  /** Hands the trace a screen read after an action; absent when the attempt keeps no trace. */
+  readonly screen: ((snapshot: EngineSnapshot) => void) | undefined;
   readonly credentials: { readonly username: string; readonly password: string } | undefined;
 }
 
-/** The user context each browsing context belongs to, as the session's events report them. */
+/** The user context and parent of each browsing context, as the session's events report them. */
 export class ContextOwners {
   private readonly owners = new Map<string, string>();
+  private readonly parents = new Map<string, string>();
 
   /** Records `context`'s user context, or its parent's for a frame. */
   created(context: string, userContext: string | undefined, parent: string | null | undefined): void {
+    if (parent != null) this.parents.set(context, parent);
     if (userContext !== undefined) this.owners.set(context, userContext);
     else if (parent != null) this.owners.set(context, this.owners.get(parent) ?? '');
   }
 
   destroyed(context: string): void {
     this.owners.delete(context);
+    this.parents.delete(context);
   }
 
   owner(context: string): string | undefined {
     return this.owners.get(context);
   }
 
+  /** The top-level browsing context `context` is, or is a frame of. */
+  top(context: string): string {
+    let top = context;
+    for (let parent = this.parents.get(top); parent !== undefined; parent = this.parents.get(top)) top = parent;
+    return top;
+  }
+
   clear(): void {
     this.owners.clear();
+    this.parents.clear();
   }
 }
 
@@ -130,8 +149,17 @@ export class BidiSession {
   /** The media features in effect: the configured ones, updated by `browser.emulateMedia`. */
   media: WebMedia;
   video: BidiVideo | undefined;
+  /** The browser provider's own recording, which takes the place of `video` when the provider records. */
+  providerVideo: ProviderVideo | undefined;
   /** Where the mouse last moved, which a viewport swipe wheels at. */
   pointer: ViewportPoint = { x: 0, y: 0 };
+  /** Input and page mutations dispatched so far: an action that fails after this moved may have reached the app. */
+  dispatches = 0;
+  /** Navigations the driver itself has in flight, which the trace leaves to the step that started them. */
+  ownNavigations = 0;
+  /** The viewport `browser.setViewport` set for the rest of the attempt; the configured one until then. */
+  private viewport: ViewportSize | null;
+  private creating: Promise<string> | undefined;
   private preloads: string[] = [];
   private readonly addedScripts: string[] = [];
   private readonly granted = new Set<string>();
@@ -144,6 +172,7 @@ export class BidiSession {
     private readonly owners: ContextOwners,
   ) {
     this.media = settings.media;
+    this.viewport = settings.viewport;
     this.network = new AttemptNetwork(browser.connection, {
       siteHeaders: settings.siteHeaders,
       credentials: attempt.credentials,
@@ -161,6 +190,11 @@ export class BidiSession {
   /** Whether `context` belongs to this attempt's user context. */
   owns(context: string | null | undefined): boolean {
     return context != null && this.owners.owner(context) === this.userContext;
+  }
+
+  /** Whether `context` is the attempt's tab or a frame in it: what a page-scoped wait listens to, not a tab the app opened. */
+  onPage(context: string | null | undefined): boolean {
+    return context != null && this.context !== undefined && this.owners.top(context) === this.context;
   }
 
   /**
@@ -241,25 +275,43 @@ export class BidiSession {
   }
 
   /**
-   * The attempt's tab, created on first use at the configured viewport,
-   * with the network covering it and a video segment started when recording.
-   * A window on Firefox: Playwright's build never answers a tab created in a
-   * new user context.
+   * The attempt's tab, created on first use at the attempt's viewport, with
+   * the network covering it and a video segment started when recording.
+   * Concurrent first uses share one creation. A window on Firefox:
+   * Playwright's build never answers a tab created in a new user context.
    */
-  async ensureContext(): Promise<string> {
-    if (this.context !== undefined) return this.context;
+  ensureContext(): Promise<string> {
+    if (this.context !== undefined) return Promise.resolve(this.context);
+    this.creating ??= this.createContext().finally(() => {
+      this.creating = undefined;
+    });
+    return this.creating;
+  }
+
+  private async createContext(): Promise<string> {
     const connection = this.connection;
+    const userContext = this.userContext;
     const { context } = await connection.send('browsingContext.create', {
       type: this.settings.browser === 'firefox' ? 'window' : 'tab',
-      userContext: this.userContext,
+      userContext,
     });
-    this.owners.created(context, this.userContext, null);
+    this.owners.created(context, userContext, null);
+    if (userContext !== this.userContext) {
+      await releaseQuietly(connection.send('browsingContext.close', { context }));
+      throw new EngineError('NODE_STALE', 'the attempt replaced its user context while a tab opened', { retryable: true });
+    }
     await this.network.addContext(context);
-    if (this.settings.viewport !== null) await connection.send('browsingContext.setViewport', { context, viewport: this.settings.viewport });
+    if (this.viewport !== null) await connection.send('browsingContext.setViewport', { context, viewport: this.viewport });
     this.context = context;
     this.pointer = { x: 0, y: 0 };
     await this.video?.contextOpened(context, await this.viewportSize());
     return context;
+  }
+
+  /** Resizes the tab, and every tab the attempt opens after it, to `size`. */
+  async setViewport(size: ViewportSize): Promise<void> {
+    this.viewport = size;
+    await this.connection.send('browsingContext.setViewport', { context: await this.ensureContext(), viewport: size });
   }
 
   /** Closes the tab, keeping the user context's storage. */
@@ -279,17 +331,37 @@ export class BidiSession {
     return callFunction(this.connection, context ?? this.requireContext(), declaration, args, options);
   }
 
+  /**
+   * Runs one of this driver's typed page functions in `context` (the tab by
+   * default), with its element arguments as references and its result
+   * converted back the same way; a promise it returns is awaited.
+   */
+  async run<F extends TypedPageFunction>(fn: F, args: Wire<Parameters<F>> & readonly PageArgument[], context?: string): Promise<Wire<Awaited<ReturnType<F>>>> {
+    const value = await callFunction(this.connection, context ?? this.requireContext(), fn, args, { awaitPromise: true });
+    return value as Wire<Awaited<ReturnType<F>>>;
+  }
+
   /** `call` for a page function of this driver whose return shape the caller names; the page is not checked against it. */
   async read<T>(declaration: string, args: readonly PageArgument[] = [], options?: CallOptions, context?: string): Promise<T> {
     return (await this.call(declaration, args, options, context)) as T;
   }
 
-  /** Runs input sources on the tab, releasing what they hold unless `release` is false (`keyboard.down`). */
-  async sendInput(actions: Input.SourceActions[], release = true): Promise<void> {
+  /**
+   * Runs input sources on the tab. A source releases what it pressed itself,
+   * so a key `keyboard.down` holds stays held across later input. Nothing is
+   * sent once `signal` aborted.
+   */
+  async sendInput(actions: Input.SourceActions[], signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const context = this.requireContext();
+    this.dispatches += 1;
     await this.connection.send('input.performActions', { context, actions });
-    if (release) await this.connection.send('input.releaseActions', { context });
     this.trackPointer(actions);
+  }
+
+  /** Counts a page mutation the driver made in the page (a fill, a select), which may have reached the app. */
+  mutated(): void {
+    this.dispatches += 1;
   }
 
   /** Remembers where `actions` left the mouse. */
@@ -311,10 +383,10 @@ export class BidiSession {
       this.connection.send('permissions.setPermission', { descriptor: { name }, state: 'granted', origin, userContext: this.userContext })));
   }
 
-  /** The viewport in CSS pixels: the configured one, else the window's. */
+  /** The viewport in CSS pixels: the attempt's, else the window's. */
   async viewportSize(): Promise<ViewportSize> {
-    if (this.settings.viewport !== null) return this.settings.viewport;
-    return this.read<ViewportSize>(VIEWPORT_SIZE);
+    if (this.viewport !== null) return this.viewport;
+    return this.run(viewportSize, []);
   }
 
   async currentUrl(): Promise<string> {
@@ -349,19 +421,39 @@ export class BidiSession {
     return { relative, absolute };
   }
 
-  /** Ends the attempt: its video, user context, network, and download directory. */
+  /**
+   * Ends the attempt: its video, user context, network, and download
+   * directory, each attempted whatever the others did; the first failure is
+   * reported once all ran. A browser already gone leaves only local work.
+   */
   async close(): Promise<void> {
-    try {
-      await this.video?.stop();
-      await this.dropUserContext();
-      await this.network.dispose();
-    } finally {
-      this.downloads.dispose();
-    }
+    const gone = this.connection.isClosed;
+    const results = await settleEach([
+      () => this.video?.stop(),
+      () => this.providerVideo?.abandon(AbortSignal.timeout(10_000)),
+      () => (gone ? undefined : this.dropUserContext()),
+      () => this.network.dispose(),
+      () => this.downloads.dispose(),
+    ]);
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed !== undefined) throw failed.reason;
   }
 }
 
 /** An init script's source as a preload script's function declaration. */
 function wrapScript(source: string): string {
   return `() => {\n${source}\n}`;
+}
+
+/** Runs each step in order whatever the earlier ones did, and settles with every outcome. */
+async function settleEach(steps: readonly (() => unknown)[]): Promise<PromiseSettledResult<unknown>[]> {
+  const results: PromiseSettledResult<unknown>[] = [];
+  for (const step of steps) {
+    try {
+      results.push({ status: 'fulfilled', value: await step() });
+    } catch (reason) {
+      results.push({ status: 'rejected', reason });
+    }
+  }
+  return results;
 }

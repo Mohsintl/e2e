@@ -27,7 +27,7 @@ import {
   type OperationContext,
   type PointerAction,
   type SemanticNode,
-  type VideoFile,
+  type VideoSegment,
   type ViewportPoint,
   type ViewportSize,
 } from 'e2e/engine';
@@ -42,12 +42,12 @@ import { cancelled, invalidState } from '../support.ts';
 import type { WebBasicAuth, WebScreencastOptions } from '../surface.ts';
 import { perform, performAt, typeText } from './actions.ts';
 import { screenshot, startVideo, stopVideo } from './artifacts.ts';
-import { classify } from './errors.ts';
+import { afterDispatch, classify, releaseQuietly } from './errors.ts';
 import { routeEvents, SESSION_EVENTS } from './events.ts';
 import { pressSource } from './input.ts';
 import { connectBidiOverCdp, launchBidiBrowser, type BidiBrowser, type BidiBrowserName } from './launch.ts';
 import type { NetworkRoute, ObservedResponse } from './network.ts';
-import { locate, observe } from './observe.ts';
+import { locate, observe, traceScreen } from './observe.ts';
 import type { PageArgument, PageValue } from './script.ts';
 import { BidiSession, ContextOwners, type SessionSettings } from './session.ts';
 import { captureState, restoreState } from './state.ts';
@@ -116,6 +116,7 @@ export class BidiSurface {
       site,
       projectRoot: info.projectRoot,
       permissions: Object.keys(info.app.permissions ?? {}),
+      remoteFiles: this.options.leases !== undefined,
       holdRequests: headers !== undefined,
       siteHeaders: (url) => siteHeadersFor(url, site, headers),
     };
@@ -128,12 +129,24 @@ export class BidiSurface {
   private async acquireBrowser(signal: AbortSignal): Promise<BidiBrowser> {
     if (this.browser !== undefined && !this.browser.connection.isClosed) return this.browser;
     if (signal.aborted) throw cancelled('browser launch cancelled');
-    const browser = await raceAbort(this.openBrowser(signal), signal, 'browser launch');
+    const opening = this.openBrowser(signal);
+    let browser: BidiBrowser;
+    try {
+      browser = await raceAbort(opening, signal, 'browser launch');
+    } catch (cause) {
+      void releaseQuietly(opening.then((late) => late.close()));
+      throw cause;
+    }
+    try {
+      await browser.connection.send('session.subscribe', { events: [...SESSION_EVENTS] });
+    } catch (cause) {
+      await releaseQuietly(browser.close());
+      throw cause;
+    }
     this.browser = browser;
     this.owners.clear();
     this.unrouteEvents();
     this.unrouteEvents = routeEvents(browser.connection, this.owners, () => this.session);
-    await browser.connection.send('session.subscribe', { events: [...SESSION_EVENTS] });
     return browser;
   }
 
@@ -154,9 +167,20 @@ export class BidiSurface {
       ? undefined
       : await raceAbort(() => httpCredentials(basicAuth, context.resolveSecret), context.signal, 'resolving the basic-auth password');
     const browser = await this.acquireBrowser(context.signal);
-    const session = new BidiSession(browser, this.settings, { artifactsDir: context.artifactsDir, appLog: context.appLog, credentials }, this.owners);
+    const session = new BidiSession(
+      browser,
+      this.settings,
+      { attemptId: context.attemptId, artifactsDir: context.artifactsDir, appLog: context.appLog, navigation: context.navigation, screen: context.screen, credentials },
+      this.owners,
+    );
+    const setup = session.openUserContext();
+    try {
+      await raceAbort(setup, context.signal, 'attempt setup');
+    } catch (cause) {
+      void releaseQuietly(setup.finally(() => session.close()));
+      throw cause;
+    }
     this.session = session;
-    await session.openUserContext();
     context.environment({ browser: `${browser.name} ${browser.version}`, driver: 'webdriver-bidi' });
   }
 
@@ -165,15 +189,11 @@ export class BidiSurface {
     await this.session?.latch.settle(context);
   }
 
-  /** Ends the attempt's session. Idempotent; a browser already gone has nothing left to close. */
+  /** Ends the attempt's session. Idempotent. */
   async endAttempt(context: EngineCleanupContext): Promise<void> {
     const session = this.session;
     this.session = undefined;
     if (session === undefined) return;
-    if (session.connection.isClosed) {
-      session.downloads.dispose();
-      return;
-    }
     await withinCleanupBudget(session.close(), context);
   }
 
@@ -194,18 +214,32 @@ export class BidiSurface {
     return this.session;
   }
 
-  /** Bounds one operation by its budget, fails it with an error a handler latched, and classifies what it threw. */
+  /**
+   * Bounds one operation by its budget, fails it with an error a handler
+   * latched, and classifies what it threw. An input operation that fails
+   * once its input went out may have reached the app
+   * (`ACTION_MAY_HAVE_COMMITTED`), so the harness never repeats it blindly;
+   * a sensitive value never leaves in a message or a cause. A step that
+   * changed the page hands the trace the screen it left.
+   */
   private async guard<T>(
     operation: OperationContext,
     label: string,
     work: (session: BidiSession, budget: { readonly signal: AbortSignal; readonly timeoutMs: number }) => Promise<T>,
+    kind: { readonly input?: boolean; readonly sensitive?: string; readonly traced?: boolean } = {},
   ): Promise<T> {
     this.session?.latch.throwPending();
+    const session = this.session;
+    const dispatches = session?.dispatches ?? 0;
+    let result: T;
     try {
-      return await withOperationDeadline(operation, label, (remaining) => work(this.requireSession(), remaining()));
+      result = await withOperationDeadline(operation, label, (remaining) => work(this.requireSession(), remaining()));
     } catch (cause) {
-      throw classify(cause, label);
+      const dispatched = kind.input === true && session !== undefined && session.dispatches !== dispatches;
+      throw afterDispatch(classify(cause, label), label, dispatched, kind.sensitive);
     }
+    if (kind.traced === true && session !== undefined) await traceScreen(session, operation.signal);
+    return result;
   }
 
   open(url: string, operation: OperationContext): Promise<void> {
@@ -213,11 +247,11 @@ export class BidiSurface {
   }
 
   back(operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'navigation', (session, budget) => traverse(session, -1, budget.timeoutMs));
+    return this.guard(operation, 'navigation', (session, budget) => traverse(session, -1, budget.timeoutMs), { traced: true });
   }
 
   forward(operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'navigation', (session, budget) => traverse(session, 1, budget.timeoutMs));
+    return this.guard(operation, 'navigation', (session, budget) => traverse(session, 1, budget.timeoutMs), { traced: true });
   }
 
   restart(operation: OperationContext): Promise<void> {
@@ -229,11 +263,11 @@ export class BidiSurface {
   }
 
   goto(url: string, waitUntil: WaitUntil, operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'navigation', (session, budget) => goto(session, url, waitUntil, budget.signal));
+    return this.guard(operation, 'navigation', (session, budget) => goto(session, url, waitUntil, budget.signal), { traced: true });
   }
 
   reload(operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'navigation', (session) => reload(session));
+    return this.guard(operation, 'navigation', (session) => reload(session), { traced: true });
   }
 
   observe(operation: OperationContext, options?: EngineObserveOptions): Promise<EngineSnapshot> {
@@ -245,24 +279,28 @@ export class BidiSurface {
   }
 
   perform(ref: NodeRef, action: LocatorAction, operation: OperationContext): Promise<void> {
-    return this.guard(operation, action.kind, (session, budget) => perform(session, ref, action, budget.timeoutMs));
+    return this.guard(operation, action.kind, (session, budget) => perform(session, ref, action, budget.timeoutMs, budget.signal), {
+      input: true,
+      traced: true,
+      ...(action.kind === 'fill' && action.sensitive ? { sensitive: action.value } : {}),
+    });
   }
 
   performAt(point: ViewportPoint, action: PointerAction, operation: OperationContext): Promise<void> {
-    return this.guard(operation, `${action.kind} at point`, (session) => performAt(session, point, action));
+    return this.guard(operation, `${action.kind} at point`, (session, budget) => performAt(session, point, action, budget.signal), { input: true, traced: true });
   }
 
   typeText(text: string, options: { readonly replace: boolean }, operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'keyboard.type', (session) => typeText(session, text, options.replace));
+    return this.guard(operation, 'keyboard.type', (session, budget) => typeText(session, text, options.replace, budget.signal), { input: true, traced: true });
   }
 
   pressKey(key: string, operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'keyboard.press', (session) => session.sendInput([pressSource(key)]));
+    return this.guard(operation, 'keyboard.press', (session, budget) => session.sendInput([pressSource(key)], budget.signal), { input: true, traced: true });
   }
 
-  /** Runs raw input sources, holding what they leave pressed when `release` is false (`keyboard.down`). */
-  input(label: string, actions: Input.SourceActions[], operation: OperationContext, release = true): Promise<void> {
-    return this.guard(operation, label, (session) => session.sendInput(actions, release));
+  /** Runs raw input sources from the `browser` fixture; a key or button they press without releasing stays held. */
+  input(label: string, actions: Input.SourceActions[], operation: OperationContext): Promise<void> {
+    return this.guard(operation, label, (session, budget) => session.sendInput(actions, budget.signal), { input: true });
   }
 
   /** Where the mouse last moved in the attempt's tab. */
@@ -331,7 +369,10 @@ export class BidiSurface {
    */
   async collectDownloads(count: number, trigger: () => Promise<void>, signal: AbortSignal): Promise<{ path: string; absolutePath: string; suggestedFilename: string }[]> {
     const session = this.requireSession();
-    const finished = await session.downloads.collect(count, trigger, signal, (context) => session.owns(context));
+    if (this.options.leases !== undefined) {
+      throw new EngineError('UNSUPPORTED_CAPABILITY', `downloads on the BiDi driver need the browser's filesystem; browser provider "${this.options.leases.name}" runs it on another machine`, { retryable: false });
+    }
+    const finished = await session.downloads.collect(count, trigger, signal, (context) => session.onPage(context));
     return finished.map((download) => {
       const { relative, absolute } = session.artifactPath('downloads', download.suggestedFilename, '');
       copyFileSync(download.filepath, absolute);
@@ -374,9 +415,7 @@ export class BidiSurface {
   }
 
   setViewport(size: ViewportSize, operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'setViewport', async (session) => {
-      await session.connection.send('browsingContext.setViewport', { context: await session.ensureContext(), viewport: size });
-    });
+    return this.guard(operation, 'setViewport', (session) => session.setViewport(size));
   }
 
   captureState(operation: OperationContext): Promise<EngineState> {
@@ -392,11 +431,11 @@ export class BidiSurface {
   }
 
   startVideo(operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'video', (session) => startVideo(session));
+    return this.guard(operation, 'video', (session, budget) => startVideo(session, this.options.leases?.recorder(session.attempt.attemptId), budget.signal));
   }
 
-  stopVideo(operation: OperationContext): Promise<readonly VideoFile[]> {
-    return this.guard(operation, 'video', (session) => stopVideo(session));
+  stopVideo(operation: OperationContext): Promise<readonly VideoSegment[]> {
+    return this.guard(operation, 'video', (session, budget) => stopVideo(session, budget.signal));
   }
 }
 
