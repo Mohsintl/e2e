@@ -118,6 +118,8 @@ export class AttemptNetwork {
   private subscription: string | undefined;
   private collector: Promise<string> | undefined;
   private requestCollector: string | undefined;
+  /** Removals that failed, tried again by the next release so nothing is forgotten while the browser still holds it. */
+  private unreleased: (() => Promise<unknown>)[] = [];
   /** Listeners of response bodies still loading, ended with the network. */
   private readonly pendingBodies = new Set<() => void>();
   private readonly inflight = new Set<string>();
@@ -558,19 +560,23 @@ export class AttemptNetwork {
    */
   private async release(): Promise<void> {
     const connection = this.connection;
-    const removals = [
-      ...[...this.intercepts].map((intercept) => connection.send('network.removeIntercept', { intercept })),
-      this.collector?.then((collector) => connection.send('network.removeDataCollector', { collector })),
-      this.requestCollector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.requestCollector }),
-      this.subscription === undefined ? undefined : connection.send('session.unsubscribe', { subscriptions: [this.subscription] }),
+    const collector = this.collector;
+    const removals: (() => Promise<unknown>)[] = [
+      ...this.unreleased,
+      ...[...this.intercepts].map((intercept) => () => connection.send('network.removeIntercept', { intercept })),
+      ...(collector === undefined ? [] : [() => collector.then((id) => connection.send('network.removeDataCollector', { collector: id }))]),
+      ...(this.requestCollector === undefined ? [] : [((id: string) => () => connection.send('network.removeDataCollector', { collector: id }))(this.requestCollector)]),
+      ...(this.subscription === undefined ? [] : [((id: string) => () => connection.send('session.unsubscribe', { subscriptions: [id] }))(this.subscription)]),
     ];
     this.intercept = this.authIntercept = this.collector = this.requestCollector = this.subscription = undefined;
     this.intercepts.clear();
     this.blank.clear();
-    const results = await Promise.allSettled(removals.map((removal) => alreadyGone(removal, connection)));
+    const results = await Promise.allSettled(removals.map((removal) => alreadyGone(removal(), connection)));
+    this.unreleased = removals.filter((_removal, index) => results[index]!.status === 'rejected');
     const failed = results.find((result) => result.status === 'rejected');
     if (failed !== undefined) throw failed.reason;
   }
+
 
   /** Ends the attempt's network: listeners, routes, intercepts, collectors, and subscription. */
   async dispose(): Promise<void> {

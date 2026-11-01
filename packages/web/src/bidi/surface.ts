@@ -215,12 +215,11 @@ export class BidiSurface {
       await raceAbort(setup, context.signal, 'attempt setup');
     } catch (cause) {
       const budget = { signal: AbortSignal.timeout(SETUP_CLEANUP_MS), timeoutMs: SETUP_CLEANUP_MS };
-      const landed = setup.then(() => undefined, (late: unknown) => {
-        if (!(late instanceof EngineError && late.code === 'CANCELLED')) throw late;
-      });
+      const landed = setup.then(() => ({ failure: undefined }), (late: unknown) => ({ failure: late instanceof EngineError && late.code === 'CANCELLED' ? undefined : late }));
       try {
         await boundedCleanup(session.close(), budget, 'attempt setup cleanup');
-        await boundedCleanup(landed, budget, 'attempt setup');
+        const { failure } = await withTimeout(landed, budget.timeoutMs, () => new EngineError('OPERATION_TIMEOUT', 'attempt setup never settled', { retryable: false }));
+        if (failure !== undefined) throw failure;
       } catch {
         await this.retireBrowser(budget);
       }

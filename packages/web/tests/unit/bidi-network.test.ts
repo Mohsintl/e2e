@@ -355,4 +355,17 @@ describe('AttemptNetwork', () => {
     await net.dispose();
     expect(fake.commands('network.removeIntercept').map((command) => command.params['intercept'])).toContain('intercept-2');
   });
+
+  it('keeps a removal that failed while rebinding, and tries it again on dispose', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake, { holdAll: true, exclusive: true });
+    fake.on('network.addIntercept', { result: { intercept: 'global' } });
+    await net.bind('user-1');
+    await net.addContext('tab');
+    fake.on('network.removeIntercept', { error: 'unknown error', message: 'stuck' });
+    await expect(net.bind('user-2')).rejects.toThrow('stuck');
+    fake.on('network.removeIntercept', { result: {} });
+    await net.dispose();
+    expect(fake.commands('network.removeIntercept').filter((command) => command.params['intercept'] === 'global').length).toBeGreaterThanOrEqual(2);
+  });
 });

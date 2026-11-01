@@ -14,14 +14,14 @@ import type { ConfiguredInitScripts } from '../init-scripts.ts';
 import type { WebMedia } from '../media.ts';
 import { cancelled, ErrorLatch, invalidState, sanitizeFilename } from '../support.ts';
 import type { WebScreencastOptions } from '../surface.ts';
-import type { BidiConnection } from './connection.ts';
+import { BidiError, type BidiConnection } from './connection.ts';
 import { AttemptDownloads } from './downloads.ts';
 import { MODIFIER_VALUES } from './input.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
 import { FrameRegistry, type NodeTarget } from './frames.ts';
 import type { BidiBrowser, BidiBrowserName } from './launch.ts';
 import { AttemptNetwork } from './network.ts';
-import { viewportSize } from './page.ts';
+import { HIT_INTERCEPTOR_INIT_SCRIPT, viewportSize } from './page.ts';
 import { callFunction, type CallOptions, type PageArgument, type PageValue, type TypedPageFunction, type Wire } from './script.ts';
 import type { BidiVideo } from './video.ts';
 import type { ProviderVideo } from '../provider-video.ts';
@@ -181,6 +181,8 @@ export class BidiSession {
   /** The viewport `browser.setViewport` set for the rest of the attempt; the configured one until then. */
   private viewport: ViewportSize | null;
   private creating: Promise<string> | undefined;
+  /** User contexts this attempt created and has not yet seen removed, tried again by every later removal and by `close`. */
+  private readonly unremoved = new Set<string>();
   /** Set by `close`: a user context that opens after it (a reset or restore the attempt gave up on) is removed at once. */
   private closed = false;
   private readonly ended = new AbortController();
@@ -252,6 +254,7 @@ export class BidiSession {
     const scoped = { userContexts: [userContext] as [string] };
     const sources = [
       wrapScript(CLOSED_SHADOW_ROOTS_INIT_SCRIPT),
+      wrapScript(HIT_INTERCEPTOR_INIT_SCRIPT),
       ...(this.settings.holdRequests ? [wrapScript(BLOCK_SERVICE_WORKERS)] : []),
       ...[...this.settings.initScripts.forAttempt(), ...this.addedScripts].map(wrapAppScript),
     ];
@@ -286,10 +289,26 @@ export class BidiSession {
     await this.video?.contextClosing();
     const userContext = this.userContext;
     this.userContext = '';
-    if (userContext !== '') await this.connection.send('browser.removeUserContext', { userContext });
-    await Promise.all(this.preloads.map((script) => releaseQuietly(this.connection.send('script.removePreloadScript', { script }))));
-    this.preloads = [];
-    this.retireContext();
+    if (userContext !== '') this.unremoved.add(userContext);
+    try {
+      await this.removeUserContexts();
+    } finally {
+      await Promise.all(this.preloads.map((script) => releaseQuietly(this.connection.send('script.removePreloadScript', { script }))));
+      this.preloads = [];
+      this.retireContext();
+    }
+  }
+
+  /** Removes every user context still owed removal; one that fails stays owed, and the first failure is thrown. */
+  private async removeUserContexts(): Promise<void> {
+    const pending = [...this.unremoved];
+    const results = await Promise.allSettled(pending.map((userContext) => this.connection.send('browser.removeUserContext', { userContext })));
+    pending.forEach((userContext, index) => {
+      const result = results[index]!;
+      if (result.status === 'fulfilled' || (result.reason instanceof BidiError && result.reason.error === 'no such user context')) this.unremoved.delete(userContext);
+    });
+    const failed = results.find((result, index) => result.status === 'rejected' && this.unremoved.has(pending[index]!));
+    if (failed !== undefined) throw (failed as PromiseRejectedResult).reason;
   }
 
   /** Replaces the user context with a clean one, the test's routes and added init scripts carried over. */
@@ -547,6 +566,7 @@ export class BidiSession {
       step('video stop', () => this.video?.stop()),
       step('provider video', () => this.providerVideo?.abandon(AbortSignal.timeout(CLOSE_STEP_MS))),
       step('user context removal', () => (gone ? undefined : this.dropUserContext())),
+      step('earlier user contexts', () => (gone ? undefined : this.removeUserContexts())),
       step('network release', () => this.network.dispose()),
       () => this.downloads.dispose(),
     ]);

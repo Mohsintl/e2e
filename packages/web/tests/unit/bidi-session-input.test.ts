@@ -83,4 +83,15 @@ describe('BidiSession.close', () => {
     await closing.close();
     expect(lifetime.aborted).toBe(true);
   });
+
+  it('owes a user context whose removal failed in a reset, and removes it on close', async () => {
+    const fake = new FakeBidi().on('browser.createUserContext', { result: { userContext: 'first' } }).on('network.addDataCollector', { result: { collector: 'c' } });
+    const closing = session(fake);
+    await closing.openUserContext();
+    fake.on('browser.removeUserContext', { error: 'unknown error', message: 'busy' });
+    await expect(closing.dropUserContext()).rejects.toThrow('busy');
+    fake.on('browser.removeUserContext', { result: {} });
+    await closing.close();
+    expect(fake.commands('browser.removeUserContext').map((command) => command.params['userContext'])).toEqual(['first', 'first']);
+  });
 });
