@@ -10,19 +10,21 @@ import { FrameRegistry, inViewport, resolveFrames, selectorLocator, withinFrame 
 import { ElementRef } from '../../src/bidi/script.ts';
 import { FakeBidi } from '../helpers/bidi-fake.ts';
 
+/** An exact string pattern. */
 const text = (value: string) => ({ kind: 'string' as const, value, exact: true });
 const note: LocatorExpression = { kind: 'query', query: { kind: 'label', value: text('Note') } };
 
-/** Scripts `locateNodes` per context and each iframe's `contentWindow`. */
+/** Scripts the CSS lookup per context and each iframe's `contentWindow`. */
 function frames(iframes: Record<string, string[]>, windows: Record<string, string>): FakeBidi {
-  return new FakeBidi()
-    .on('browsingContext.locateNodes', (params) => ({
-      result: { nodes: (iframes[String(params['context'])] ?? []).map((sharedId) => ({ type: 'node', sharedId, value: { localName: 'iframe', nodeType: 1 } })) },
-    }))
-    .on('script.callFunction', (params) => {
-      const element = (params['arguments'] as { sharedId: string }[])[0]!;
-      return { result: { type: 'success', realm: 'r', result: { type: 'window', value: { context: windows[element.sharedId] } } } };
-    });
+  return new FakeBidi().on('script.callFunction', (params) => {
+    const [first] = params['arguments'] as ({ type: 'string'; value: string } | { sharedId: string })[];
+    if (first !== undefined && 'type' in first) {
+      const found = iframes[String((params['target'] as { context: string }).context)] ?? [];
+      const value = found.map((sharedId) => ({ type: 'object', value: [['element', { type: 'node', sharedId }], ['localName', { type: 'string', value: 'iframe' }]] }));
+      return { result: { type: 'success', realm: 'r', result: { type: 'array', value } } };
+    }
+    return { result: { type: 'success', realm: 'r', result: { type: 'window', value: { context: windows[(first as { sharedId: string }).sharedId] } } } };
+  });
 }
 
 describe('resolveFrames', () => {

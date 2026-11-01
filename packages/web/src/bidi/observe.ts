@@ -11,7 +11,6 @@ import {
   OBSERVED_NAME_LIMIT,
   OBSERVED_TEXT_LIMIT,
   resolveExpression,
-  TestError,
   type EngineObserveOptions,
   type EngineSnapshot,
   type LocatorExpression,
@@ -26,10 +25,9 @@ import { frameSelectors } from '../locators.ts';
 import { assembleTree, frameContentInset, isOnSiteFrame, ROOT_NODE_ID, toSemanticNode } from '../observation.ts';
 import { readPngSize } from '../observe.ts';
 import { SECURE_FIELD_SELECTOR, type RawNodeData } from '../read-node.ts';
-import { cancelled, message } from '../support.ts';
-import { BidiError } from './connection.ts';
+import { cancelled } from '../support.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
-import { contentContext, inViewport, resolveFrames, selectorLocator, withinFrame, type NodeTarget } from './frames.ts';
+import { contentContext, inViewport, resolveFrames, selectElements, withinFrame, type NodeTarget } from './frames.ts';
 import { domReady, LOCATE_READ, maskSecureFields, READ_TREE, unmaskSecureFields, type LocateMetadata, type TreeMetadata } from './page.ts';
 import { ElementRef, type PageArgument } from './script.ts';
 import type { BidiSession } from './session.ts';
@@ -129,10 +127,7 @@ export async function locate(session: BidiSession, expression: LocatorExpression
   const sharedIds = new Map(ids.map((id, index) => [id, elements[index]!.sharedId]));
   const labels = new Map(nodes.map((node, index) => [ids[index]!, node.labels ?? []]));
   const matches = resolveExpression(inner, buildForest(nodes, parents, ids), {
-    label: (node, pattern) => {
-      const own = labels.get(node.ref.id) ?? [];
-      return own.length > 0 ? own.some((label) => matchesText(label, pattern)) : node.name !== undefined && matchesText(node.name, pattern);
-    },
+    label: (node, pattern) => (labels.get(node.ref.id) ?? []).some((label) => matchesText(label, pattern)),
     selector: (selector, candidates) => {
       const hits = selected.get(selector) ?? new Set<string>();
       return candidates.filter((node) => hits.has(sharedIds.get(node.ref.id) ?? ''));
@@ -149,16 +144,8 @@ export async function locate(session: BidiSession, expression: LocatorExpression
 async function locateSelectors(session: BidiSession, expression: LocatorExpression, context: string): Promise<Map<string, Set<string>>> {
   const out = new Map<string, Set<string>>();
   for (const selector of selectorsOf(expression)) {
-    let nodes;
-    try {
-      ({ nodes } = await session.connection.send('browsingContext.locateNodes', { context, locator: selectorLocator(selector) }));
-    } catch (cause) {
-      if (cause instanceof BidiError && cause.error === 'invalid selector') {
-        throw new TestError('INVALID_LOCATOR', `selector ${selector} is not a CSS or XPath selector: ${message(cause)}`);
-      }
-      throw cause;
-    }
-    out.set(selector, new Set(nodes.flatMap((node) => (node.sharedId === undefined ? [] : [node.sharedId]))));
+    const found = await selectElements(session.connection, context, selector);
+    out.set(selector, new Set(found.map(({ element }) => element.sharedId)));
   }
   return out;
 }

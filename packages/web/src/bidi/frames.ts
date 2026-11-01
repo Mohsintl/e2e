@@ -7,9 +7,10 @@
  */
 
 import type { BrowsingContext } from 'webdriver-bidi-protocol';
-import { EngineError, type LocatorExpression, type SemanticNode } from 'e2e/engine';
+import { EngineError, TestError, type LocatorExpression, type SemanticNode } from 'e2e/engine';
+import { message } from '../support.ts';
 import { contentBox, frameContentInset, placeRectInFrame } from '../observation.ts';
-import type { BidiConnection } from './connection.ts';
+import { BidiError, type BidiConnection } from './connection.ts';
 import { callFunction, ElementRef, WindowRef } from './script.ts';
 
 /** An element and the browsing context whose document holds it. */
@@ -41,6 +42,63 @@ export function selectorLocator(selector: string): BrowsingContext.Locator {
   if (selector.startsWith('xpath=')) return { type: 'xpath', value: selector.slice('xpath='.length) };
   if (selector.startsWith('css=')) return { type: 'css', value: selector.slice('css='.length) };
   return /^\(*(\/|\.\.)/.test(selector) ? { type: 'xpath', value: selector } : { type: 'css', value: selector };
+}
+
+/** One element a selector matched, and its tag name. */
+export interface SelectedElement {
+  readonly element: ElementRef;
+  readonly localName: string;
+}
+
+/**
+ * The elements of `selector` in document order, through open shadow roots
+ * for CSS (`querySelectorAll` in the document and in each open root), as
+ * Playwright's CSS engine reaches into them; a selector the page cannot
+ * parse is `INVALID_LOCATOR`. Runs in the page.
+ */
+function cssSelectAll(selector: string): { element: Element; localName: string }[] | string {
+  const out: { element: Element; localName: string }[] = [];
+  const roots: ParentNode[] = [document];
+  try {
+    for (let index = 0; index < roots.length; index += 1) {
+      for (const element of roots[index]!.querySelectorAll(selector)) out.push({ element, localName: element.localName });
+      for (const element of roots[index]!.querySelectorAll('*')) if (element.shadowRoot !== null) roots.push(element.shadowRoot);
+    }
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause);
+  }
+  return out;
+}
+
+/**
+ * The elements `selector` matches in `context`'s document (see
+ * `selectorLocator`): CSS through open shadow roots, as Playwright reads it,
+ * XPath through `browsingContext.locateNodes`, which stays in the light DOM
+ * as Playwright's XPath does.
+ */
+export async function selectElements(connection: BidiConnection, context: string, selector: string): Promise<SelectedElement[]> {
+  const locator = selectorLocator(selector);
+  if (locator.type === 'css') {
+    const found = await callFunction(connection, context, cssSelectAll, [locator.value], { maxObjectDepth: null });
+    if (typeof found === 'string') throw new TestError('INVALID_LOCATOR', `selector ${selector} is not a CSS or XPath selector: ${found}`);
+    if (!isSelection(found)) throw new EngineError('ENGINE_FAILURE', `selector ${selector} read an unexpected value`, { retryable: false });
+    return found;
+  }
+  try {
+    const { nodes } = await connection.send('browsingContext.locateNodes', { context, locator });
+    return nodes.flatMap((node) => (node.sharedId === undefined ? [] : [{ element: new ElementRef(node.sharedId), localName: node.value?.localName ?? '' }]));
+  } catch (cause) {
+    if (cause instanceof BidiError && cause.error === 'invalid selector') {
+      throw new TestError('INVALID_LOCATOR', `selector ${selector} is not a CSS or XPath selector: ${message(cause)}`);
+    }
+    throw cause;
+  }
+}
+
+/** True for what `cssSelectAll` returns once its elements crossed the wire. */
+function isSelection(value: unknown): value is SelectedElement[] {
+  return Array.isArray(value) && value.every((each: unknown) =>
+    typeof each === 'object' && each !== null && Reflect.get(each, 'element') instanceof ElementRef && typeof Reflect.get(each, 'localName') === 'string');
 }
 
 /** The iframe that holds each child context the surface entered, by child context. */
@@ -131,17 +189,14 @@ export async function resolveFrames(
 ): Promise<string> {
   let context = top;
   for (const selector of selectors) {
-    const { nodes } = await connection.send('browsingContext.locateNodes', { context, locator: selectorLocator(selector) });
-    const iframes = nodes.filter((node) => node.value?.localName === 'iframe' || node.value?.localName === 'frame');
+    const iframes = (await selectElements(connection, context, selector)).filter((found) => found.localName === 'iframe' || found.localName === 'frame');
     if (iframes.length === 0) {
       throw new EngineError('FRAME_NOT_FOUND', `no frame matches ${selector}`, { retryable: true });
     }
     if (iframes.length > 1) {
       throw new EngineError('FRAME_AMBIGUOUS', `${iframes.length} frames match ${selector}`, { retryable: false });
     }
-    const sharedId = iframes[0]!.sharedId;
-    if (sharedId === undefined) throw new EngineError('FRAME_NOT_FOUND', `frame ${selector} has no element id`, { retryable: true });
-    const frame: NodeTarget = { element: new ElementRef(sharedId), context };
+    const frame: NodeTarget = { element: iframes[0]!.element, context };
     const child = await contentContext(connection, frame);
     if (child === undefined) throw new EngineError('FRAME_NOT_FOUND', `frame ${selector} has no document yet`, { retryable: true });
     frames.enter(child, frame);

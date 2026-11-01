@@ -60,7 +60,7 @@
     "webdriver-bidi-protocol": "1.0.2"
   },
   "peerDependencies": {
-    "e2e": ">=0.18.0 <1"
+    "e2e": ">=0.22.1 <1"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
