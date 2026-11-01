@@ -1,8 +1,8 @@
 /** Separates exceptions thrown by trusted page code from failures of the evaluation transport. */
-import { TestError } from 'e2e/engine';
+import { TestError, validateJsonValue, type JsonValue } from 'e2e/engine';
 import { message } from './support.ts';
 
-type EvaluationResult =
+export type EvaluationResult =
   | { ok: true; value: unknown }
   | { ok: false; message: string };
 
@@ -70,4 +70,23 @@ export function compileEvaluation(source: string, hasArgument: boolean): (arg: u
   } catch (cause) {
     throw new TestError('EVALUATE_FAILED', message(cause), { cause });
   }
+}
+
+/**
+ * `browser.evaluate` on any driver: `fn` serialized and compiled behind the
+ * page-side error boundary, `run` executing it with `arg` in the page, and
+ * the result checked. A page exception is `EVALUATE_FAILED` with the page's
+ * message; argument and result must be JSON.
+ */
+export async function evaluateInPage<T extends JsonValue>(
+  fn: string | ((arg?: never) => T | Promise<T>),
+  arg: JsonValue | undefined,
+  run: (compiled: (arg: unknown) => Promise<EvaluationResult>, arg: JsonValue | undefined) => Promise<unknown>,
+): Promise<T> {
+  const source = typeof fn === 'string' ? fn : pageFunctionSource(fn);
+  validateJsonValue(arg, 'evaluate argument');
+  const result = (await run(compileEvaluation(source, arg !== undefined), arg)) as EvaluationResult;
+  if (!result.ok) throw new TestError('EVALUATE_FAILED', result.message);
+  validateJsonValue(result.value, 'evaluate result');
+  return result.value as T;
 }

@@ -15,19 +15,16 @@
 import type { Download, Route } from 'playwright-core';
 import type { ActionOptions, Expectable, JsonValue, Locator, Screen, TextMatch } from 'e2e';
 import {
-  ConfigurationError,
   Deadline,
   describePattern,
   EngineError,
   matchesText,
-  obj,
   pollCondition,
   raceAbort,
   rejectUnknownOptions,
   TestError,
   toTextPattern,
   urlMatches,
-  validateJsonValue,
   withTimeout,
   type EngineFixtureContext,
   type FixtureOperation,
@@ -39,12 +36,12 @@ import {
 import { classifyInputError } from './actions.ts';
 import type { DialogHandler } from './dialogs.ts';
 import { saveDownloadsTo, saveFromBrowser, saveLocally } from './downloads.ts';
-import { isTestErrorCode, message as causeMessage, translatePwError } from './support.ts';
-import { compileEvaluation, pageFunctionSource } from './evaluation.ts';
+import { isTestErrorCode, translatePwError } from './support.ts';
+import { cookieTargets, readResponseBody, requireCookieFilter, requireDownloadCount, requireDownloadTimeout, requireMedia, runRouteHandler, waitedResponse } from './browser-calls.ts';
+import { evaluateInPage } from './evaluation.ts';
 import { initScriptLabel, testInitScriptSource } from './init-scripts.ts';
-import { MEDIA_KEYS, mediaLabel, mediaProblem, type WebMedia } from './media.ts';
+import { mediaLabel, type WebMedia } from './media.ts';
 import { lowercaseNames } from './protected-app.ts';
-import { parseContinue, parseFulfill, requireNoArguments } from './route-options.ts';
 import { routePatternMatches, routePatternsEqual } from './route-pattern.ts';
 import type { PlaywrightSurface } from './surface.ts';
 
@@ -108,34 +105,6 @@ export interface WebResponse {
   json<T = unknown>(): Promise<T>;
   /** Waits for the body and reads it as text; rejects with `ACTION_FAILED` when the body could not be read. */
   text(): Promise<string>;
-}
-
-/**
- * Reads the body once the response is known and keeps the outcome: a body
- * that arrived decodes to text on every call, a body the browser could not
- * read rejects every call with `ACTION_FAILED` naming the cause. Swallowing
- * that failure would hand the test an empty string the server never sent,
- * indistinguishable from a real empty body. `failure` names the reason the
- * browser reported on a page request (`net::ERR_CONTENT_LENGTH_MISMATCH` for
- * a connection cut short of the declared length, `net::ERR_ABORTED` for a
- * request the page aborted), and the error behind the read is the fallback,
- * as for a redirect, whose body the browser never keeps.
- */
-async function readResponseBody(
-  api: 'waitForResponse' | 'route.fetch',
-  body: () => Promise<Buffer>,
-  failure: () => string | undefined = () => undefined,
-): Promise<() => Promise<string>> {
-  try {
-    const text = new TextDecoder().decode(await body());
-    return () => Promise.resolve(text);
-  } catch (cause) {
-    const error = new TestError(
-      'ACTION_FAILED',
-      `${api}: response body could not be read: ${failure() ?? causeMessage(cause)}`,
-    );
-    return () => Promise.reject(error);
-  }
 }
 
 export interface CookieFields {
@@ -334,9 +303,7 @@ async function collectDownloads(
   timeout: number | undefined,
   api: 'browser.waitForDownload' | 'browser.waitForDownloads',
 ): Promise<DownloadedFile[]> {
-  if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
-    throw new TestError('INVALID_ARGUMENT', `${api} timeout must be positive and finite`);
-  }
+  requireDownloadTimeout(timeout, api);
   const operation = context.operation(timeout);
   const waitMs = operation.timeoutMs;
   const deadline = new Deadline(waitMs);
@@ -489,21 +456,9 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
     },
     locator: (selector) => context.locator({ kind: 'selector', selector: requireSelector('browser.locator', selector) }),
     frameLocator: (selector) => frameScreen(context, [requireSelector('browser.frameLocator', selector)]),
-    async evaluate<T extends JsonValue>(
-      fn: string | ((arg?: never) => T | Promise<T>),
-      arg?: JsonValue,
-    ): Promise<T> {
-      const source = typeof fn === 'string' ? fn : pageFunctionSource(fn);
-      validateJsonValue(arg, 'evaluate argument');
-      const evaluate = compileEvaluation(source, arg !== undefined);
-      // JSON safety is checked above; Playwright's recursive argument type cannot expand JsonValue.
-      const input: unknown = arg;
-      const result = await surface.guard(context.operation(), 'evaluate', () =>
-        surface.requirePage().evaluate(evaluate, input),
-      );
-      if (!result.ok) throw new TestError('EVALUATE_FAILED', result.message);
-      validateJsonValue(result.value, 'evaluate result');
-      return result.value as T;
+    evaluate<T extends JsonValue>(fn: string | ((arg?: never) => T | Promise<T>), arg?: JsonValue): Promise<T> {
+      return evaluateInPage(fn, arg, (evaluate, input) =>
+        surface.guard(context.operation(), 'evaluate', () => surface.requirePage().evaluate(evaluate, input as unknown)));
     },
     async addInitScript(script: unknown, ...rest: unknown[]) {
       const source = await testInitScriptSource(script, rest.length === 0 ? undefined : { arg: rest[0] }, (file) => surface.projectPath(file));
@@ -512,108 +467,40 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
     route(pattern, handler) {
       const wirePattern = toTextPattern(pattern);
       const predicate = (url: URL) => routePatternMatches(wirePattern, url.href);
-      // Playwright never surfaces a throwing route handler to the test, so a
-      // contract violation (no decision, two decisions) or a failing handler
-      // is latched on the surface and fails the next step with its real cause.
-      const handleRoute = async (route: Route): Promise<void> => {
-        let decided = false;
-        const decide = (name: string) => {
-          if (decided) {
-            throw new TestError('ACTION_FAILED', `route handler already decided; ${name} called twice`);
-          }
-          decided = true;
-        };
-        // Validation runs before `decide`, so a rejected option leaves the
-        // request to the abort below. A Playwright call that fails after the
-        // decision aborts too, rather than leaving the page's request pending.
-        const decideWith = async (name: string, act: () => Promise<void>): Promise<void> => {
-          decide(name);
-          try {
-            await act();
-          } catch (cause) {
-            await route.abort().catch(() => undefined);
-            throw cause;
-          }
-        };
+      const handleRoute = (route: Route): Promise<void> => {
         const request = route.request();
         const postData = request.postData();
-        const publicRoute: WebRoute = {
-          request: {
-            url: request.url(),
-            method: request.method(),
-            headers: request.headers(),
-            ...(postData === null ? {} : { postData }),
-          },
-          fetch: async (...args: unknown[]) => {
-            requireNoArguments('route.fetch', args);
-            return surface.guard(context.operation(), 'route.fetch', async currentOperation => {
-              const site = surface.siteHeaders(request.url());
-              const response = await route.fetch({
-                headers: { ...lowercaseNames(request.headers()), ...site },
-                timeout: currentOperation.timeoutMs,
-                maxRedirects: 0,
-              });
-              try {
-                const text = await readResponseBody('route.fetch', () => response.body());
-                return {
-                  url: response.url(),
-                  status: response.status(),
-                  headers: response.headers(),
-                  // oxlint-disable-next-line e2e/no-unchecked-json -- public API: the caller names T, unknown by default
-                  json: async <T = unknown>() => JSON.parse(await text()) as T,
-                  text,
-                };
-              } finally {
-                await response.dispose();
-              }
+        return runRouteHandler(handler, {
+          request: { url: request.url(), method: request.method(), headers: request.headers(), ...(postData === null ? {} : { postData }) },
+          fetch: () => surface.guard(context.operation(), 'route.fetch', async (currentOperation) => {
+            const response = await route.fetch({
+              headers: { ...lowercaseNames(request.headers()), ...surface.siteHeaders(request.url()) },
+              timeout: currentOperation.timeoutMs,
+              maxRedirects: 0,
+            });
+            try {
+              const text = await readResponseBody('route.fetch', () => response.body());
+              // oxlint-disable-next-line e2e/no-unchecked-json -- public API: the caller names T, unknown by default
+              return { url: response.url(), status: response.status(), headers: response.headers(), json: async <T = unknown>() => JSON.parse(await text()) as T, text };
+            } finally {
+              await response.dispose();
+            }
+          }),
+          fulfill: (decision) => route.fulfill({
+            ...decision,
+            ...(decision.json === undefined && decision.path === undefined && decision.body === undefined ? { body: '' } : {}),
+          }),
+          // `continue` skips every route registered before this one, the site-header route included, so it merges those headers itself.
+          continue: ({ headers, ...decision }) => {
+            const site = surface.siteHeaders(decision.url ?? request.url());
+            return route.continue({
+              ...decision,
+              ...(headers === undefined && site === undefined ? {} : { headers: { ...lowercaseNames(headers ?? request.headers()), ...site } }),
             });
           },
-          fulfill: async (response) => {
-            const decision = parseFulfill(response, (file) => surface.projectPath(file));
-            await decideWith('fulfill', () => route.fulfill({
-              ...decision,
-              ...(decision.json === undefined && decision.path === undefined && decision.body === undefined
-                ? { body: '' }
-                : {}),
-            }));
-          },
-          continue: async (overrides) => {
-            const { headers, ...decision } = parseContinue(overrides, request.url(), context.app.resolveUrl);
-            // `continue` skips every route registered before this one, the
-            // site-header route included, so it merges those headers itself.
-            const site = surface.siteHeaders(decision.url ?? request.url());
-            await decideWith('continue', () => route.continue({
-              ...decision,
-              ...(headers === undefined && site === undefined
-                ? {}
-                : { headers: { ...lowercaseNames(headers ?? request.headers()), ...site } }),
-            }));
-          },
-          fallback: async (...args: unknown[]) => {
-            requireNoArguments('route.fallback', args);
-            await decideWith('fallback', () => route.fallback());
-          },
-          abort: async (...args: unknown[]) => {
-            requireNoArguments('route.abort', args);
-            await decideWith('abort', () => route.abort());
-          },
-        };
-        try {
-          await handler(publicRoute);
-          if (!decided) {
-            throw new TestError(
-              'ACTION_FAILED',
-              'route handler returned without calling fulfill, continue, fallback, or abort',
-            );
-          }
-        } catch (cause) {
-          latch.latch(
-            cause instanceof Error
-              ? cause
-              : new TestError('ACTION_FAILED', `route handler failed: ${causeMessage(cause)}`),
-          );
-          if (!decided) await route.abort().catch(() => undefined);
-        }
+          fallback: () => route.fallback(),
+          abort: () => route.abort(),
+        }, (error) => latch.latch(error), context, (file) => surface.projectPath(file));
       };
       // Tracked so the attempt end waits for a handler still running and
       // collects what it latched.
@@ -644,29 +531,8 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
           (candidate) => routePatternMatches(wirePattern, candidate.url()),
           { timeout: currentOperation.timeoutMs },
         );
-        // Started now, while the browser still holds the body, and awaited
-        // only by `text` and `json` on a budget of their own: the timeout
-        // bounds the match, never a body still streaming in behind headers
-        // that already arrived.
         const body = readResponseBody('waitForResponse', () => response.body(), () => response.request().failure()?.errorText);
-        const text = async (): Promise<string> => {
-          const { signal, timeoutMs } = context.operation();
-          const read = await raceAbort(
-            withTimeout(body, timeoutMs, () =>
-              new TestError('ACTION_FAILED', `waitForResponse: response body did not finish within ${timeoutMs}ms`)),
-            signal,
-            'waitForResponse body',
-          );
-          return read();
-        };
-        return {
-          url: response.url(),
-          status: response.status(),
-          headers: response.headers(),
-          // oxlint-disable-next-line e2e/no-unchecked-json -- public API: the caller names T, unknown by default
-          json: async <T = unknown>() => JSON.parse(await text()) as T,
-          text,
-        };
+        return waitedResponse(context, { url: response.url(), status: response.status(), headers: response.headers() }, body);
       });
     },
     cookies: () =>
@@ -686,23 +552,7 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
         );
       }),
     setCookies(cookies) {
-      const scheme = new URL(baseHref()).protocol === 'https:' ? 'https' : 'http';
-      // The harness's URL rule decides which cookie targets are admitted; a
-      // domain cookie is checked as the origin it would be sent to. The rule
-      // admits `about:blank` for navigation, which holds no cookie. A `url`
-      // cookie is set on the URL the rule resolved, so a relative one lands
-      // on the base URL the way `goto` would.
-      const targets = cookies.map((cookie) => {
-        const target = context.app.resolveUrl(
-          cookie.url === undefined ? `${scheme}://${cookie.domain.replace(/^\./, '')}` : cookie.url,
-        );
-        if (!/^https?:/.test(target)) {
-          throw new ConfigurationError('POLICY_DENIED', `cookie URL must be http(s): ${target}`);
-        }
-        return cookie.url === undefined
-          ? { domain: cookie.domain, path: cookie.path ?? '/' }
-          : { url: target };
-      });
+      const targets = cookieTargets(cookies, context);
       return surface.guard(context.operation(), 'setCookies', async () => {
         await surface.requireContext().addCookies(
           cookies.map((cookie, index) => ({
@@ -718,13 +568,7 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
       });
     },
     clearCookies(options) {
-      rejectUnknownOptions('browser.clearCookies', options, ['name', 'domain', 'path']);
-      for (const field of ['name', 'domain', 'path'] as const) {
-        const value = options?.[field];
-        if (value !== undefined && typeof value !== 'string' && !(value instanceof RegExp)) {
-          throw new TestError('INVALID_ARGUMENT', `browser.clearCookies ${field} must be a string or RegExp`);
-        }
-      }
+      requireCookieFilter(options);
       return surface.guard(context.operation(), 'clearCookies', () => surface.requireContext().clearCookies(options));
     },
     setViewport: (size) =>
@@ -733,16 +577,7 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
         context.attachViewport({ width: size.width, height: size.height, scale: 1 });
       }),
     async emulateMedia(media) {
-      if (typeof media !== 'object' || media === null) {
-        throw new TestError('INVALID_ARGUMENT', 'browser.emulateMedia takes { colorScheme?, reducedMotion? }');
-      }
-      rejectUnknownOptions('browser.emulateMedia', media, MEDIA_KEYS);
-      for (const key of MEDIA_KEYS) {
-        const problem = mediaProblem((name) => `browser.emulateMedia({ ${name} })`, key, media[key]);
-        if (problem !== undefined) throw new TestError('INVALID_ARGUMENT', problem);
-      }
-      // Read once, so a test that changes its object later changes nothing here.
-      const requested = obj({ colorScheme: media.colorScheme, reducedMotion: media.reducedMotion });
+      const requested = requireMedia(media);
       await surface.guard(context.operation(), 'emulateMedia', () => surface.emulateMedia(requested));
     },
     // Async so the harness records the registration as a `browser.onDialog` step.
@@ -755,11 +590,7 @@ export function createBrowserFixture(surface: PlaywrightSurface, context: Engine
       return file!;
     },
     async waitForDownloads(trigger, options) {
-      rejectUnknownOptions('browser.waitForDownloads', options, ['count', 'timeout']);
-      const count = options?.count;
-      if (!Number.isSafeInteger(count) || count < 1) {
-        throw new TestError('INVALID_ARGUMENT', 'waitForDownloads: count must be a positive safe integer');
-      }
+      const count = requireDownloadCount(options);
       return collectDownloads(surface, context, trigger, count, options.timeout, 'browser.waitForDownloads');
     },
     keyboard: {

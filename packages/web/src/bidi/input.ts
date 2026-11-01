@@ -1,7 +1,7 @@
 /** The contract's key grammar and pointer gestures as WebDriver BiDi `input.performActions` sources. */
 
 import type { Input } from 'webdriver-bidi-protocol';
-import { EngineError, parseKey, type KeyModifier, type KeyName } from 'e2e/engine';
+import { EngineError, parseKey, TestError, type KeyModifier, type KeyName } from 'e2e/engine';
 
 /** WebDriver's code points for the named keys (WebDriver spec, "Keyboard actions"). */
 const KEY_CODES: Readonly<Record<KeyName, string>> = {
@@ -105,6 +105,26 @@ export function clickSources(x: number, y: number, options: ClickOptions = {}): 
 /** The source that moves the mouse to a viewport point. */
 export function moveSources(x: number, y: number): Input.SourceActions[] {
   return [mouse([{ type: 'pointerMove', x, y, origin: 'viewport' }])];
+}
+
+/** The source that presses the primary button at a viewport point and holds it (`mouse.down`). */
+export function pressDownSources(x: number, y: number): Input.SourceActions[] {
+  return [mouse([{ type: 'pointerMove', x, y, origin: 'viewport' }, { type: 'pointerDown', button: 0 }])];
+}
+
+/** The source that releases the primary button where the mouse is (`mouse.up`). */
+export function releaseSources(): Input.SourceActions[] {
+  return [mouse([{ type: 'pointerUp', button: 0 }])];
+}
+
+/** The key source that presses one key of the grammar and holds it (`keyboard.down`), or releases it (`keyboard.up`). */
+export function holdKeySources(key: string, phase: 'keyDown' | 'keyUp'): Input.SourceActions[] {
+  const parsed = parseKey(key);
+  if (parsed === undefined || parsed.modifiers.length > 0) {
+    throw new TestError('INVALID_ARGUMENT', `keyboard.down and keyboard.up take one key, got "${key}"`);
+  }
+  const value = parsed.key.kind === 'named' ? KEY_CODES[parsed.key.name] : parsed.key.char;
+  return [{ type: 'key', id: 'keyboard', actions: [{ type: phase, value }] }];
 }
 
 /** Steps a drag moves through between its press and its release, so drag-and-drop libraries see motion. */
