@@ -27,8 +27,8 @@ import { SECURE_FIELD_SELECTOR, type RawNodeData } from '../read-node.ts';
 import { cancelled, message } from '../support.ts';
 import { BidiError } from './connection.ts';
 import { releaseQuietly, unlessStale } from './errors.ts';
-import { contentContext, inViewport, resolveFrames, withinFrame, type NodeTarget } from './frames.ts';
-import { domReady, FRAME_INSET, LOCATE_READ, MASK, READ_TREE, UNMASK, type LocateMetadata, type TreeMetadata } from './page.ts';
+import { contentContext, inViewport, resolveFrames, selectorLocator, withinFrame, type NodeTarget } from './frames.ts';
+import { domReady, FRAME_INSET, LOCATE_READ, maskSecureFields, READ_TREE, unmaskSecureFields, type LocateMetadata, type TreeMetadata } from './page.ts';
 import { ElementRef, type PageArgument } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -113,10 +113,13 @@ export async function locate(session: BidiSession, expression: LocatorExpression
   const frameBox = chain.length === 0 ? undefined : await session.frames.viewportBox(session.connection, context);
   const selected = await locateSelectors(session, inner, context);
   const options = { testIdAttribute: session.settings.testIdAttribute, secureFieldSelector: SECURE_FIELD_SELECTOR };
-  const [json, elements] = await session.read<[string, ElementRef[]]>(LOCATE_READ, [options, wantedQueries(inner), CLOSED_SHADOW_ROOTS_KEY], undefined, context);
+  const readLocated = (structured: boolean): Promise<[LocateMetadata | string | null, ElementRef[]]> =>
+    session.read(LOCATE_READ, [options, wantedQueries(inner), CLOSED_SHADOW_ROOTS_KEY, structured], structured ? { maxObjectDepth: null } : undefined, context);
+  let [metadata, elements] = await readLocated(false);
+  if (metadata === null) [metadata, elements] = await readLocated(true);
   // oxlint-disable-next-line e2e/no-unchecked-json -- page-reported reads; the alignment below is checked
-  const { nodes, parents } = JSON.parse(json) as LocateMetadata;
-  if (nodes.length !== elements.length || parents.length !== nodes.length) {
+  const { nodes, parents } = typeof metadata === 'string' ? (JSON.parse(metadata) as LocateMetadata) : (metadata as LocateMetadata);
+  if (!Array.isArray(nodes) || !Array.isArray(parents) || nodes.length !== elements.length || parents.length !== nodes.length) {
     throw new EngineError('ENGINE_FAILURE', 'located reads do not align with their elements', { retryable: false });
   }
   const first = session.refs.reserveIds(nodes.length);
@@ -139,14 +142,9 @@ export async function locate(session: BidiSession, expression: LocatorExpression
 async function locateSelectors(session: BidiSession, expression: LocatorExpression, context: string): Promise<Map<string, Set<string>>> {
   const out = new Map<string, Set<string>>();
   for (const selector of selectorsOf(expression)) {
-    const xpath = selector.startsWith('xpath=') ? selector.slice('xpath='.length) : selector.startsWith('/') ? selector : undefined;
-    const css = selector.startsWith('css=') ? selector.slice('css='.length) : selector;
     let nodes;
     try {
-      ({ nodes } = await session.connection.send('browsingContext.locateNodes', {
-        context,
-        locator: xpath === undefined ? { type: 'css', value: css } : { type: 'xpath', value: xpath },
-      }));
+      ({ nodes } = await session.connection.send('browsingContext.locateNodes', { context, locator: selectorLocator(selector) }));
     } catch (cause) {
       if (cause instanceof BidiError && cause.error === 'invalid selector') {
         throw new TestError('INVALID_LOCATOR', `selector ${selector} is not a CSS or XPath selector: ${message(cause)}`);
@@ -258,25 +256,37 @@ async function readFrame(
 
 /**
  * A viewport screenshot with every secure field in every document covered
- * and the caret hidden. A frame that went away masks nothing and shows
- * nothing; any other masking failure fails the capture, so no image leaves
- * unmasked.
+ * and the caret hidden. The capture fails open nowhere: a document that
+ * cannot be masked, a frame that appeared or went away, or a field that
+ * moved while the screenshot was taken fails it as `NODE_STALE`, retried on
+ * a settled page, and any other masking failure fails it outright.
  */
 export async function capturePixels(session: BidiSession, viewport: ViewportSize): Promise<{ pixels: ObservationPixels; maskedRegionCount: number }> {
   const context = session.requireContext();
   const documents = await session.documentContexts(context);
+  const masked: string[] = [];
+  let held = true;
   try {
-    const counts = await Promise.all(documents.map((each) =>
-      unlessStale(session.read<number>(MASK, [SECURE_FIELD_SELECTOR, CLOSED_SHADOW_ROOTS_KEY], undefined, each), 0)));
+    let count = 0;
+    for (const each of documents) {
+      count += await session.run(maskSecureFields, [SECURE_FIELD_SELECTOR, CLOSED_SHADOW_ROOTS_KEY], each);
+      masked.push(each);
+    }
     const { data } = await session.connection.send('browsingContext.captureScreenshot', { context, origin: 'viewport', format: { type: 'image/png' } });
+    held = (await Promise.all(masked.map((each) => session.run(unmaskSecureFields, [], each)))).every(Boolean);
+    masked.length = 0;
+    const after = await session.documentContexts(context);
+    if (!held || after.length !== documents.length || after.some((each, index) => each !== documents[index])) {
+      throw new EngineError('NODE_STALE', 'the page changed while its screenshot was masked', { retryable: true });
+    }
     const bytes = new Uint8Array(Buffer.from(data, 'base64'));
     const size = readPngSize(bytes) ?? viewport;
     return {
       pixels: { data: bytes, mediaType: 'image/png', width: size.width, height: size.height, scale: viewport.width > 0 ? size.width / viewport.width : 1 },
-      maskedRegionCount: counts.reduce((total, count) => total + count, 0),
+      maskedRegionCount: count,
     };
   } finally {
-    await Promise.all(documents.map((each) => releaseQuietly(session.call(UNMASK, [], undefined, each))));
+    await Promise.all(masked.map((each) => releaseQuietly(session.run(unmaskSecureFields, [], each))));
   }
 }
 

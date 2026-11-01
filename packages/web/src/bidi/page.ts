@@ -8,16 +8,22 @@ import { readSemanticsFunction } from '../in-page/read-semantics.ts';
 import { frameContentInset } from '../observation.ts';
 import type { RawNodeData, RawObservedNode } from '../read-node.ts';
 
-/** Reads the document's semantic tree: the walk's metadata as JSON when the page left `JSON` native, and the walked elements. */
+/**
+ * Whether the page left `JSON.stringify` native and added no `toJSON` a
+ * read's metadata would go through, so the metadata can cross as one string;
+ * else it crosses as a structured value.
+ */
+const NATIVE_JSON = `typeof JSON.stringify === 'function' &&
+    /^function stringify\\(\\)\\s*\\{\\s*\\[native code\\]\\s*\\}$/.test(Function.prototype.toString.call(JSON.stringify)) &&
+    !('toJSON' in Object.prototype) && !('toJSON' in Array.prototype)`;
+
+/** Reads the document's semantic tree: the walk's metadata (see `NATIVE_JSON`), and the walked elements. */
 export const READ_TREE = `(options, structured) => {
   const read = (${readSemanticsFunction.toString()});
   const observation = read(document.documentElement, options);
   const data = { nodes: observation.nodes, ids: observation.ids, truncated: observation.truncated };
-  const native = typeof JSON.stringify === 'function' &&
-    /^function stringify\\(\\)\\s*\\{\\s*\\[native code\\]\\s*\\}$/.test(Function.prototype.toString.call(JSON.stringify)) &&
-    !('toJSON' in Object.prototype) && !('toJSON' in Array.prototype);
   if (structured) return [data, observation.elements];
-  return [native ? JSON.stringify(data) : null, observation.elements];
+  return [${NATIVE_JSON} ? JSON.stringify(data) : null, observation.elements];
 }`;
 
 /**
@@ -33,10 +39,9 @@ export const READ_TREE = `(options, structured) => {
  * the nearest read ancestor, which keeps every containment a scope or
  * filter asks about. Iframe documents are not entered.
  */
-export const LOCATE_READ = `(options, wants, key) => {
+export const LOCATE_READ = `(options, wants, key, structured) => {
   const read = (${readSemanticsFunction.toString()});
   const recorded = Reflect.get(globalThis, Symbol.for(key));
-  const skip = new Set(['script', 'style', 'noscript', 'template', 'head', 'meta', 'link', 'title', 'base']);
   const labelable = 'input, select, textarea, button, meter, output, progress, [aria-label], [aria-labelledby], [contenteditable], [role]';
   const squash = (text) => text.replace(/\\s+/g, '').toLowerCase();
   const may = (actual, pattern) => pattern === undefined || pattern === null || pattern.kind !== 'string' || (actual !== null && actual !== undefined && squash(String(actual)).includes(squash(pattern.value)));
@@ -44,7 +49,6 @@ export const LOCATE_READ = `(options, wants, key) => {
   const parentOf = [];
   const hosts = new Set();
   const visit = (element, parent) => {
-    if (skip.has(element.localName)) return;
     const index = all.length;
     all.push(element);
     parentOf.push(parent);
@@ -125,7 +129,8 @@ export const LOCATE_READ = `(options, wants, key) => {
     }
   });
   const nodes = read(document.documentElement, { ...base, mode: { kind: 'nodes', elements } });
-  return [JSON.stringify({ nodes, parents }), elements];
+  if (structured) return [{ nodes, parents }, elements];
+  return [${NATIVE_JSON} ? JSON.stringify({ nodes, parents }) : null, elements];
 }`;
 
 /** An iframe element's content box inset, in its own document; see `frameContentInset`. */
@@ -360,16 +365,18 @@ export function boxSize(element: Element): { width: number; height: number } {
 }
 
 /**
- * Covers every secure field in the document with an opaque box and hides the
- * caret, for one screenshot; returns how many fields it covered. `UNMASK`
- * takes both away.
+ * Covers every secure field of the document, through open and recorded
+ * closed shadow roots, with an opaque box, and hides the caret, for one
+ * screenshot; returns how many fields it covered. The boxes sit in a manual
+ * popover, so they paint in the top layer above a modal dialog or popover
+ * the app shows. `unmaskSecureFields` takes them away.
  */
-export const MASK = `(selector, key) => {
-  const recorded = Reflect.get(globalThis, Symbol.for(key));
-  const roots = [document];
-  const fields = [];
+export function maskSecureFields(selector: string, key: string): number {
+  const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
+  const roots: ParentNode[] = [document];
+  const fields: Element[] = [];
   for (let index = 0; index < roots.length; index += 1) {
-    const root = roots[index];
+    const root = roots[index]!;
     fields.push(...root.querySelectorAll(selector));
     for (const element of root.querySelectorAll('*')) {
       const shadow = element.shadowRoot ?? recorded?.get(element);
@@ -377,29 +384,44 @@ export const MASK = `(selector, key) => {
     }
   }
   const layer = document.createElement('div');
-  layer.setAttribute('data-e2e-mask', '');
-  layer.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647';
+  layer.popover = 'manual';
+  layer.style.cssText = 'position:fixed;inset:0;margin:0;padding:0;border:0;width:100vw;height:100vh;max-width:none;max-height:none;background:transparent;overflow:visible;pointer-events:none';
+  const boxes: { field: Element; rect: DOMRect }[] = [];
   for (const field of fields) {
     const rect = field.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
     const box = document.createElement('div');
-    box.style.cssText = 'position:fixed;background:#000;left:' + rect.left + 'px;top:' + rect.top + 'px;width:' + rect.width + 'px;height:' + rect.height + 'px';
-    layer.appendChild(box);
+    box.style.cssText = `position:fixed;background:#000;left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px`;
+    layer.append(box);
+    boxes.push({ field, rect });
   }
   const caret = new CSSStyleSheet();
   caret.replaceSync('*, *::before, *::after { caret-color: transparent !important; }');
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, caret];
-  Reflect.set(globalThis, Symbol.for('e2e.bidi.caret'), caret);
-  document.documentElement.appendChild(layer);
-  return fields.length;
-}`;
+  document.documentElement.append(layer);
+  layer.showPopover();
+  Reflect.set(globalThis, Symbol.for('e2e.bidi.mask'), { layer, caret, boxes });
+  return boxes.length;
+}
 
-/** Removes what `MASK` added. */
-export const UNMASK = `() => {
-  for (const layer of document.querySelectorAll('[data-e2e-mask]')) layer.remove();
-  const caret = Reflect.get(globalThis, Symbol.for('e2e.bidi.caret'));
-  if (caret) document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== caret);
-}`;
+/**
+ * Removes what `maskSecureFields` added. Returns whether every covered field
+ * is still where its box was, so the screenshot taken between the two showed
+ * none of them.
+ */
+export function unmaskSecureFields(): boolean {
+  const mask = Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as
+    | { layer: HTMLElement; caret: CSSStyleSheet; boxes: { field: Element; rect: DOMRect }[] }
+    | undefined;
+  if (mask === undefined) return true;
+  Reflect.deleteProperty(globalThis, Symbol.for('e2e.bidi.mask'));
+  mask.layer.remove();
+  document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== mask.caret);
+  return mask.boxes.every(({ field, rect }) => {
+    const now = field.getBoundingClientRect();
+    return now.x === rect.x && now.y === rect.y && now.width === rect.width && now.height === rect.height;
+  });
+}
 
 /**
  * The history entry the document shows once it reads complete, null while
