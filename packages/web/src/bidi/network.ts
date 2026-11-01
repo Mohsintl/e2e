@@ -174,10 +174,11 @@ export class AttemptNetwork {
     });
   }
 
-  /** A top-level tab of the attempt closed. */
+  /** A top-level tab of the attempt closed; queued behind its own addition, so a tab that opened and closed at once is never covered. */
   removeContext(context: string): Promise<void> {
-    if (!this.tops.delete(context)) return Promise.resolve();
-    return this.change(() => this.refreshIntercepts());
+    return this.change(async () => {
+      if (this.tops.delete(context)) await this.refreshIntercepts();
+    });
   }
 
   /** Subscribes to the request events of the bound user context, and collects request bodies while requests are held. */
@@ -294,7 +295,7 @@ export class AttemptNetwork {
       if (blocked) void this.connection.send('network.continueRequest', { request: event.request.request }).catch((cause: unknown) => this.fail(cause));
       return;
     }
-    this.inflight.add(event.request.request);
+    if (this.options.onPage(event.context)) this.inflight.add(event.request.request);
     if (!blocked) return;
     const decide = event.context !== null && this.blank.has(event.context) ? this.answerBlank(event) : this.route(event);
     void decide.catch(async (cause: unknown) => {
@@ -429,9 +430,10 @@ export class AttemptNetwork {
   }
 
   /**
-   * Resolves once no request has been in flight for 500 ms, Playwright's
-   * `networkidle`. `track` must have run before the navigation it follows,
-   * so the requests it started were counted.
+   * Resolves once no request of the attempt's tab has been in flight for
+   * 500 ms, Playwright's `networkidle`; a tab the app opened does not count.
+   * `track` must have run before the navigation it follows, so the requests
+   * it started were counted.
    */
   async waitForIdle(signal: AbortSignal): Promise<void> {
     for (;;) {

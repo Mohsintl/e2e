@@ -295,4 +295,25 @@ describe('AttemptNetwork', () => {
     await settle();
     expect(seen).toMatchObject({ bodyUnavailable: true });
   });
+
+  it('never covers a tab that opened and closed in the same burst', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake, { holdAll: true });
+    await net.bind('user-1');
+    void net.addContext('flash');
+    await net.removeContext('flash');
+    await net.addContext('tab');
+    expect(fake.commands('network.addIntercept').at(-1)?.params).toEqual({ phases: ['beforeRequestSent'], contexts: ['tab'] });
+  });
+
+  it('calls the network idle while a tab the app opened is still busy', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake, { onPage: (context) => context === 'tab' });
+    await net.bind('user-1');
+    await net.track();
+    fake.emit('network.beforeRequestSent', { ...request('poll', `${SITE}/poll`, []), context: 'popup' });
+    const started = Date.now();
+    await net.waitForIdle(AbortSignal.timeout(5_000));
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
 });

@@ -9,7 +9,7 @@
 import type { BrowsingContext } from 'webdriver-bidi-protocol';
 import { EngineError, TestError, type LocatorExpression, type SemanticNode } from 'e2e/engine';
 import { message } from '../support.ts';
-import { contentBox, frameContentInset, placeRectInFrame } from '../observation.ts';
+import { contentBox, frameContentInset } from '../observation.ts';
 import { BidiError, type BidiConnection } from './connection.ts';
 import { callFunction, ElementRef, WindowRef } from './script.ts';
 
@@ -20,6 +20,21 @@ export interface NodeTarget {
 }
 
 type Rect = NonNullable<SemanticNode['rect']>;
+
+/** A frame's viewport in the top-level one: where its coordinates start, and the part of it its holders show. */
+export interface FrameView {
+  readonly origin: { readonly x: number; readonly y: number };
+  readonly clip: Rect;
+}
+
+/** `rect` cut to `bounds`; undefined when nothing of it is inside. */
+function clipTo(rect: Rect, bounds: Rect): Rect | undefined {
+  const x = Math.max(rect.x, bounds.x);
+  const y = Math.max(rect.y, bounds.y);
+  const width = Math.min(rect.x + rect.width, bounds.x + bounds.width) - x;
+  const height = Math.min(rect.y + rect.height, bounds.y + bounds.height) - y;
+  return width > 0 && height > 0 ? { x, y, width, height } : undefined;
+}
 
 /** An iframe element's window, which serializes as its browsing context. Runs in the page. */
 function contentWindow(element: HTMLIFrameElement): Window | null {
@@ -135,24 +150,26 @@ export class FrameRegistry {
   }
 
   /**
-   * The top-level viewport box of `context`'s viewport: each holding iframe's
-   * content box, nested; undefined for the top level, null when a frame on
-   * the way lays out no box.
+   * Where `context`'s viewport sits in the top-level one: `origin`, its
+   * content box's corner with every holding iframe's offset added, and
+   * `clip`, the part of it every holding iframe shows. Undefined for the top
+   * level, null when a frame on the way lays out no box or shows none of it.
    */
-  async viewportBox(connection: BidiConnection, context: string): Promise<Rect | null | undefined> {
+  async viewportBox(connection: BidiConnection, context: string): Promise<FrameView | null | undefined> {
     const boxes = await this.contentBoxes(connection, context);
     if (boxes === null) return null;
-    let box: Rect | undefined;
+    let view: FrameView | undefined;
     for (const content of boxes) {
-      if (box === undefined) {
-        box = content;
+      if (view === undefined) {
+        view = { origin: { x: content.x, y: content.y }, clip: content };
         continue;
       }
-      const placed = placeRectInFrame(content, box);
-      if (placed === undefined) return null;
-      box = placed;
+      const origin = { x: view.origin.x + content.x, y: view.origin.y + content.y };
+      const clip = clipTo({ ...origin, width: content.width, height: content.height }, view.clip);
+      if (clip === undefined) return null;
+      view = { origin, clip };
     }
-    return box;
+    return view;
   }
 
   /** Forgets every frame, when the documents that held them are gone. */
@@ -234,13 +251,13 @@ export function withinFrame(expression: LocatorExpression): LocatorExpression {
 
 /**
  * A node read inside a frame, in the top-level viewport: its box shifted by
- * the frame's and clipped to it, dropped when the frame has no box or the
- * node lies outside it, and its frame path set.
+ * the frame's origin and clipped to what the frame shows, dropped when the
+ * frame has no box or the node lies outside it, and its frame path set.
  */
-export function inViewport(node: SemanticNode, frame: Rect | null | undefined, framePath: readonly string[]): SemanticNode {
+export function inViewport(node: SemanticNode, frame: FrameView | null | undefined, framePath: readonly string[]): SemanticNode {
   const withPath = framePath.length === 0 ? node : { ...node, framePath };
   if (frame === undefined || node.rect === undefined) return withPath;
   const { rect: _rect, ...rest } = withPath;
-  const placed = frame === null ? undefined : placeRectInFrame(node.rect, frame);
+  const placed = frame === null ? undefined : clipTo({ ...node.rect, x: node.rect.x + frame.origin.x, y: node.rect.y + frame.origin.y }, frame.clip);
   return placed === undefined ? rest : { ...rest, rect: placed };
 }

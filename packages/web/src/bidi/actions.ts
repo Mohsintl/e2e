@@ -332,7 +332,7 @@ async function dragTo(session: BidiSession, source: NodeTarget, target: NodeTarg
   if (local.state !== 'ok') throw new EngineError('NOT_ACTIONABLE', `dragTo: the target cannot be shown with the source: ${blocker(local)}`, { retryable: false });
   const box = await session.frames.viewportBox(session.connection, target.context);
   if (box === null) throw new EngineError('NOT_ACTIONABLE', 'dragTo: the target is in a frame that lays out no box', { retryable: false });
-  const to = box === undefined ? local : { x: Math.round(box.x + local.x), y: Math.round(box.y + local.y) };
+  const to = box === undefined ? local : { x: Math.round(box.origin.x + local.x), y: Math.round(box.origin.y + local.y) };
   await drag(session, from, to, 0, signal);
 }
 
