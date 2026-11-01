@@ -6,7 +6,7 @@
 
 import type { Network, Storage } from 'webdriver-bidi-protocol';
 import type { Expectable, JsonValue } from 'e2e';
-import { Deadline, rejectUnknownOptions, TestError, toTextPattern, withTimeout, type EngineFixtureContext, type OperationContext, type TextPattern } from 'e2e/engine';
+import { Deadline, rejectUnknownOptions, toTextPattern, type EngineFixtureContext, type OperationContext, type TextPattern } from 'e2e/engine';
 import { createBrowserExpectation, declareBrowserFixture, frameScreen, requireSelector, type Browser, type BrowserExpectation, type Cookie } from '../browser.ts';
 import {
   cookieTargets,
@@ -168,19 +168,27 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
   return declareBrowserFixture(context, browser, expectation);
 }
 
-/** A held request as the shared route contract drives it; `fetch` replays it from Node with the site headers. */
+/**
+ * A held request as the shared route contract drives it. `fetch` replays it
+ * from Node as the browser sent it (its body bytes, its cookies, and the
+ * site headers) within the operation's budget, and stores the cookies the
+ * response sets in the user context, as Playwright's `route.fetch` does.
+ */
 function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, request: InterceptedRequest, decisions: RouteDecisions): RouteAdapter {
   return {
     request: { url: request.url, method: request.method, headers: request.headers, ...(request.postData === undefined ? {} : { postData: request.postData }) },
     fetch: async () => {
-      const { signal } = context.operation();
+      const operation = context.operation();
+      const signal = AbortSignal.any([operation.signal, AbortSignal.timeout(operation.timeoutMs)]);
       const fetched = await fetch(request.url, {
         method: request.method,
-        headers: { ...request.headers, ...surface.siteHeaders(request.url) },
+        headers: { ...request.headers, ...(request.cookie === undefined ? {} : { cookie: request.cookie }), ...surface.siteHeaders(request.url) },
         redirect: 'manual',
         signal,
-        ...(request.postData === undefined ? {} : { body: request.postData }),
+        ...(request.body === undefined ? {} : { body: new Uint8Array(request.body) }),
       });
+      const cookies = fetched.headers.getSetCookie().flatMap((header) => setCookieOf(header, new URL(request.url)) ?? []);
+      if (cookies.length > 0) await surface.setCookies(cookies, operation);
       const text = await readResponseBody('route.fetch', async () => Buffer.from(await fetched.arrayBuffer()));
       // oxlint-disable-next-line e2e/no-unchecked-json -- public API: the caller names T, unknown by default
       return { url: request.url, status: fetched.status, headers: Object.fromEntries(fetched.headers), json: async <T = unknown>() => JSON.parse(await text()) as T, text };
@@ -189,6 +197,36 @@ function routeAdapter(surface: BidiSurface, context: EngineFixtureContext, reque
     continue: (decision) => decisions.continue(decision),
     fallback: () => decisions.fallback(),
     abort: () => decisions.abort(),
+  };
+}
+
+/** One `Set-Cookie` header of a response from `url` as a cookie to store; undefined for one with no name. */
+export function setCookieOf(header: string, url: URL): Storage.PartialCookie | undefined {
+  const [pair = '', ...attributes] = header.split(';');
+  const split = pair.indexOf('=');
+  const name = pair.slice(0, split).trim();
+  if (split <= 0 || name === '') return undefined;
+  const directory = url.pathname.slice(0, url.pathname.lastIndexOf('/'));
+  const attribute = new Map<string, string>();
+  for (const each of attributes) {
+    const at = each.indexOf('=');
+    attribute.set((at === -1 ? each : each.slice(0, at)).trim().toLowerCase(), at === -1 ? '' : each.slice(at + 1).trim());
+  }
+  const domain = attribute.get('domain') ?? '';
+  const path = attribute.get('path') ?? '';
+  const sameSite = attribute.get('samesite')?.toLowerCase() ?? '';
+  const maxAge = attribute.get('max-age') ?? '';
+  const expires = Date.parse(attribute.get('expires') ?? '');
+  const expiry = /^-?\d+$/.test(maxAge) ? Math.floor(Date.now() / 1000) + Number(maxAge) : Number.isNaN(expires) ? undefined : Math.floor(expires / 1000);
+  return {
+    name,
+    value: { type: 'string', value: pair.slice(split + 1).trim() },
+    domain: domain === '' ? url.hostname : domain,
+    path: path.startsWith('/') ? path : directory === '' ? '/' : directory,
+    ...(attribute.has('secure') ? { secure: true } : {}),
+    ...(attribute.has('httponly') ? { httpOnly: true } : {}),
+    ...(['strict', 'lax', 'none'].includes(sameSite) ? { sameSite: sameSite as Network.SameSite } : {}),
+    ...(expiry === undefined ? {} : { expiry }),
   };
 }
 
@@ -203,11 +241,7 @@ async function downloads(
 ): Promise<{ path: string; absolutePath: string; suggestedFilename: string }[]> {
   requireDownloadTimeout(timeout, api);
   const { signal, timeoutMs } = context.operation(timeout);
-  const files = await withTimeout(
-    surface.collectDownloads(count, trigger, signal),
-    timeoutMs,
-    () => new TestError('ACTION_FAILED', `${count === 1 ? 'no download' : `fewer than ${count} downloads`} finished within ${timeoutMs}ms`),
-  );
+  const files = await surface.collectDownloads(count, trigger, signal, timeoutMs);
   for (const file of files) context.attachArtifact('download', file.path);
   return files;
 }

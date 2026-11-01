@@ -32,9 +32,12 @@ export class AttemptDownloads {
 
   /**
    * Runs `trigger` and resolves with the first `count` downloads it starts,
-   * in start order, once each has finished. A canceled one fails the wait.
+   * in start order, once each has finished and the trigger returned. A
+   * canceled one fails the wait. The wait owns its deadline: past
+   * `timeoutMs`, or once `signal` aborts, it stops listening and fails,
+   * whatever the trigger is still doing, and nothing it saw is kept.
    */
-  async collect(count: number, trigger: () => Promise<void>, signal: AbortSignal, ours: (context: string) => boolean): Promise<FinishedDownload[]> {
+  async collect(count: number, trigger: () => Promise<void>, signal: AbortSignal, timeoutMs: number, ours: (context: string) => boolean): Promise<FinishedDownload[]> {
     const started: { readonly id: string; readonly suggestedFilename: string }[] = [];
     const ended = new Map<string, string | null>();
     let settled: () => void = () => undefined;
@@ -51,9 +54,14 @@ export class AttemptDownloads {
       ended.set(event.download, event.status === 'complete' ? event.filepath : null);
       check();
     });
+    const deadline = AbortSignal.timeout(timeoutMs);
     try {
-      await trigger();
-      await raceAbort(done, signal, 'download');
+      await raceAbort(Promise.all([trigger(), done]), AbortSignal.any([signal, deadline]), 'download');
+    } catch (cause) {
+      if (deadline.aborted && !signal.aborted) {
+        throw new TestError('ACTION_FAILED', `${count === 1 ? 'no download' : `fewer than ${count} downloads`} finished within ${timeoutMs}ms`);
+      }
+      throw cause;
     } finally {
       offBegin();
       offEnd();
