@@ -12,7 +12,7 @@ export interface ElementRef {
 /** What a page function may take: JSON values and element references. */
 export type PageArgument = string | number | boolean | null | ElementRef | readonly PageArgument[] | { readonly [key: string]: PageArgument };
 
-/** What a page function hands back: JSON values, with each DOM node as its reference. */
+/** What a page function hands back: JSON values, with each DOM node as its reference and each window as its browsing context. */
 export type PageValue = string | number | boolean | null | undefined | ElementRef | PageValue[] | { [key: string]: PageValue };
 
 export interface CallOptions {
@@ -89,6 +89,8 @@ function fromRemoteValue(value: Script.RemoteValue): PageValue {
       }
       return out;
     }
+    case 'window':
+      return { context: value.value.context };
     case 'node':
       if (value.sharedId === undefined) throw new EngineError('NODE_STALE', 'a returned node has no shared id', { retryable: true });
       return { sharedId: value.sharedId };

@@ -5,6 +5,7 @@
  */
 
 import { readSemanticsFunction } from '../in-page/read-semantics.ts';
+import { frameContentInset } from '../observation.ts';
 import type { RawNodeData, RawObservedNode } from '../read-node.ts';
 
 /** Reads the document's semantic tree: the walk's metadata as JSON when the page left `JSON` native, and the walked elements. */
@@ -20,47 +21,70 @@ export const READ_TREE = `(options, structured) => {
 }`;
 
 /**
- * Reads every element a locate could match, in document order through open
- * and recorded closed shadow roots, each with the reader's node mode (the
- * full locator-read projection). `wants` names the query kinds of the
- * expression; an element no kind could match is skipped, and its read
- * descendants hang under the nearest read ancestor, which keeps every
- * containment a scope or filter asks about. Iframe documents are not entered.
+ * Reads the elements a locate could match, in document order through open
+ * and recorded closed shadow roots, with the reader's node projection (the
+ * full locator-read surface), all under one reader. `wants` names the
+ * expression's query kinds and the roles its role queries ask for: a role
+ * query reads only the elements the reader gives one of those roles, the
+ * other kinds only elements that carry what they compare. An element no
+ * query could match is skipped, and its read descendants hang under the
+ * nearest read ancestor, which keeps every containment a scope or filter
+ * asks about. Iframe documents are not entered.
  */
 export const LOCATE_READ = `(options, wants, key) => {
   const read = (${readSemanticsFunction.toString()});
   const recorded = Reflect.get(globalThis, Symbol.for(key));
   const skip = new Set(['script', 'style', 'noscript', 'template', 'head', 'meta', 'link', 'title', 'base']);
   const labelable = 'input, select, textarea, button, meter, output, progress, [aria-label], [aria-labelledby], [contenteditable], [role]';
-  const wanted = (element) => {
-    if (wants.all) return true;
-    if (wants.testId && element.hasAttribute(options.testIdAttribute)) return true;
-    if (wants.placeholder && element.hasAttribute('placeholder')) return true;
-    if (wants.displayValue && /^(input|textarea|select)$/.test(element.localName)) return true;
-    if (wants.label && element.matches(labelable)) return true;
-    if (wants.text && (element.textContent.trim() !== '' || element.hasAttribute('aria-label') || element.hasAttribute('alt') || element.hasAttribute('title') || element.hasAttribute('value'))) return true;
-    return false;
-  };
-  const nodes = [];
-  const parents = [];
-  const elements = [];
-  const nodeOptions = { testIdAttribute: options.testIdAttribute, secureFieldSelector: options.secureFieldSelector, mode: { kind: 'node' } };
+  const kinds = wants.kinds;
+  const all = [];
+  const parentOf = [];
   const visit = (element, parent) => {
     if (skip.has(element.localName)) return;
-    let next = parent;
-    if (wanted(element)) {
-      next = nodes.length;
-      nodes.push(read(element, nodeOptions));
-      parents.push(parent);
-      elements.push(element);
-    }
+    const index = all.length;
+    all.push(element);
+    parentOf.push(parent);
     const shadow = element.shadowRoot ?? recorded?.get(element);
-    if (shadow) for (const child of shadow.children) visit(child, next);
-    for (const child of element.children) visit(child, next);
+    if (shadow) for (const child of shadow.children) visit(child, index);
+    for (const child of element.children) visit(child, index);
   };
   visit(document.documentElement, -1);
+  const base = { testIdAttribute: options.testIdAttribute, secureFieldSelector: options.secureFieldSelector };
+  const roles = !wants.all && wants.roles.length > 0
+    ? read(document.documentElement, { ...base, mode: { kind: 'roles', elements: all } })
+    : null;
+  const roleSet = new Set(wants.roles);
+  const keep = all.map((element, index) => {
+    if (wants.all) return true;
+    if (roles !== null && roleSet.has(roles[index])) return true;
+    if (kinds.testId && element.hasAttribute(options.testIdAttribute)) return true;
+    if (kinds.placeholder && element.hasAttribute('placeholder')) return true;
+    if (kinds.displayValue && /^(input|textarea|select)$/.test(element.localName)) return true;
+    if (kinds.label && element.matches(labelable)) return true;
+    if (kinds.text && (element.textContent.trim() !== '' || element.hasAttribute('aria-label') || element.hasAttribute('alt') || element.hasAttribute('title') || element.hasAttribute('value'))) return true;
+    return false;
+  });
+  const keptIndex = new Array(all.length).fill(-1);
+  const nearest = new Array(all.length).fill(-1);
+  const elements = [];
+  const parents = [];
+  all.forEach((element, index) => {
+    const above = parentOf[index] >= 0 ? nearest[parentOf[index]] : -1;
+    if (keep[index]) {
+      keptIndex[index] = elements.length;
+      parents.push(above);
+      elements.push(element);
+      nearest[index] = keptIndex[index];
+    } else {
+      nearest[index] = above;
+    }
+  });
+  const nodes = read(document.documentElement, { ...base, mode: { kind: 'nodes', elements } });
   return [JSON.stringify({ nodes, parents }), elements];
 }`;
+
+/** An iframe element's content box inset, in its own document; see `frameContentInset`. */
+export const FRAME_INSET = `(element) => (${frameContentInset.toString()})(element)`;
 
 /** What `LOCATE_READ` reports beside the elements: each read and the index of its nearest read ancestor. */
 export interface LocateMetadata {

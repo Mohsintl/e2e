@@ -30,18 +30,22 @@ describe('web({ driver })', () => {
     expect(() => web()).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG', message: 'E2E_WEB_DRIVER must be "playwright" or "bidi", got "cdp"' }));
   });
 
-  it('refuses webkit and the options it does not implement yet', () => {
-    expect(() => web({ driver: 'bidi', browser: 'webkit' })).toThrow(/drives chromium and firefox, got "webkit"/);
-    expect(() => web({ driver: 'bidi', locale: 'de-DE', headers: { 'x-a': 'b' } })).toThrow(
-      "web({ driver: 'bidi' }) does not support headers, locale yet; remove them or use the playwright driver",
-    );
+  it('refuses webkit and a persistent remote context, naming why', () => {
+    expect(() => web({ driver: 'bidi', browser: 'webkit' })).toThrow(/drives chromium and firefox, got "webkit"; WebKit has no BiDi endpoint yet/);
+    const cdpEndpoint = () => 'ws://127.0.0.1:9222';
+    expect(() => web({ driver: 'bidi', connect: { cdpEndpoint, reconnectEndpoint: cdpEndpoint } })).toThrow(/does not ride a persistent remote context \(connect.reconnectEndpoint\)/);
   });
 
-  it('offers the browser fixture and saved sessions, and no video', () => {
+  it('takes the options the Playwright driver takes, validated the same way', () => {
+    expect(() => web({ driver: 'bidi', locale: 'de-DE', timezoneId: 'Europe/Berlin', headers: { 'x-a': 'b' }, colorScheme: 'dark' })).not.toThrow();
+    expect(() => web({ driver: 'bidi', headers: { 'x bad': 'b' } })).toThrow(/invalid header name/);
+  });
+
+  it('offers the browser fixture, saved sessions, and video', () => {
     const engine = web({ driver: 'bidi', browser: 'firefox' });
     expect(Object.keys(engine.fixtures ?? {})).toEqual(['browser']);
     expect(engine.state).toBeDefined();
-    expect(engine.artifacts?.startVideo).toBeUndefined();
+    expect(engine.artifacts?.startVideo).toBeDefined();
   });
 });
 

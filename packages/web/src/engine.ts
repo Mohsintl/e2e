@@ -11,6 +11,7 @@ import {
   ConfigurationError,
   defineEngine,
   isSecret,
+  obj,
   LOCATOR_ACTION_KINDS,
   POINTER_ACTION_KINDS,
   rejectUnknownKeys,
@@ -19,13 +20,12 @@ import {
   type EngineHandle,
 } from 'e2e/engine';
 import { createRequire } from 'node:module';
-import { asBrowserProvider } from './provider.ts';
+import { asBrowserProvider, LeasedBrowsers, type BrowserProvider } from './provider.ts';
 import { PlaywrightSurface, type WebDriverName, type WebOptions } from './surface.ts';
 import { BidiSurface } from './bidi/surface.ts';
 import { createBidiBrowserFixture } from './bidi/browser.ts';
-import { ConfiguredInitScripts } from './init-scripts.ts';
 import { createBrowserFixture } from './browser.ts';
-import { validateInitScripts } from './init-scripts.ts';
+import { ConfiguredInitScripts, validateInitScripts } from './init-scripts.ts';
 import { DEFAULT_VIEWPORT } from './support.ts';
 import { MEDIA_KEYS, mediaProblem } from './media.ts';
 import { FIELD_VALUE_CONTROL, headerProblem } from './protected-app.ts';
@@ -72,7 +72,6 @@ export function web(options: WebOptions = {}): EngineHandle {
     );
   }
   rejectUnknownKeys('web()', options, WEB_OPTION_KEYS);
-  if (driverOf(options) === 'bidi') return bidiWeb(options);
   const provider = typeof options.browser === 'object' && options.browser !== null ? asBrowserProvider(options.browser) : undefined;
   if (provider !== undefined && options.connect !== undefined) {
     throw new ConfigurationError(
@@ -96,6 +95,7 @@ export function web(options: WebOptions = {}): EngineHandle {
   validateMedia(options);
   if (options.initScripts !== undefined) validateInitScripts(options.initScripts);
   if (options.screencast !== undefined) validateScreencast(options.screencast);
+  if (driverOf(options) === 'bidi') return bidiWeb(options, provider);
   const reconnecting = options.connect?.reconnectEndpoint !== undefined;
   // A per-attempt lease rides the same persistent context as `reconnectEndpoint`, with the same limits.
   const recoverable = reconnecting || provider?.scope === 'attempt';
@@ -177,41 +177,39 @@ function driverOf(options: WebOptions): WebDriverName {
   return chosen;
 }
 
-/** Options the BiDi driver does not implement yet; each is refused at config load rather than ignored. */
-const BIDI_UNSUPPORTED_OPTIONS = [
-  'connect',
-  'screencast',
-  'headers',
-  'basicAuth',
-  'userAgent',
-  'locale',
-  'timezoneId',
-  'colorScheme',
-  'reducedMotion',
-] as const satisfies readonly (keyof WebOptions)[];
-
 /**
  * The `web()` engine on the WebDriver BiDi driver: the same contract hooks
- * as the Playwright engine, over `BidiSurface`. Its version carries the
- * driver, so neither driver replays traces the other recorded.
+ * as the Playwright engine, over `BidiSurface`. The options were validated
+ * as for Playwright; what is left is what the driver cannot take. Its version
+ * carries the driver, so neither driver replays traces the other recorded.
  */
-function bidiWeb(options: WebOptions): EngineHandle {
-  const browser = options.browser ?? 'chromium';
+function bidiWeb(options: WebOptions, provider: BrowserProvider | undefined): EngineHandle {
+  const browser = provider === undefined ? (options.browser as BrowserName | undefined) ?? 'chromium' : 'chromium';
   if (browser !== 'chromium' && browser !== 'firefox') {
-    const named = typeof browser === 'string' ? `"${browser}"` : `browser provider "${asBrowserProvider(browser).name}"`;
-    throw new ConfigurationError('INVALID_CONFIG', `web({ driver: 'bidi' }) drives chromium and firefox, got ${named}`);
+    throw new ConfigurationError('INVALID_CONFIG', `web({ driver: 'bidi' }) drives chromium and firefox, got "${browser}"; WebKit has no BiDi endpoint yet`);
   }
-  const unsupported = BIDI_UNSUPPORTED_OPTIONS.filter((key) => options[key] !== undefined);
-  if (unsupported.length > 0) {
-    throw new ConfigurationError('INVALID_CONFIG', `web({ driver: 'bidi' }) does not support ${unsupported.join(', ')} yet; remove ${unsupported.length === 1 ? 'it' : 'them'} or use the playwright driver`);
+  if (options.connect?.reconnectEndpoint !== undefined || provider?.scope === 'attempt') {
+    const mode = provider === undefined ? 'connect.reconnectEndpoint' : `browser provider "${provider.name}" with scope "attempt"`;
+    throw new ConfigurationError(
+      'INVALID_CONFIG',
+      `web({ driver: 'bidi' }) does not ride a persistent remote context (${mode}) yet: it isolates each attempt in a user context of its own; use connect.cdpEndpoint or scope "worker"`,
+    );
   }
-  if (options.testIdAttribute !== undefined) validateTestIdAttribute(options.testIdAttribute);
-  if (options.initScripts !== undefined) validateInitScripts(options.initScripts);
+  const leases = provider === undefined ? undefined : new LeasedBrowsers(provider);
   const surface = new BidiSurface({
     browser,
     viewport: options.viewport === undefined ? DEFAULT_VIEWPORT : options.viewport,
     testIdAttribute: options.testIdAttribute ?? 'data-testid',
     initScripts: new ConfiguredInitScripts(options.initScripts ?? []),
+    screencast: options.screencast ?? {},
+    headers: options.headers,
+    basicAuth: options.basicAuth,
+    userAgent: options.userAgent,
+    locale: options.locale,
+    timezoneId: options.timezoneId,
+    media: obj({ colorScheme: options.colorScheme, reducedMotion: options.reducedMotion }),
+    cdpEndpoint: options.connect?.cdpEndpoint,
+    leases,
   });
   return defineEngine({
     name: 'web',
@@ -219,8 +217,10 @@ function bidiWeb(options: WebOptions): EngineHandle {
     spiVersion: 1,
     platform: 'web',
     prepare: (info) => surface.prepare(info),
+    finish: (info) => surface.finish(info),
     init: (info) => surface.init(info),
     startAttempt: (context) => surface.startAttempt(context),
+    settleAttempt: (context) => surface.settleAttempt(context),
     endAttempt: (context) => surface.endAttempt(context),
     dispose: (context) => surface.dispose(context),
     observe: (operation, observeOptions) => surface.observe(operation, observeOptions),
@@ -234,12 +234,8 @@ function bidiWeb(options: WebOptions): EngineHandle {
       type: (text, keyboardOptions, operation) => surface.typeText(text, keyboardOptions, operation),
       press: (key, operation) => surface.pressKey(key, operation),
     },
-    validateApp: (app, info) => {
-      if (app.permissions !== undefined) {
-        throw new ConfigurationError('INVALID_CONFIG', `target "${info.targetName}" declares app.permissions, which web({ driver: 'bidi' }) does not grant yet`);
-      }
-      validateApp(app, info, browser);
-    },
+    validateApp: (app, info) => validateApp(app, info, browser),
+    ...(isSecret(options.basicAuth?.password) ? { secrets: [options.basicAuth.password] } : {}),
     session: {
       open: (url, operation) => surface.open(url, operation),
       back: (operation) => surface.back(operation),
@@ -248,6 +244,8 @@ function bidiWeb(options: WebOptions): EngineHandle {
     },
     artifacts: {
       screenshot: (label, operation) => surface.screenshot(label, operation),
+      startVideo: (operation) => surface.startVideo(operation),
+      stopVideo: (operation) => surface.stopVideo(operation),
     },
     state: {
       capture: (operation) => surface.captureState(operation),

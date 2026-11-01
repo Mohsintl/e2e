@@ -63,6 +63,19 @@ export class BidiConnection {
     });
   }
 
+  /**
+   * Sends a browser-specific extension command the spec types do not name,
+   * such as Chromium's `goog:cdp.sendCommand`.
+   */
+  sendExtension(method: `${string}:${string}`, params: object): Promise<unknown> {
+    return this.send(method as BidiMethod, params as never);
+  }
+
+  /** Listens for a browser-specific extension event, such as `goog:cdp.Page.screencastFrame`; returns the unsubscribe. */
+  onExtension(event: `${string}:${string}`, handler: (params: Record<string, unknown>) => void): () => void {
+    return this.on(event as BidiEventName, handler as never);
+  }
+
   /** Listens for one event; returns the unsubscribe. The session must subscribe to it too (`session.subscribe`). */
   on<E extends BidiEventName>(event: E, handler: (params: BidiEventParams<E>) => void): () => void {
     let set = this.listeners.get(event);

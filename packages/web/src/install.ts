@@ -1,7 +1,7 @@
 /** First-run browser provisioning for the Playwright engine. */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -57,6 +57,24 @@ export function headlessShellExecutable(executable: string): string | undefined 
     (entry) => entry.isDirectory() && existsSync(path.join(shellRoot, entry.name, name)),
   );
   return folder === undefined ? undefined : path.join(shellRoot, folder.name, name);
+}
+
+/**
+ * The ffmpeg Playwright installs beside its browsers, which encodes the
+ * BiDi driver's Chromium screencast; undefined when it is not installed.
+ */
+export function ffmpegExecutable(): string | undefined {
+  const root = path.dirname(createRequire(import.meta.url).resolve('playwright-core/package.json'));
+  // oxlint-disable-next-line e2e/no-unchecked-json -- the pinned playwright-core's own manifest
+  const { browsers } = JSON.parse(readFileSync(path.join(root, 'browsers.json'), 'utf8')) as { browsers: { name: string; revision: string }[] };
+  const revision = browsers.find((browser) => browser.name === 'ffmpeg')?.revision;
+  const executable = browserType('chromium').executablePath();
+  const marker = `${path.sep}chromium-`;
+  const at = executable.lastIndexOf(marker);
+  if (revision === undefined || at === -1) return undefined;
+  const name = process.platform === 'win32' ? 'ffmpeg-win64.exe' : process.platform === 'darwin' ? 'ffmpeg-mac' : 'ffmpeg-linux';
+  const candidate = path.join(executable.slice(0, at), `ffmpeg-${revision}`, name);
+  return existsSync(candidate) ? candidate : undefined;
 }
 
 /** The `node` arguments that run the pinned `playwright-core` CLI with `args`. */
