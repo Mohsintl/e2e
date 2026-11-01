@@ -31,6 +31,12 @@ export interface ResolveExpressionOptions {
    * Without it a label query matches the name.
    */
   readonly label?: (node: SemanticNode, pattern: TextPattern) => boolean;
+  /**
+   * Whether `node`'s displayed value matches `pattern`, for a platform where
+   * only some nodes with a value display it (a checkbox's submission value
+   * is no display value). Without it a display-value query matches any value.
+   */
+  readonly displayValue?: (node: SemanticNode, pattern: TextPattern) => boolean;
 }
 
 /**
@@ -229,6 +235,7 @@ function matchesQuery(node: SemanticNode, query: SemanticQuery, options: Resolve
         (node.text !== undefined && matchesText(node.text, query.value))
       );
     case 'displayValue':
+      if (options.displayValue !== undefined) return options.displayValue(node, query.value);
       return node.value !== undefined && matchesText(node.value, query.value);
     case 'testId':
       return node.testId !== undefined && matchesText(node.testId, query.value);

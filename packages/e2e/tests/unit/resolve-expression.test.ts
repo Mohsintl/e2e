@@ -65,6 +65,12 @@ function ids(expression: LocatorExpression, nodes: readonly SemanticNode[] = SET
 }
 
 describe('resolveExpression', () => {
+  it('answers a display-value query through the engine’s predicate when it gives one', () => {
+    const matches = resolveExpression(query('displayValue', 'wifi'), SETTINGS, { displayValue: () => false });
+    expect(matches).toEqual([]);
+    expect(ids(query('displayValue', 'wifi'))).toEqual(['search']);
+  });
+
   it('answers a label query through the engine’s label predicate when it gives one', () => {
     const labels: Record<string, string[]> = { search: ['Find', 'Search'] };
     const matches = resolveExpression(query('label', 'Find'), SETTINGS, {

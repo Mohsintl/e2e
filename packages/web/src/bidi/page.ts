@@ -128,15 +128,17 @@ export const LOCATE_READ = `(options, wants, key, structured) => {
     }
   });
   const nodes = read(document.documentElement, { ...base, mode: { kind: 'nodes', elements } });
-  if (structured) return [{ nodes, parents }, elements];
-  return [${NATIVE_JSON} ? JSON.stringify({ nodes, parents }) : null, elements];
+  const valued = elements.map((element) => element.matches('input:not([type="checkbox" i]):not([type="radio" i]), textarea, select'));
+  if (structured) return [{ nodes, parents, valued }, elements];
+  return [${NATIVE_JSON} ? JSON.stringify({ nodes, parents, valued }) : null, elements];
 }`;
 
 
-/** What `LOCATE_READ` reports beside the elements: each read and the index of its nearest read ancestor. */
+/** What `LOCATE_READ` reports beside the elements: each read, the index of its nearest read ancestor, and whether it displays its value (an input but a checkbox or radio, a textarea, a select). */
 export interface LocateMetadata {
   readonly nodes: RawNodeData[];
   readonly parents: number[];
+  readonly valued: boolean[];
 }
 
 /** The walk's metadata, as `READ_TREE` reports it. */
@@ -394,7 +396,8 @@ export function boxSize(element: Element): { width: number; height: number } {
  * popover, so they paint in the top layer above a modal dialog or popover
  * the app shows, inside a closed shadow root of a host whose every style is
  * set inline as `!important`, so no page rule reaches them. `token` names
- * this masking for `unmaskSecureFields`.
+ * this masking for `unmaskSecureFields`; captures that overlap each keep
+ * their own.
  */
 export function maskSecureFields(selector: string, key: string, token: string): number {
   const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
@@ -436,23 +439,26 @@ export function maskSecureFields(selector: string, key: string, token: string): 
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, caret];
   document.documentElement.append(host);
   host.showPopover();
-  Reflect.set(globalThis, Symbol.for('e2e.bidi.mask'), { token, host, caret, boxes, selector, key });
+  const masks = (Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as Map<string, unknown> | undefined) ?? new Map<string, unknown>();
+  masks.set(token, { host, caret, boxes, selector, key });
+  Reflect.set(globalThis, Symbol.for('e2e.bidi.mask'), masks);
   return boxes.length;
 }
 
 /**
  * Removes what `maskSecureFields` added. Returns whether the screenshot taken
- * between the two showed no secure field: this document is the one masked
+ * between the two showed no secure field: this document holds the masking
  * under `token`, every box still painted opaque in the top layer, every
  * covered field where its box was, and no visible secure field appeared
  * that no box covers.
  */
 export function unmaskSecureFields(token: string): boolean {
-  const mask = Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as
-    | { token: string; host: HTMLElement; caret: CSSStyleSheet; boxes: { field: Element; rect: DOMRect; box: HTMLElement }[]; selector: string; key: string }
+  const masks = Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as
+    | Map<string, { host: HTMLElement; caret: CSSStyleSheet; boxes: { field: Element; rect: DOMRect; box: HTMLElement }[]; selector: string; key: string }>
     | undefined;
+  const mask = masks?.get(token);
   if (mask === undefined) return false;
-  Reflect.deleteProperty(globalThis, Symbol.for('e2e.bidi.mask'));
+  masks!.delete(token);
   const painted = (element: HTMLElement): boolean => {
     const style = getComputedStyle(element);
     return style.display !== 'none' && style.visibility === 'visible' && style.opacity === '1';
@@ -460,7 +466,7 @@ export function unmaskSecureFields(token: string): boolean {
   const shown = mask.host.matches(':popover-open') && painted(mask.host) && mask.boxes.every(({ box }) => painted(box));
   mask.host.remove();
   document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== mask.caret);
-  if (mask.token !== token || !shown) return false;
+  if (!shown) return false;
   const still = mask.boxes.every(({ field, rect }) => {
     const now = field.getBoundingClientRect();
     return now.x === rect.x && now.y === rect.y && now.width === rect.width && now.height === rect.height;

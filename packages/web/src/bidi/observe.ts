@@ -103,8 +103,9 @@ export async function traceScreen(session: BidiSession, signal: AbortSignal): Pr
  * Resolves one expression with the contract's reference semantics
  * (`resolveExpression`) over node-mode reads of the elements its queries
  * could match, in the document its frame chain names; a `selector` is
- * answered by `browsingContext.locateNodes`, and a label query by any one of
- * a control's labels, as the Playwright driver's label engine reads them.
+ * answered by `browsingContext.locateNodes`, a label query by any one of a
+ * control's labels, and a display-value query by controls that display
+ * their value, as the Playwright driver reads both.
  */
 export async function locate(session: BidiSession, expression: LocatorExpression): Promise<SemanticNode[]> {
   const chain = frameSelectors(expression);
@@ -118,16 +119,18 @@ export async function locate(session: BidiSession, expression: LocatorExpression
   let [metadata, elements] = await readLocated(false);
   if (metadata === null) [metadata, elements] = await readLocated(true);
   // oxlint-disable-next-line e2e/no-unchecked-json -- page-reported reads; the alignment below is checked
-  const { nodes, parents } = typeof metadata === 'string' ? (JSON.parse(metadata) as LocateMetadata) : (metadata as LocateMetadata);
-  if (!Array.isArray(nodes) || !Array.isArray(parents) || nodes.length !== elements.length || parents.length !== nodes.length) {
+  const { nodes, parents, valued } = typeof metadata === 'string' ? (JSON.parse(metadata) as LocateMetadata) : (metadata as LocateMetadata);
+  if (!Array.isArray(nodes) || !Array.isArray(parents) || !Array.isArray(valued) || nodes.length !== elements.length || parents.length !== nodes.length || valued.length !== nodes.length) {
     throw new EngineError('ENGINE_FAILURE', 'located reads do not align with their elements', { retryable: false });
   }
   const first = session.refs.reserveIds(nodes.length);
   const ids = nodes.map((_node, index) => `n${first + index}`);
   const sharedIds = new Map(ids.map((id, index) => [id, elements[index]!.sharedId]));
   const labels = new Map(nodes.map((node, index) => [ids[index]!, node.labels ?? []]));
+  const displayed = new Set(ids.filter((_id, index) => valued[index]));
   const matches = resolveExpression(inner, buildForest(nodes, parents, ids), {
     label: (node, pattern) => (labels.get(node.ref.id) ?? []).some((label) => matchesText(label, pattern)),
+    displayValue: (node, pattern) => displayed.has(node.ref.id) && node.value !== undefined && matchesText(node.value, pattern),
     selector: (selector, candidates) => {
       const hits = selected.get(selector) ?? new Set<string>();
       return candidates.filter((node) => hits.has(sharedIds.get(node.ref.id) ?? ''));
