@@ -78,7 +78,7 @@ export class ContextOwners {
  * context that holds it. A BiDi shared id holds no handle: it names the
  * element for as long as it lives, so nothing here needs disposing.
  */
-export class BidiRefs {
+class BidiRefs {
   private counter = 0;
   private observation = new Map<string, NodeTarget>();
   private readonly located = new Map<string, NodeTarget>();
