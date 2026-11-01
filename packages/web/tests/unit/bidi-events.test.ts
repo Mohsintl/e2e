@@ -17,15 +17,19 @@ function attempt(owners: ContextOwners, userContext: string) {
   const latch = new ErrorLatch();
   const log: AppLogEntry[] = [];
   const added: string[] = [];
+  const lines: string[] = [];
+  const visited: string[] = [];
   const session = {
     context: 'tab',
+    ownNavigations: 0,
     latch,
     dialogs: new DialogRouter(latch),
-    attempt: { appLog: (entry: AppLogEntry) => log.push(entry) },
+    attempt: { appLog: (entry: AppLogEntry) => log.push(entry), navigation: (line: string) => lines.push(line) },
+    visit: async (url: string) => void visited.push(url),
     network: { addContext: async (context: string) => void added.push(context), removeContext: async () => undefined },
     owns: (context: string | null | undefined) => context != null && owners.owner(context) === userContext,
   };
-  return { session: session as unknown as BidiSession, log, added, latch };
+  return { session: session as unknown as BidiSession, state: session, log, added, latch, lines, visited };
 }
 
 function prompt(context: string, type = 'confirm') {
@@ -80,7 +84,7 @@ describe('routeEvents', () => {
     const off = routeEvents(fake.connection, owners, () => session);
     fake.emit('browsingContext.contextCreated', { context: 'tab', userContext: 'mine', parent: null, url: 'about:blank', children: null, clientWindow: 'w' });
     fake.emit('browsingContext.contextCreated', { context: 'frame', parent: 'tab', url: 'about:blank', children: null, clientWindow: 'w' });
-    fake.emit('browsingContext.contextCreated', { context: 'popup', userContext: 'mine', parent: null, url: 'about:blank', children: null, clientWindow: 'w' });
+    fake.emit('browsingContext.contextCreated', { context: 'popup', userContext: 'mine', parent: null, originalOpener: 'tab', url: 'about:blank', children: null, clientWindow: 'w' });
     expect(owners.owner('frame')).toBe('mine');
     expect(added).toEqual(['popup']);
     const entry = (context: string, text: string) => ({ type: 'console', level: 'error', text, timestamp: 0, method: 'error', args: [], source: { realm: 'r', context } });
@@ -90,5 +94,39 @@ describe('routeEvents', () => {
     off();
     fake.emit('log.entryAdded', entry('tab', 'after unsubscribe'));
     expect(log).toEqual([{ source: 'console', level: 'error', text: 'boom' }]);
+  });
+
+  it('tells where the app went, never the driver’s own navigations, and grants each started navigation', async () => {
+    const fake = new FakeBidi();
+    const owners = new ContextOwners();
+    const { session, state, lines, visited } = attempt(owners, 'mine');
+    routeEvents(fake.connection, owners, () => session);
+    const created = (context: string, extra: Record<string, unknown> = {}) =>
+      fake.emit('browsingContext.contextCreated', { context, userContext: 'mine', parent: null, url: 'about:blank', children: null, clientWindow: 'w', originalOpener: null, ...extra });
+    const nav = (context: string, url: string) => ({ context, url, navigation: 'n', timestamp: 0 });
+    created('tab');
+    created('scratch');
+    fake.emit('browsingContext.contextCreated', { context: 'frame', parent: 'tab', url: 'about:blank', children: null, clientWindow: 'w' });
+    state.ownNavigations = 1;
+    fake.emit('browsingContext.navigationCommitted', nav('tab', 'http://app.test/'));
+    state.ownNavigations = 0;
+    fake.emit('browsingContext.navigationStarted', nav('tab', 'http://app.test/checkout'));
+    fake.emit('browsingContext.navigationCommitted', nav('tab', 'http://app.test/checkout'));
+    fake.emit('browsingContext.historyUpdated', { context: 'tab', url: 'http://app.test/checkout?step=2', timestamp: 0 });
+    fake.emit('browsingContext.navigationCommitted', nav('frame', 'http://pay.test/embed'));
+    fake.emit('browsingContext.navigationCommitted', nav('frame', 'about:srcdoc'));
+    fake.emit('browsingContext.navigationCommitted', nav('scratch', 'http://app.test/'));
+    created('popup', { originalOpener: 'tab' });
+    fake.emit('browsingContext.navigationCommitted', nav('popup', 'http://app.test/help'));
+    fake.emit('browsingContext.navigationCommitted', nav('popup', 'http://app.test/help/2'));
+    await settle();
+    expect(lines).toEqual([
+      'navigated to http://app.test/checkout',
+      'navigated to http://app.test/checkout?step=2',
+      'frame loaded http://pay.test/embed',
+      'the app opened a new tab; the test stays on its page',
+      'the new tab navigated to http://app.test/help/2',
+    ]);
+    expect(visited).toEqual(['http://app.test/checkout']);
   });
 });

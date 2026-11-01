@@ -2,7 +2,8 @@
 
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Deadline, EngineError } from 'e2e/engine';
-import { isStale, releaseQuietly } from './errors.ts';
+import { isStale } from './errors.ts';
+import { historyEntry } from './page.ts';
 import type { BidiSession } from './session.ts';
 
 /** How a navigation waits: the `waitUntil` the `browser` fixture takes. */
@@ -16,56 +17,59 @@ const POLL_MS = 50;
  * `networkidle` wait then holds until no request has been in flight for
  * 500 ms, counted from before the navigation started.
  */
-export async function goto(session: BidiSession, url: string, waitUntil: WaitUntil, signal: AbortSignal): Promise<void> {
-  const context = await session.ensureContext();
-  await session.grantPermissions(url);
-  if (waitUntil === 'networkidle') await session.network.track();
-  const wait = waitUntil === 'load' || waitUntil === 'networkidle' ? 'complete' : waitUntil === 'domcontentloaded' ? 'interactive' : 'none';
-  await session.connection.send('browsingContext.navigate', { context, url, wait });
-  if (waitUntil === 'networkidle') await session.network.waitForIdle(signal);
+export function goto(session: BidiSession, url: string, waitUntil: WaitUntil, signal: AbortSignal): Promise<void> {
+  return own(session, async () => {
+    const context = await session.ensureContext();
+    await session.visit(url);
+    if (waitUntil === 'networkidle') await session.network.track();
+    const wait = waitUntil === 'load' || waitUntil === 'networkidle' ? 'complete' : waitUntil === 'domcontentloaded' ? 'interactive' : 'none';
+    await session.connection.send('browsingContext.navigate', { context, url, wait });
+    if (waitUntil === 'networkidle') await session.network.waitForIdle(signal);
+  });
 }
 
 /** Reloads the tab and waits for its load event. */
-export async function reload(session: BidiSession): Promise<void> {
-  await session.connection.send('browsingContext.reload', { context: session.requireContext(), wait: 'complete' });
+export function reload(session: BidiSession): Promise<void> {
+  return own(session, async () => {
+    await session.connection.send('browsingContext.reload', { context: session.requireContext(), wait: 'complete' });
+  });
 }
 
 /**
  * Moves `delta` entries through the tab's history and waits until the
- * document it lands on has loaded: a `browsingContext.load` event for the
- * tab, or a new URL whose document reads complete, which a page restored
- * from the back-forward cache shows without a load event.
+ * document reads complete on another entry than before: a new document, a
+ * page restored from the back-forward cache, or the same document on an
+ * entry the app pushed, whose URL may not differ.
  */
-export async function traverse(session: BidiSession, delta: number, timeoutMs: number): Promise<void> {
-  const connection = session.connection;
-  const context = session.requireContext();
-  const deadline = new Deadline(timeoutMs);
-  const before = await session.currentUrl();
-  let loaded = false;
-  const off = connection.on('browsingContext.load', (event) => {
-    if (event.context === context) loaded = true;
-  });
-  const { subscription } = await connection.send('session.subscribe', { events: ['browsingContext.load'], contexts: [context] });
-  try {
-    await connection.send('browsingContext.traverseHistory', { context, delta });
+export function traverse(session: BidiSession, delta: number, timeoutMs: number, signal: AbortSignal): Promise<void> {
+  return own(session, async () => {
+    const context = session.requireContext();
+    const deadline = new Deadline(timeoutMs);
+    const before = await landedEntry(session);
+    await session.connection.send('browsingContext.traverseHistory', { context, delta });
     for (;;) {
-      if (loaded) return;
-      const settled = await landedUrl(session);
-      if (settled !== undefined && settled !== before) return;
+      const entry = await landedEntry(session);
+      if (entry !== undefined && entry !== before) return;
       if (deadline.expired()) throw new EngineError('OPERATION_TIMEOUT', 'history navigation did not load in time', { retryable: false });
-      await sleep(POLL_MS);
+      await sleep(POLL_MS, undefined, { signal });
     }
+  });
+}
+
+/** Runs a navigation the driver makes itself, which the trace leaves to the step that asked for it. */
+async function own<T>(session: BidiSession, work: () => Promise<T>): Promise<T> {
+  session.ownNavigations += 1;
+  try {
+    return await work();
   } finally {
-    off();
-    await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
+    session.ownNavigations -= 1;
   }
 }
 
-/** The tab's URL once its document reads complete; undefined while it loads or is being replaced. */
-async function landedUrl(session: BidiSession): Promise<string | undefined> {
+/** The tab's history entry once its document reads complete; undefined while it loads or is being replaced. */
+async function landedEntry(session: BidiSession): Promise<string | undefined> {
   try {
-    const url = await session.call("() => document.readyState === 'complete' ? location.href : null");
-    return typeof url === 'string' ? url : undefined;
+    return (await session.run(historyEntry, [])) ?? undefined;
   } catch (cause) {
     if (isStale(cause)) return undefined;
     throw cause;

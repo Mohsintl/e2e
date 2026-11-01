@@ -247,11 +247,11 @@ export class BidiSurface {
   }
 
   back(operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'navigation', (session, budget) => traverse(session, -1, budget.timeoutMs), { traced: true });
+    return this.guard(operation, 'navigation', (session, budget) => traverse(session, -1, budget.timeoutMs, budget.signal), { traced: true });
   }
 
   forward(operation: OperationContext): Promise<void> {
-    return this.guard(operation, 'navigation', (session, budget) => traverse(session, 1, budget.timeoutMs), { traced: true });
+    return this.guard(operation, 'navigation', (session, budget) => traverse(session, 1, budget.timeoutMs, budget.signal), { traced: true });
   }
 
   restart(operation: OperationContext): Promise<void> {
@@ -367,12 +367,12 @@ export class BidiSurface {
    * attempt's `downloads` folder, in start order. The trigger is test code,
    * so only cancellation bounds the wait around it.
    */
-  async collectDownloads(count: number, trigger: () => Promise<void>, signal: AbortSignal): Promise<{ path: string; absolutePath: string; suggestedFilename: string }[]> {
+  async collectDownloads(count: number, trigger: () => Promise<void>, signal: AbortSignal, timeoutMs: number): Promise<{ path: string; absolutePath: string; suggestedFilename: string }[]> {
     const session = this.requireSession();
     if (this.options.leases !== undefined) {
       throw new EngineError('UNSUPPORTED_CAPABILITY', `downloads on the BiDi driver need the browser's filesystem; browser provider "${this.options.leases.name}" runs it on another machine`, { retryable: false });
     }
-    const finished = await session.downloads.collect(count, trigger, signal, (context) => session.onPage(context));
+    const finished = await session.downloads.collect(count, trigger, signal, timeoutMs, (context) => session.onPage(context));
     return finished.map((download) => {
       const { relative, absolute } = session.artifactPath('downloads', download.suggestedFilename, '');
       copyFileSync(download.filepath, absolute);

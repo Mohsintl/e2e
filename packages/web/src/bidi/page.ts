@@ -400,3 +400,13 @@ export const UNMASK = `() => {
   const caret = Reflect.get(globalThis, Symbol.for('e2e.bidi.caret'));
   if (caret) document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== caret);
 }`;
+
+/**
+ * The history entry the document shows once it reads complete, null while
+ * it loads: the Navigation API's entry key, else its URL and state.
+ */
+export function historyEntry(): string | null {
+  if (document.readyState !== 'complete') return null;
+  const key = (globalThis as { navigation?: { currentEntry?: { key?: string } | null } }).navigation?.currentEntry?.key;
+  return key ?? `${location.href} ${JSON.stringify(history.state)}`;
+}

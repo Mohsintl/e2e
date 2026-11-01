@@ -16,11 +16,18 @@ export const SESSION_EVENTS = [
   'network.fetchError',
   'browsingContext.contextCreated',
   'browsingContext.contextDestroyed',
+  'browsingContext.navigationStarted',
+  'browsingContext.navigationCommitted',
+  'browsingContext.fragmentNavigated',
+  'browsingContext.historyUpdated',
   'browsingContext.userPromptOpened',
   'browsingContext.downloadWillBegin',
   'browsingContext.downloadEnd',
   'input.fileDialogOpened',
 ] as const;
+
+/** Documents that are no place the app went: a fresh tab, an inline frame. */
+const NO_PLACE = new Set(['about:blank', 'about:srcdoc']);
 
 /** Chromium's and Firefox's codes for a request the page itself abandoned, which is no app failure. */
 const ABORTED = new Set(['net::ERR_ABORTED', 'NS_BINDING_ABORTED']);
@@ -28,7 +35,9 @@ const ABORTED = new Set(['net::ERR_ABORTED', 'NS_BINDING_ABORTED']);
 /**
  * Routes `connection`'s events to the attempt `current` returns; returns the
  * unsubscribe. A prompt in a context of another session (a browser shared
- * over CDP) is left for that session to answer.
+ * over CDP) is left for that session to answer. Where the app went is told
+ * as the Playwright driver tells it (`app-log.ts`): its own navigations, the
+ * tabs it opens, and the frames it loads, never the driver's.
  */
 export function routeEvents(connection: BidiConnection, owners: ContextOwners, current: () => BidiSession | undefined): () => void {
   const report = (entry: AppLogEntry): void => {
@@ -42,17 +51,53 @@ export function routeEvents(connection: BidiConnection, owners: ContextOwners, c
     const session = current();
     return session?.owns(context) === true ? session : undefined;
   };
+  const went = (line: string): void => {
+    try {
+      current()?.attempt.navigation(line);
+    } catch {
+      return;
+    }
+  };
+  /** Tabs the app opened, and whether their first document, which the opening told, has loaded. */
+  const appTabs = new Map<string, { opened: boolean }>();
+  const navigated = (event: { readonly context: string; readonly url: string }): void => {
+    const session = ours(event.context);
+    if (session === undefined || NO_PLACE.has(event.url) || event.url.startsWith('data:')) return;
+    if (owners.top(event.context) !== event.context) {
+      went(`frame loaded ${event.url}`);
+      return;
+    }
+    if (event.context === session.context) {
+      if (session.ownNavigations === 0) went(`navigated to ${event.url}`);
+      return;
+    }
+    const tab = appTabs.get(event.context);
+    if (tab === undefined) return;
+    if (tab.opened) went(`the new tab navigated to ${event.url}`);
+    else tab.opened = true;
+  };
   const offs = [
     connection.on('browsingContext.contextCreated', (info) => {
       owners.created(info.context, info.userContext, info.parent);
       const session = ours(info.context);
-      if (info.parent == null && session !== undefined && info.context !== session.context) void session.network.addContext(info.context).catch((cause: unknown) => session.latch.latch(asError(cause)));
+      if (info.parent != null || info.originalOpener == null || session === undefined) return;
+      void session.network.addContext(info.context).catch((cause: unknown) => session.latch.latch(asError(cause)));
+      appTabs.set(info.context, { opened: false });
+      went(`the app opened a new tab${NO_PLACE.has(info.url) ? '' : ` at ${info.url}`}; the test stays on its page`);
     }),
     connection.on('browsingContext.contextDestroyed', (info) => {
       const session = ours(info.context);
       if (info.parent == null && session !== undefined) void session.network.removeContext(info.context).catch((cause: unknown) => session.latch.latch(asError(cause)));
+      appTabs.delete(info.context);
       owners.destroyed(info.context);
     }),
+    connection.on('browsingContext.navigationStarted', (event) => {
+      const session = ours(event.context);
+      if (session !== undefined) void session.visit(event.url).catch((cause: unknown) => session.latch.latch(asError(cause)));
+    }),
+    connection.on('browsingContext.navigationCommitted', navigated),
+    connection.on('browsingContext.fragmentNavigated', navigated),
+    connection.on('browsingContext.historyUpdated', navigated),
     connection.on('browsingContext.userPromptOpened', (prompt) => {
       const session = ours(prompt.context);
       if (session === undefined) return;
