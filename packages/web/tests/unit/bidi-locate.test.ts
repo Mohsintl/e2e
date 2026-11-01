@@ -8,8 +8,10 @@ import { resolveExpression, type LocatorExpression } from 'e2e/engine';
 import { buildForest, wantedQueries } from '../../src/bidi/observe.ts';
 import type { RawNodeData } from '../../src/read-node.ts';
 
+/** A string pattern. */
 const text = (value: string, exact = false) => ({ kind: 'string' as const, value, exact });
 
+/** A reader's node read, defaults filled in. */
 function raw(fields: Partial<RawNodeData>): RawNodeData {
   return {
     role: null, name: null, labels: null, text: null, value: null, selection: null, inputPurpose: 'none',

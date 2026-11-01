@@ -32,6 +32,7 @@ function attempt(owners: ContextOwners, userContext: string) {
   return { session: session as unknown as BidiSession, state: session, log, added, latch, lines, visited };
 }
 
+/** A user prompt event in `context`. */
 function prompt(context: string, type = 'confirm') {
   return { context, handler: 'ignore', message: 'Really delete everything?', type };
 }

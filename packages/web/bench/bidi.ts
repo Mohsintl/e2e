@@ -48,6 +48,12 @@ const STEPS_PER_TEST = Number(values['steps-per-test']);
  * (upstream Firefox gaps), and the pad drag that fails on Playwright's Firefox on main too.
  */
 const FIREFOX_SKIPS = 'drags and drops on the board|dragging the card marks it done|emulated media reaches|raw mouse input drags along the pad';
+/**
+ * Actions in the agent flow, each with the observation before it (the flow's
+ * eighth observation checks the result): an agent step is the flow, less its
+ * one navigation, over these.
+ */
+const AGENT_FLOW_ACTIONS = 7;
 /** Warm iterations a driver runs before the other takes its turn. */
 const BLOCK = 5;
 const TESTBED_PORT = 4291;
@@ -79,13 +85,17 @@ async function waitForHttp(url: string): Promise<void> {
   throw new Error(`${url} never answered`);
 }
 
+/** A fresh operation budget for one engine call. */
 const operation = (timeoutMs = 30_000): OperationContext => ({ signal: AbortSignal.timeout(timeoutMs), timeoutMs });
 
+/** A string text pattern. */
 const string = (value: string, exact = false) => ({ kind: 'string' as const, value, exact });
+/** A role query, with an optional accessible name. */
 const role = (value: string, name?: string): LocatorExpression => ({
   kind: 'query',
   query: { kind: 'role', value: string(value, true), ...(name === undefined ? {} : { name: string(name) }) },
 });
+/** An exact label query. */
 const label = (value: string): LocatorExpression => ({ kind: 'query', query: { kind: 'label', value: string(value, true) } });
 
 /** One engine with an attempt running, and the hooks the scenarios call. */
@@ -129,6 +139,7 @@ async function attempt(engine: EngineHandle): Promise<void> {
   });
 }
 
+/** A cleanup budget for ending an attempt or disposing an engine. */
 const cleanup = () => ({ signal: AbortSignal.timeout(30_000), timeoutMs: 30_000 });
 
 /** Boots `engine` with an attempt running; an engine whose boot or attempt failed is disposed before the failure goes on. */
@@ -234,10 +245,11 @@ function record(samples: Samples, name: string, ms: number): void {
   (samples[name] ??= []).push(ms);
 }
 
+/** A testbed page's URL. */
 const testbed = (page: string) => `http://127.0.0.1:${TESTBED_PORT}${page}`;
 const HEAVY = `http://127.0.0.1:${HEAVY_PORT}/`;
 
-/** The agent-style flow: observe, pick a node from the tree, act, observe again, ten steps on the todos page. */
+/** The agent-style flow on the todos page: open it, then observe, pick a node from the tree, and act, seven times, and observe the result. */
 async function agentFlow(d: Driven): Promise<void> {
   const { engine } = d;
   await d.open(testbed('/todos'));
@@ -323,11 +335,9 @@ async function warmBlock(driver: 'playwright' | 'bidi', browser: 'chromium' | 'f
       await d.open(testbed('/forms'));
       record(samples, 'observe: /forms right after a heavy observation', await time(() => engine.observe!(operation())));
       sample();
-      record(samples, 'agent flow: todos (10 observe/act steps)', await time(async () => {
-        await engine.endAttempt!(cleanup());
-        await attempt(engine);
-        await agentFlow(d);
-      }));
+      await engine.endAttempt!(cleanup());
+      await attempt(engine);
+      record(samples, 'agent flow: todos (open, 7 actions, 8 observations)', await time(() => agentFlow(d)));
       sample();
     }
     sample();
@@ -462,7 +472,7 @@ for (const browser of BROWSERS) {
 function totals(key: string): Record<string, number> {
   const samples = results[key]!.samples;
   const p50 = (name: string): number => samples[name]?.p50 ?? 0;
-  const agentStep = p50('agent flow: todos (10 observe/act steps)') / 10;
+  const agentStep = (p50('agent flow: todos (open, 7 actions, 8 observations)') - p50('navigate: testbed /forms')) / AGENT_FLOW_ACTIONS;
   return {
     'sum of p50s, every scenario (ms)': Object.values(samples).reduce((total, s) => total + s.p50, 0),
     'sum of means, every scenario (ms)': Object.values(samples).reduce((total, s) => total + s.mean, 0),

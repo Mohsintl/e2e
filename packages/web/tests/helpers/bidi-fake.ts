@@ -62,6 +62,7 @@ export class FakeBidi {
     return this.sent.filter((command) => command.method === method);
   }
 
+  /** Replies to one command with its method's handler, or an empty result. */
   private async answer(command: SentCommand): Promise<void> {
     const handler = this.handlers.get(command.method);
     const reply = handler === undefined ? { result: {} } : await handler(command.params);
