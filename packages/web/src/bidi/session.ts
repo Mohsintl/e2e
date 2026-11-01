@@ -17,7 +17,7 @@ import type { WebScreencastOptions } from '../surface.ts';
 import type { BidiConnection } from './connection.ts';
 import { AttemptDownloads } from './downloads.ts';
 import { MODIFIER_VALUES } from './input.ts';
-import { releaseQuietly } from './errors.ts';
+import { releaseQuietly, unlessStale } from './errors.ts';
 import { FrameRegistry, type NodeTarget } from './frames.ts';
 import type { BidiBrowser, BidiBrowserName } from './launch.ts';
 import { AttemptNetwork } from './network.ts';
@@ -268,9 +268,7 @@ export class BidiSession {
     await this.connection.send('browser.removeUserContext', { userContext: this.userContext });
     await Promise.all(this.preloads.map((script) => releaseQuietly(this.connection.send('script.removePreloadScript', { script }))));
     this.preloads = [];
-    this.context = undefined;
-    this.refs.clear();
-    this.frames.clear();
+    this.retireContext();
   }
 
   /** Replaces the user context with a clean one, the test's routes and added init scripts carried over. */
@@ -349,16 +347,16 @@ export class BidiSession {
     await this.connection.send('browsingContext.setViewport', { context: await this.ensureContext(), viewport: size });
   }
 
-  /** Closes the tab, keeping the user context's storage. */
+  /** Closes the tab and every tab the app opened, keeping the user context's storage, as a restart of the Playwright driver closes every page. */
   async closeContext(): Promise<void> {
-    const context = this.context;
     await this.video?.contextClosing();
-    this.context = undefined;
-    this.refs.clear();
-    this.frames.clear();
-    if (context === undefined) return;
-    await this.network.removeContext(context);
-    await this.connection.send('browsingContext.close', { context });
+    this.retireContext();
+    const { contexts } = await this.connection.send('browsingContext.getTree', { maxDepth: 0 });
+    const tabs = contexts.filter((info) => info.userContext === this.userContext).map((info) => info.context);
+    await Promise.all(tabs.map(async (context) => {
+      await this.network.removeContext(context);
+      await unlessStale(this.connection.send('browsingContext.close', { context }), undefined);
+    }));
   }
 
   /** Calls a page function in `context` (the tab by default). */
@@ -399,22 +397,41 @@ export class BidiSession {
   /**
    * A key source with the modifiers already held left alone: a chord or a
    * modifier click presses and releases only the modifiers it adds, so one
-   * `keyboard.down` holds stays held. Records what stays held after it.
+   * `keyboard.down` holds stays held. A press or release left out becomes a
+   * pause, so the source keeps its ticks beside a pointer's. Records what
+   * stays held after it.
    */
   private keepHeld(source: Input.KeySourceActions): Input.KeySourceActions {
     const skipped = new Set<string>();
-    const kept = source.actions.filter((action) => {
+    const kept = source.actions.map((action): Input.KeySourceAction => {
       if (action.type === 'keyDown' && MODIFIER_VALUES.has(action.value) && this.heldKeys.has(action.value)) {
         skipped.add(action.value);
-        return false;
+        return { type: 'pause' };
       }
-      return !(action.type === 'keyUp' && skipped.has(action.value));
+      return action.type === 'keyUp' && skipped.has(action.value) ? { type: 'pause' } : action;
     });
     for (const action of kept) {
       if (action.type === 'keyDown') this.heldKeys.add(action.value);
       else if (action.type === 'keyUp') this.heldKeys.delete(action.value);
     }
     return { ...source, actions: kept };
+  }
+
+  /** Whether a key (by WebDriver value) is held down on the tab. */
+  isHeld(value: string): boolean {
+    return this.heldKeys.has(value);
+  }
+
+  /**
+   * Forgets the tab, which closed or is closing: its refs, frames, and the
+   * input state that died with it, so the next use opens a fresh one.
+   */
+  retireContext(): void {
+    this.context = undefined;
+    this.refs.clear();
+    this.frames.clear();
+    this.heldKeys.clear();
+    this.pointer = { x: 0, y: 0 };
   }
 
   /** Counts a page mutation the driver made in the page (a fill, a select), which may have reached the app. */

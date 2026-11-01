@@ -88,7 +88,10 @@ export function routeEvents(connection: BidiConnection, owners: ContextOwners, c
     }),
     connection.on('browsingContext.contextDestroyed', (info) => {
       const session = ours(info.context);
-      if (info.parent == null && session !== undefined) void session.network.removeContext(info.context).catch((cause: unknown) => session.latch.latch(asError(cause)));
+      if (info.parent == null && session !== undefined) {
+        if (info.context === session.context) session.retireContext();
+        void session.network.removeContext(info.context).catch((cause: unknown) => session.latch.latch(asError(cause)));
+      }
       appTabs.delete(info.context);
       owners.destroyed(info.context);
     }),

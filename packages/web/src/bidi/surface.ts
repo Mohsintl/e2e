@@ -46,7 +46,7 @@ import { perform, performAt, typeText } from './actions.ts';
 import { screenshot, startVideo, stopVideo } from './artifacts.ts';
 import { afterDispatch, classify, releaseQuietly } from './errors.ts';
 import { routeEvents, SESSION_EVENTS } from './events.ts';
-import { pressSource } from './input.ts';
+import { pressSource, SHIFT_KEY } from './input.ts';
 import { connectBidiOverCdp, launchBidiBrowser, type BidiBrowser, type BidiBrowserName } from './launch.ts';
 import type { NetworkRoute, ObservedResponse } from './network.ts';
 import { locate, observe, traceScreen } from './observe.ts';
@@ -391,6 +391,11 @@ export class BidiSurface {
   /** The headers a request to `url` carries for the app's site, which a route's own `fetch` sends too. */
   siteHeaders(url: string): Readonly<Record<string, string>> | undefined {
     return this.settings?.siteHeaders(url);
+  }
+
+  /** Whether Shift is held on the attempt's tab, which a key the fixture names by letter is typed in upper case under. */
+  shiftHeld(): boolean {
+    return this.session?.isHeld(SHIFT_KEY) ?? false;
   }
 
   /** The running attempt's basic-auth credentials, which a route's own `fetch` answers a challenge with. */

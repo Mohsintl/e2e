@@ -44,6 +44,12 @@ describe('setCookieOf', () => {
     expect(setCookieOf('theme=dark; Path=/x', new URL('https://app.test/'))).toEqual({ name: 'theme', value: { type: 'string', value: 'dark' }, domain: 'app.test', path: '/x' });
   });
 
+  it('refuses a Domain the response host does not belong to, and keeps a parent domain', () => {
+    expect(setCookieOf('sid=x; Domain=app.test', new URL('https://other.test/'))).toBeUndefined();
+    expect(setCookieOf('sid=x; Domain=evil-app.test', new URL('https://app.test/'))).toBeUndefined();
+    expect(setCookieOf('sid=x; Domain=.app.test', new URL('https://api.app.test/'))).toMatchObject({ domain: '.app.test' });
+  });
+
   it('skips a header with no name', () => {
     expect(setCookieOf('=orphan', url)).toBeUndefined();
     expect(setCookieOf('novalue', url)).toBeUndefined();

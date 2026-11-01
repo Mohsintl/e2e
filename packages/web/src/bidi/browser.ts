@@ -40,7 +40,6 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
     context,
   });
   const latch = surface.attemptLatch();
-  const heldKeys = new Set<string>();
   const routes: { readonly pattern: TextPattern; readonly route: NetworkRoute }[] = [];
   const removeRoutes = (match: (stored: (typeof routes)[number]) => boolean): Promise<void> => {
     const removed = new Set(routes.filter(match).map((stored) => stored.route));
@@ -142,15 +141,9 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
     },
     waitForDownloads: (trigger, options) => downloads(surface, context, trigger, requireDownloadCount(options), options.timeout, 'browser.waitForDownloads'),
     keyboard: {
-      down: async (key) => {
-        await surface.input('keyboard.down', [fixtureKeySource(key, 'keyDown', heldKeys.has('Shift'))], context.operation());
-        heldKeys.add(key);
-      },
-      up: async (key) => {
-        await surface.input('keyboard.up', [fixtureKeySource(key, 'keyUp', heldKeys.has('Shift'))], context.operation());
-        heldKeys.delete(key);
-      },
-      press: (key) => surface.input('keyboard.press', [fixtureKeySource(key, 'press', heldKeys.has('Shift'))], context.operation()),
+      down: (key) => surface.input('keyboard.down', [fixtureKeySource(key, 'keyDown', surface.shiftHeld())], context.operation()),
+      up: (key) => surface.input('keyboard.up', [fixtureKeySource(key, 'keyUp', surface.shiftHeld())], context.operation()),
+      press: (key) => surface.input('keyboard.press', [fixtureKeySource(key, 'press', surface.shiftHeld())], context.operation()),
       type: (text) => surface.input('keyboard.type', [typeSource(text)], context.operation()),
     },
     mouse: {
@@ -220,7 +213,11 @@ function defaultCookiePath(url: URL): string {
   return directory === '' ? '/' : directory;
 }
 
-/** One `Set-Cookie` header of a response from `url` as a cookie to store; undefined for one with no name. */
+/**
+ * One `Set-Cookie` header of a response from `url` as a cookie to store;
+ * undefined for one with no name, or with a `Domain` the response's host does
+ * not belong to, which a browser would refuse too.
+ */
 export function setCookieOf(header: string, url: URL): Storage.PartialCookie | undefined {
   const [pair = '', ...attributes] = header.split(';');
   const split = pair.indexOf('=');
@@ -231,7 +228,9 @@ export function setCookieOf(header: string, url: URL): Storage.PartialCookie | u
     const at = each.indexOf('=');
     attribute.set((at === -1 ? each : each.slice(0, at)).trim().toLowerCase(), at === -1 ? '' : each.slice(at + 1).trim());
   }
-  const domain = attribute.get('domain') ?? '';
+  const domain = (attribute.get('domain') ?? '').toLowerCase();
+  const bare = domain.replace(/^\./, '');
+  if (bare !== '' && url.hostname !== bare && !url.hostname.endsWith(`.${bare}`)) return undefined;
   const path = attribute.get('path') ?? '';
   const sameSite = attribute.get('samesite')?.toLowerCase() ?? '';
   const maxAge = attribute.get('max-age') ?? '';

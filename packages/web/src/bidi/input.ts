@@ -41,6 +41,9 @@ const MODIFIER_CODES: Readonly<Record<Exclude<KeyModifier, 'ControlOrMeta'>, str
   Meta: '',
 };
 
+/** Shift's WebDriver code point. */
+export const SHIFT_KEY = MODIFIER_CODES.Shift;
+
 /** Every modifier's WebDriver code point. */
 export const MODIFIER_VALUES: ReadonlySet<string> = new Set(Object.values(MODIFIER_CODES));
 
