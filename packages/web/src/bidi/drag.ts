@@ -81,8 +81,8 @@ export async function chromiumDrag(
   let intercepting = false;
   try {
     subscription = await connection.subscribeExtension(['goog:cdp.Input.dragIntercepted'], [context]);
-    await pointer([{ type: 'pointerMove', x: from.x, y: from.y, origin: 'viewport' }, { type: 'pointerDown', button: 0 }]);
     pressed = true;
+    await pointer([{ type: 'pointerMove', x: from.x, y: from.y, origin: 'viewport' }, { type: 'pointerDown', button: 0 }]);
     // Armed after the press: armed before, it latches onto the move to the press point and misses the drag.
     await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, watchDrag), undefined)));
     intercepting = true;
@@ -91,8 +91,8 @@ export async function chromiumDrag(
     await pointer([{ type: 'pointerMove', x: first.x, y: first.y, origin: 'viewport' }]);
     const started = await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, dragStarted, [], { awaitPromise: true }), false)));
     const data = started.includes(true) ? await raceAbort(dragData, signal, 'drag') : undefined;
-    intercepting = false;
     await cdp('Input.setInterceptDrags', { enabled: false });
+    intercepting = false;
     if (data === undefined) {
       await pointer([
         ...rest.map((point) => ({ type: 'pointerMove' as const, x: point.x, y: point.y, origin: 'viewport' as const, ...(stepMs > 0 ? { duration: stepMs } : {}) })),

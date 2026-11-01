@@ -41,6 +41,9 @@ const MODIFIER_CODES: Readonly<Record<Exclude<KeyModifier, 'ControlOrMeta'>, str
   Meta: '',
 };
 
+/** Every modifier's WebDriver code point. */
+export const MODIFIER_VALUES: ReadonlySet<string> = new Set(Object.values(MODIFIER_CODES));
+
 /** A modifier's WebDriver code point; `ControlOrMeta` is Meta on macOS and Control elsewhere. */
 function modifierCode(modifier: KeyModifier): string {
   if (modifier === 'ControlOrMeta') return process.platform === 'darwin' ? MODIFIER_CODES.Meta : MODIFIER_CODES.Control;

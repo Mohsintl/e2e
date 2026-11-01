@@ -16,6 +16,7 @@ import { ErrorLatch, invalidState, sanitizeFilename } from '../support.ts';
 import type { WebScreencastOptions } from '../surface.ts';
 import type { BidiConnection } from './connection.ts';
 import { AttemptDownloads } from './downloads.ts';
+import { MODIFIER_VALUES } from './input.ts';
 import { releaseQuietly } from './errors.ts';
 import { FrameRegistry, type NodeTarget } from './frames.ts';
 import type { BidiBrowser, BidiBrowserName } from './launch.ts';
@@ -166,6 +167,8 @@ export class BidiSession {
   video: BidiVideo | undefined;
   /** The browser provider's own recording, which takes the place of `video` when the provider records. */
   providerVideo: ProviderVideo | undefined;
+  /** The keys held down across calls, by WebDriver value. */
+  private readonly heldKeys = new Set<string>();
   /** Where the mouse last moved, which a viewport swipe wheels at. */
   pointer: ViewportPoint = { x: 0, y: 0 };
   /** Input and page mutations dispatched so far: an action that fails after this moved may have reached the app. */
@@ -233,16 +236,15 @@ export class BidiSession {
     this.visited.clear();
     const scoped = { userContexts: [userContext] as [string] };
     const sources = [
-      CLOSED_SHADOW_ROOTS_INIT_SCRIPT,
-      ...(this.settings.holdRequests ? [BLOCK_SERVICE_WORKERS] : []),
-      ...this.settings.initScripts.forAttempt(),
-      ...this.addedScripts,
+      wrapScript(CLOSED_SHADOW_ROOTS_INIT_SCRIPT),
+      ...(this.settings.holdRequests ? [wrapScript(BLOCK_SERVICE_WORKERS)] : []),
+      ...[...this.settings.initScripts.forAttempt(), ...this.addedScripts].map(wrapAppScript),
     ];
     const { userAgent, locale, timezoneId } = this.settings;
     this.preloads = [];
     const steps = await Promise.allSettled([
       ...sources.map(async (source) => {
-        this.preloads.push((await connection.send('script.addPreloadScript', { functionDeclaration: wrapScript(source), ...scoped })).script);
+        this.preloads.push((await connection.send('script.addPreloadScript', { functionDeclaration: source, ...scoped })).script);
       }),
       this.downloads.allow(userContext),
       userAgent === undefined ? undefined : connection.send('emulation.setUserAgentOverride', { userAgent, ...scoped }),
@@ -293,7 +295,7 @@ export class BidiSession {
   /** Adds an init script for every document of this user context from now on, and of every one that replaces it. */
   async addInitScript(source: string): Promise<void> {
     const { script } = await this.connection.send('script.addPreloadScript', {
-      functionDeclaration: wrapScript(source),
+      functionDeclaration: wrapAppScript(source),
       userContexts: [this.userContext],
     });
     this.addedScripts.push(source);
@@ -381,15 +383,38 @@ export class BidiSession {
 
   /**
    * Runs input sources on the tab. A source releases what it pressed itself,
-   * so a key `keyboard.down` holds stays held across later input. Nothing is
-   * sent once `signal` aborted.
+   * and a modifier already held is neither pressed nor released again
+   * (`keepHeld`), so a key `keyboard.down` holds stays held across later
+   * input. Nothing is sent once `signal` aborted.
    */
   async sendInput(actions: Input.SourceActions[], signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     const context = this.requireContext();
+    const sent = actions.map((source) => (source.type === 'key' ? this.keepHeld(source) : source));
     this.dispatches += 1;
-    await this.connection.send('input.performActions', { context, actions });
-    this.trackPointer(actions);
+    await this.connection.send('input.performActions', { context, actions: sent });
+    this.trackPointer(sent);
+  }
+
+  /**
+   * A key source with the modifiers already held left alone: a chord or a
+   * modifier click presses and releases only the modifiers it adds, so one
+   * `keyboard.down` holds stays held. Records what stays held after it.
+   */
+  private keepHeld(source: Input.KeySourceActions): Input.KeySourceActions {
+    const skipped = new Set<string>();
+    const kept = source.actions.filter((action) => {
+      if (action.type === 'keyDown' && MODIFIER_VALUES.has(action.value) && this.heldKeys.has(action.value)) {
+        skipped.add(action.value);
+        return false;
+      }
+      return !(action.type === 'keyUp' && skipped.has(action.value));
+    });
+    for (const action of kept) {
+      if (action.type === 'keyDown') this.heldKeys.add(action.value);
+      else if (action.type === 'keyUp') this.heldKeys.delete(action.value);
+    }
+    return { ...source, actions: kept };
   }
 
   /** Counts a page mutation the driver made in the page (a fill, a select), which may have reached the app. */
@@ -486,9 +511,17 @@ export class BidiSession {
   }
 }
 
-/** An init script's source as a preload script's function declaration. */
+/** The query parameter that marks a scratch document a saved-state read or write opens, which the app's init scripts skip. */
+export const SCRATCH_PARAM = '__e2e_state_scratch';
+
+/** A driver script's source as a preload script's function declaration. */
 function wrapScript(source: string): string {
   return `() => {\n${source}\n}`;
+}
+
+/** An app init script's source as a preload script's function declaration: it runs in every document but a saved-state scratch one, which it must not change. */
+function wrapAppScript(source: string): string {
+  return `() => {\nif (new URLSearchParams(location.search).has(${JSON.stringify(SCRATCH_PARAM)})) return;\n${source}\n}`;
 }
 
 /** Runs each step in order whatever the earlier ones did, and settles with every outcome. */

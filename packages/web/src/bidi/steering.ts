@@ -15,7 +15,8 @@ const POLL_MS = 50;
 /**
  * Navigates the attempt's tab to `url`, creating it on first use. A
  * `networkidle` wait then holds until no request has been in flight for
- * 500 ms, counted from before the navigation started.
+ * 500 ms, counted from before the navigation started. No navigation is sent
+ * once `signal` aborted, nor in `reload` and `traverse`.
  */
 export function goto(session: BidiSession, url: string, waitUntil: WaitUntil, signal: AbortSignal): Promise<void> {
   return own(session, async () => {
@@ -23,14 +24,16 @@ export function goto(session: BidiSession, url: string, waitUntil: WaitUntil, si
     await session.visit(url);
     if (waitUntil === 'networkidle') await session.network.track();
     const wait = waitUntil === 'load' || waitUntil === 'networkidle' ? 'complete' : waitUntil === 'domcontentloaded' ? 'interactive' : 'none';
+    signal.throwIfAborted();
     await session.connection.send('browsingContext.navigate', { context, url, wait });
     if (waitUntil === 'networkidle') await session.network.waitForIdle(signal);
   });
 }
 
 /** Reloads the tab and waits for its load event. */
-export function reload(session: BidiSession): Promise<void> {
+export function reload(session: BidiSession, signal: AbortSignal): Promise<void> {
   return own(session, async () => {
+    signal.throwIfAborted();
     await session.connection.send('browsingContext.reload', { context: session.requireContext(), wait: 'complete' });
   });
 }
@@ -46,6 +49,7 @@ export function traverse(session: BidiSession, delta: number, timeoutMs: number,
     const context = session.requireContext();
     const deadline = new Deadline(timeoutMs);
     const before = await landedEntry(session);
+    signal.throwIfAborted();
     await session.connection.send('browsingContext.traverseHistory', { context, delta });
     for (;;) {
       const entry = await landedEntry(session);

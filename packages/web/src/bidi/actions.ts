@@ -68,10 +68,10 @@ export async function perform(session: BidiSession, ref: NodeRef, action: Locato
     case 'clear':
       return fill(session, target, '', deadline, signal);
     case 'press':
-      await focusOn(session, target);
+      await focusOn(session, target, signal);
       return session.sendInput([pressSource(action.key)], signal);
     case 'focus':
-      return focusOn(session, target);
+      return focusOn(session, target, signal);
     case 'scrollIntoView':
       await settledPoint(session, target, deadline, { enabled: false, scroll: true }, signal);
       return;
@@ -143,8 +143,10 @@ async function click(session: BidiSession, target: NodeTarget, deadline: Deadlin
   await session.sendInput(clickSources(point.x, point.y, options), signal);
 }
 
-/** Focuses the element, refusing when focus does not land on it. */
-async function focusOn(session: BidiSession, target: NodeTarget): Promise<void> {
+/** Focuses the element, a page change its focus handlers may make, refusing when focus does not land on it. */
+async function focusOn(session: BidiSession, target: NodeTarget, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  session.mutated();
   if (!(await session.run(focus, [target.element, CLOSED_SHADOW_ROOTS_KEY], target.context))) throw new EngineError('NOT_ACTIONABLE', 'element could not be focused', { retryable: false });
 }
 
