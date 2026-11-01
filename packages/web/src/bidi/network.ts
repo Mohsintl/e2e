@@ -424,7 +424,7 @@ export class AttemptNetwork {
       method: request.method,
       headers: headerRecord(request.headers),
       ...(request.cookies.length === 0 ? {} : { cookie: request.cookies.map((cookie) => `${cookie.name}=${bytesText(cookie.value)}`).join('; ') }),
-      ...(matching.length === 0 ? {} : await this.postData(request)),
+      ...(matching.length === 0 ? {} : await this.postData(request, event.navigation !== null)),
     };
     for (const route of matching) {
       let passed = false;
@@ -441,10 +441,15 @@ export class AttemptNetwork {
     await unlessCancelled(this.continue(intercepted));
   }
 
-  /** The request's body when the collector kept one, as text and bytes; a body it did not keep (too large, a stream) is marked unavailable. */
-  private async postData(request: Network.RequestData): Promise<{ postData?: string; body?: Buffer; bodyUnavailable?: true }> {
+  /**
+   * The request's body when the collector kept one, as text and bytes; a
+   * body it did not keep (too large, a stream) is marked unavailable. So is
+   * a held navigation's on Chromium, which never answers for the body of a
+   * paused form submission (https://github.com/puppeteer/puppeteer/pull/15607).
+   */
+  private async postData(request: Network.RequestData, navigation: boolean): Promise<{ postData?: string; body?: Buffer; bodyUnavailable?: true }> {
     if (request.bodySize === 0 || (request.bodySize === null && ['GET', 'HEAD'].includes(request.method))) return {};
-    if (this.requestCollector === undefined) return { bodyUnavailable: true };
+    if (this.requestCollector === undefined || (navigation && this.options.browser === 'chromium')) return { bodyUnavailable: true };
     try {
       const { bytes } = await this.connection.send('network.getData', { dataType: 'request', request: request.request, collector: this.requestCollector });
       const body = bytes.type === 'string' ? Buffer.from(bytes.value) : Buffer.from(bytes.value, 'base64');

@@ -194,6 +194,7 @@ function fixtureKeyValue(name: string, shifted: boolean): string {
   if (isModifier(name)) return modifierCode(name);
   if (Object.hasOwn(KEY_CODES, name)) return KEY_CODES[name as KeyName];
   if (Object.hasOwn(LOCATED_KEYS, name)) return LOCATED_KEYS[name]!;
+  if (name === '\n' || name === '\r') return KEY_CODES.Enter;
   const physical = /^Key([A-Z])$/.exec(name)?.[1];
   if (physical !== undefined) return shifted ? physical : physical.toLowerCase();
   if (/^[a-z]$/.test(name) && shifted) return name.toUpperCase();

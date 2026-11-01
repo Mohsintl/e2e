@@ -25,9 +25,29 @@ export function goto(session: BidiSession, url: string, waitUntil: WaitUntil, si
     if (waitUntil === 'networkidle') await session.network.track();
     const wait = waitUntil === 'load' || waitUntil === 'networkidle' ? 'complete' : waitUntil === 'domcontentloaded' ? 'interactive' : 'none';
     signal.throwIfAborted();
-    await session.connection.send('browsingContext.navigate', { context, url, wait });
+    await navigateOrDownload(session, context, url, wait);
     if (waitUntil === 'networkidle') await session.network.waitForIdle(signal);
   });
+}
+
+/**
+ * Sends one navigation and fails it as Playwright's `goto` does when the
+ * response turns into a download. Firefox announces the download before
+ * the navigation settles on the old document, so its start in this tab
+ * decides. Chromium rejects with `net::ERR_ABORTED` before announcing it,
+ * and that error stands.
+ */
+async function navigateOrDownload(session: BidiSession, context: string, url: string, wait: 'complete' | 'interactive' | 'none'): Promise<void> {
+  let downloading = false;
+  const off = session.connection.on('browsingContext.downloadWillBegin', (event) => {
+    if (event.context === context) downloading = true;
+  });
+  try {
+    await session.connection.send('browsingContext.navigate', { context, url, wait });
+  } finally {
+    off();
+  }
+  if (downloading) throw new EngineError('ENGINE_FAILURE', `navigation to ${url} failed: Download is starting`, { retryable: false });
 }
 
 /** Reloads the tab and waits for its load event. */

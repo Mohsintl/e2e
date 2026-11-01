@@ -188,7 +188,7 @@ export interface PlaywrightAria {
  * `getAriaExpanded`, `getAriaSelected`). Runs in the page, embedded in
  * `LOCATE_READ`.
  */
-export function playwrightAria(elements: Element[], roles: (string | null)[]): PlaywrightAria[] {
+function playwrightAria(elements: Element[], roles: (string | null)[]): PlaywrightAria[] {
   const normalize = (text: string): string => text.replace(/\u200b/g, '').trim().replace(/\s+/g, ' ');
   const texts = new Map<Element | ShadowRoot, string>();
   const textOf = (root: Element | ShadowRoot): string => {
@@ -788,8 +788,11 @@ export function hitInterceptorResult(): string | null {
 /**
  * Scrolls an element into view as Playwright's `scrollIntoViewIfNeeded`
  * does: once it holds still for a frame, and only when some of it is out of
- * the viewport (centred then) or a scrolling ancestor (to its nearest edge,
- * as Playwright's rect scroll leaves it). Any element with a box counts, a zero-sized or
+ * the viewport or a scrolling ancestor (to its nearest edge there). In the
+ * viewport each axis follows Chromium's center-if-needed, which Playwright's
+ * rect scroll uses: a box wholly out is centred, a box partly out goes to
+ * its closest edge, start unless it is smaller than the view and past its
+ * end or larger and short of it. Any element with a box counts, a zero-sized or
  * `visibility: hidden` one included; a `display: contents` element counts by
  * the boxes of its contents. Returns `detached`, `hidden` when nothing lays
  * out a box yet (it may appear), `moving`, or `ok`.
@@ -820,13 +823,21 @@ export async function scrollIntoViewIfNeeded(element: Element): Promise<'detache
   for (let at = element.parentElement; !container && at !== null && at !== document.documentElement; at = at.parentElement) {
     if (getComputedStyle(at).overflow !== 'visible') container = outside(at.getBoundingClientRect());
   }
-  const viewport = outside({ left: 0, top: 0, right: visualViewport?.width || innerWidth, bottom: visualViewport?.height || innerHeight });
+  const width = visualViewport?.width || innerWidth;
+  const height = visualViewport?.height || innerHeight;
+  const viewport = outside({ left: 0, top: 0, right: width, bottom: height });
   if (container || viewport) {
     const target = element.getClientRects().length > 0
       ? element
       : ([...element.querySelectorAll('*')].find((child) => child.getClientRects().length > 0) ?? element.parentElement);
-    const align: ScrollLogicalPosition = container ? 'nearest' : 'center';
-    target?.scrollIntoView({ block: align, inline: align, behavior: 'instant' });
+    const axis = (start: number, end: number, view: number): ScrollLogicalPosition => {
+      if (start >= 0 && end <= view) return 'nearest';
+      if (end <= 0 || start >= view) return 'center';
+      return (end > view && end - start < view) || (end < view && end - start > view) ? 'end' : 'start';
+    };
+    target?.scrollIntoView(container
+      ? { block: 'nearest', inline: 'nearest', behavior: 'instant' }
+      : { block: axis(rect.top, rect.bottom, height), inline: axis(rect.left, rect.right, width), behavior: 'instant' });
   }
   return 'ok';
 }
