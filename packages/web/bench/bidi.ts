@@ -6,7 +6,7 @@
  * synthetic heavy page itself, so nothing leaves the machine.
  *
  *   pnpm build
- *   node packages/web/bench/bidi.ts [--iterations 20] [--browsers chromium,firefox] [--out bidi-results.json]
+ *   node packages/web/bench/bidi.ts [--iterations 20] [--browsers chromium,firefox] [--testbed-runs 3] [--out bidi-results.json]
  */
 
 import { spawn, execFileSync } from 'node:child_process';
@@ -25,6 +25,8 @@ const { values } = parseArgs({
     'cold-iterations': { type: 'string', default: '10' },
     browsers: { type: 'string', default: 'chromium,firefox' },
     drivers: { type: 'string', default: 'playwright,bidi' },
+    'testbed-runs': { type: 'string', default: '3' },
+    'steps-per-test': { type: 'string', default: '6' },
     out: { type: 'string', default: path.join(path.dirname(fileURLToPath(import.meta.url)), 'bidi-results.json') },
   },
 });
@@ -32,6 +34,15 @@ const ITERATIONS = Number(values.iterations);
 const COLD_ITERATIONS = Number(values['cold-iterations']);
 const BROWSERS = values.browsers.split(',') as ('chromium' | 'firefox')[];
 const DRIVERS = values.drivers.split(',') as ('playwright' | 'bidi')[];
+const TESTBED_RUNS = Number(values['testbed-runs']);
+/** Steps of a typical test: the testbed's mean is 6.25 per test (79 tests, `.e2e/report.json`), median 5. */
+const STEPS_PER_TEST = Number(values['steps-per-test']);
+/**
+ * Testbed tests a driver cannot pass on Firefox, left out of both drivers' wall-clock runs there so
+ * neither pays a failing test's timeout: HTML5 drag and drop and media emulation on BiDi
+ * (upstream Firefox gaps), and the pad drag that fails on Playwright's Firefox on main too.
+ */
+const FIREFOX_SKIPS = 'drags and drops on the board|dragging the card marks it done|emulated media reaches|raw mouse input drags along the pad';
 const TESTBED_PORT = 4291;
 const HEAVY_PORT = 4292;
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -330,14 +341,58 @@ try {
   heavy.close();
 }
 
+/** Wall-clock milliseconds of one whole testbed run on `driver` and `browser`, at the testbed's own concurrency. */
+function testbedRun(driver: 'playwright' | 'bidi', browser: 'chromium' | 'firefox'): Promise<{ ms: number; passed: boolean }> {
+  const cwd = path.join(ROOT, 'apps/testbed');
+  const args = [path.join(cwd, 'node_modules/e2e/dist/cli/bin.js'), 'run', '--config', browser === 'firefox' ? 'e2e.firefox.config.ts' : 'e2e.config.ts'];
+  if (browser === 'firefox') args.push('--grep-invert', FIREFOX_SKIPS);
+  const start = performance.now();
+  const child = spawn(process.execPath, args, { cwd, env: { ...process.env, E2E_WEB_DRIVER: driver }, stdio: 'ignore' });
+  return new Promise((resolve) => child.once('exit', (code) => resolve({ ms: performance.now() - start, passed: code === 0 })));
+}
+
+const testbedTimes: Record<string, { median: number; runs: number[]; passed: boolean }> = {};
+for (const browser of BROWSERS) {
+  for (const driver of DRIVERS) {
+    const runs: number[] = [];
+    let passed = true;
+    for (let index = 0; index < TESTBED_RUNS; index += 1) {
+      process.stderr.write(`${driver}/${browser}: testbed run ${index + 1}\n`);
+      const run = await testbedRun(driver, browser);
+      runs.push(run.ms);
+      passed &&= run.passed;
+    }
+    testbedTimes[`${driver}/${browser}`] = { median: stats(runs).p50, runs, passed };
+  }
+}
+
+/** One driver's totals over every scenario, the realistic test, and the whole testbed. */
+function totals(key: string): Record<string, number> {
+  const samples = results[key]!.samples;
+  const p50 = (name: string): number => samples[name]?.p50 ?? 0;
+  const agentStep = p50('agent flow: todos (10 observe/act steps)') / 10;
+  return {
+    'sum of p50s, every scenario (ms)': Object.values(samples).reduce((total, s) => total + s.p50, 0),
+    'sum of means, every scenario (ms)': Object.values(samples).reduce((total, s) => total + s.mean, 0),
+    [`realistic test: cold launch + new page + ${STEPS_PER_TEST} agent steps (ms)`]: p50('cold launch (init)') + p50('new context + page (startAttempt → first open)') + STEPS_PER_TEST * agentStep,
+    [`testbed wall clock, median of ${TESTBED_RUNS} (ms)`]: testbedTimes[key]?.median ?? 0,
+    'node CPU, warm loop (s)': results[key]!.resources?.['node CPU, warm loop (s)'] ?? 0,
+    'node + browser CPU, warm loop (s, floor)': results[key]!.resources?.['node + browser CPU, warm loop (s, floor)'] ?? 0,
+    'peak RSS, node + browser (MB)': results[key]!.resources?.['peak RSS, node + browser (MB)'] ?? 0,
+  };
+}
+
 const meta = {
   date: new Date().toISOString(),
   machine: `${os.cpus()[0]?.model} x${os.cpus().length}, ${Math.round(os.totalmem() / 2 ** 30)} GB, ${os.platform()} ${os.release()}`,
   node: process.version,
   iterations: ITERATIONS,
   coldIterations: COLD_ITERATIONS,
+  testbedRuns: TESTBED_RUNS,
+  stepsPerTest: STEPS_PER_TEST,
 };
-writeFileSync(values.out, JSON.stringify({ meta, results }, null, 2));
+const summary = Object.fromEntries(Object.keys(results).map((key) => [key, totals(key)]));
+writeFileSync(values.out, JSON.stringify({ meta, results, testbed: testbedTimes, totals: summary }, null, 2));
 
 const fmt = (ms: number) => (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1));
 for (const browser of BROWSERS) {
@@ -360,4 +415,19 @@ for (const browser of BROWSERS) {
     console.log(`| ${resource} | ${keys.map((key) => fmt(results[key]!.resources![resource]!)).join(' | ')} | |`);
   }
 }
+console.log('\n### Totals\n');
+console.log(`| Total | ${BROWSERS.flatMap((browser) => DRIVERS.map((driver) => `${driver} ${browser}`)).join(' | ')} | ${BROWSERS.map((browser) => `BiDi vs PW ${browser}`).join(' | ')} |`);
+console.log(`| --- | ${BROWSERS.flatMap(() => DRIVERS.map(() => '---')).join(' | ')} | ${BROWSERS.map(() => '---').join(' | ')} |`);
+for (const name of Object.keys(summary[Object.keys(summary)[0]!]!)) {
+  const cells = BROWSERS.flatMap((browser) => DRIVERS.map((driver) => fmt(summary[`${driver}/${browser}`]![name]!)));
+  const changes = BROWSERS.map((browser) => {
+    const pw = summary[`playwright/${browser}`]?.[name];
+    const bidi = summary[`bidi/${browser}`]?.[name];
+    if (pw === undefined || bidi === undefined || pw === 0) return '';
+    const change = ((bidi - pw) / pw) * 100;
+    return `${change > 0 ? '+' : ''}${change.toFixed(0)}%`;
+  });
+  console.log(`| ${name} | ${cells.join(' | ')} | ${changes.join(' | ')} |`);
+}
+for (const [key, run] of Object.entries(testbedTimes)) if (!run.passed) console.log(`\nnote: a ${key} testbed run failed; its wall clock includes the failure`);
 console.log(`\n${JSON.stringify(meta)}`);
