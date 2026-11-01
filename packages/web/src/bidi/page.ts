@@ -778,11 +778,16 @@ export function armHitInterceptor(element: Element): void {
   Reflect.set(globalThis, Symbol.for('e2e.bidi.hit.active'), { target, verdict: undefined });
 }
 
-/** Ends the click watch: null when the input reached the element, why not when it did not, `unseen` when no input reached this document. */
+/**
+ * Ends the click watch: null when the input reached the element, or when
+ * the document it was armed in is gone (the click navigated, so it landed);
+ * why not when it did not; `unseen` when no input reached this document.
+ */
 export function hitInterceptorResult(): string | null {
   const watch = Reflect.get(globalThis, Symbol.for('e2e.bidi.hit.active')) as { verdict: string | null | undefined } | undefined;
   Reflect.deleteProperty(globalThis, Symbol.for('e2e.bidi.hit.active'));
-  return watch === undefined || watch.verdict === undefined ? 'unseen' : watch.verdict;
+  if (watch === undefined) return null;
+  return watch.verdict === undefined ? 'unseen' : watch.verdict;
 }
 
 /**
