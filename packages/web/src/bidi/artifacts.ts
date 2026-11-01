@@ -4,7 +4,7 @@ import { writeFileSync } from 'node:fs';
 import type { VideoSegment } from 'e2e/engine';
 import { ProviderVideo } from '../provider-video.ts';
 import type { LeaseRecording } from '../provider.ts';
-import { capturePixels } from './observe.ts';
+import { maskedPixels } from './observe.ts';
 import type { BidiSession } from './session.ts';
 import { BidiVideo } from './video.ts';
 
@@ -14,7 +14,7 @@ const DEFAULT_VIDEO_SIZE = { width: 1280, height: 720 };
 /** Writes a masked viewport screenshot under the attempt directory and returns its relative path. */
 export async function screenshot(session: BidiSession, label: string | undefined): Promise<string> {
   const { relative, absolute } = session.artifactPath('screenshots', label, '.png');
-  const { pixels } = await capturePixels(session, await session.viewportSize());
+  const { pixels } = await maskedPixels(session, await session.viewportSize());
   writeFileSync(absolute, pixels.data);
   return relative;
 }

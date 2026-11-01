@@ -149,7 +149,7 @@ export function fixtureKeySource(key: string, phase: 'press' | 'keyDown' | 'keyU
 }
 
 /** Whether `name` is a modifier key's name. */
-export function isModifier(name: string): name is KeyModifier {
+function isModifier(name: string): name is KeyModifier {
   return name === 'ControlOrMeta' || Object.hasOwn(MODIFIER_CODES, name);
 }
 

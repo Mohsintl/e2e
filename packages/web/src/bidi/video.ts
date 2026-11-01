@@ -51,11 +51,6 @@ export class BidiVideo {
     private readonly options: VideoOptions,
   ) {}
 
-  /** True between `arm` and `stop`: a tab the attempt opens then starts a segment. */
-  get isArmed(): boolean {
-    return this.armed;
-  }
-
   /** Starts recording `context`, unless a segment already records, and arms the recorder. */
   async arm(context: string | undefined, viewport: { width: number; height: number }): Promise<void> {
     this.armed = true;

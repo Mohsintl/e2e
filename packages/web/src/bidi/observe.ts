@@ -61,7 +61,7 @@ export async function observe(session: BidiSession, timeoutMs: number, signal: A
   const viewport = await session.viewportSize();
   const [captured, pixels] = await Promise.all([
     captureTree(session, context, [], MAX_OBSERVED_NODES, deadline),
-    options?.pixels === true ? capturePixels(session, viewport).then((value) => value, () => undefined) : undefined,
+    options?.pixels === true ? maskedPixels(session, viewport).then((value) => value, () => undefined) : undefined,
   ]);
   if (signal.aborted) throw cancelled('observe cancelled');
   session.refs.publish(captured.generation);
@@ -261,7 +261,7 @@ async function readFrame(
  * moved while the screenshot was taken fails it as `NODE_STALE`, retried on
  * a settled page, and any other masking failure fails it outright.
  */
-export async function capturePixels(session: BidiSession, viewport: ViewportSize): Promise<{ pixels: ObservationPixels; maskedRegionCount: number }> {
+export async function maskedPixels(session: BidiSession, viewport: ViewportSize): Promise<{ pixels: ObservationPixels; maskedRegionCount: number }> {
   const context = session.requireContext();
   const documents = await session.documentContexts(context);
   const masked: string[] = [];
