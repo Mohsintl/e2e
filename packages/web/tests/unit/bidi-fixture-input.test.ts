@@ -12,6 +12,8 @@ describe('fixtureKeySource', () => {
     expect(fixtureKeySource('KeyB', 'press', true).actions).toEqual([{ type: 'keyDown', value: 'B' }, { type: 'keyUp', value: 'B' }]);
     expect(fixtureKeySource('KeyB', 'press', false).actions).toEqual([{ type: 'keyDown', value: 'b' }, { type: 'keyUp', value: 'b' }]);
     expect(fixtureKeySource('Digit7', 'press', false).actions[0]).toEqual({ type: 'keyDown', value: '7' });
+    expect(fixtureKeySource('A', 'press', false).actions[0]).toEqual({ type: 'keyDown', value: 'A' });
+    expect(fixtureKeySource('a', 'press', true).actions[0]).toEqual({ type: 'keyDown', value: 'A' });
   });
 
   it('presses modifiers around the key of a combination, including the plus key itself', () => {

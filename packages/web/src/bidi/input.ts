@@ -157,8 +157,9 @@ function isModifier(name: string): name is KeyModifier {
 function fixtureKeyValue(name: string, shifted: boolean): string {
   if (isModifier(name)) return modifierCode(name);
   if (Object.hasOwn(KEY_CODES, name)) return KEY_CODES[name as KeyName];
-  const letter = /^Key([A-Z])$/.exec(name)?.[1] ?? (/^[a-zA-Z]$/.test(name) ? name : undefined);
-  if (letter !== undefined) return shifted ? letter.toUpperCase() : letter.toLowerCase();
+  const physical = /^Key([A-Z])$/.exec(name)?.[1];
+  if (physical !== undefined) return shifted ? physical : physical.toLowerCase();
+  if (/^[a-z]$/.test(name) && shifted) return name.toUpperCase();
   const digit = /^Digit([0-9])$/.exec(name)?.[1];
   if (digit !== undefined) return digit;
   if ([...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(name)].length === 1) return name;
