@@ -314,8 +314,15 @@ export class BidiSurface {
       connection.on('browsingContext.contextCreated', (info) => {
         if (info.userContext !== undefined) this.contexts.set(info.context, info.userContext);
         else if (info.parent != null) this.contexts.set(info.context, this.contexts.get(info.parent) ?? '');
+        // A tab the app opened itself: the attempt's routes and headers cover it too.
+        if (info.parent == null && info.context !== this.attempt?.context && this.ours(info.context)) {
+          void this.attempt?.network.addContext(info.context).catch(() => undefined);
+        }
       }),
-      connection.on('browsingContext.contextDestroyed', (info) => this.contexts.delete(info.context)),
+      connection.on('browsingContext.contextDestroyed', (info) => {
+        if (info.parent == null && this.ours(info.context)) void this.attempt?.network.removeContext(info.context).catch(() => undefined);
+        this.contexts.delete(info.context);
+      }),
       connection.on('browsingContext.userPromptOpened', (prompt) => this.onPrompt(connection, prompt)),
       connection.on('log.entryAdded', (entry) => {
         if (!this.ours(entry.source.context) || entry.text === null) return;
@@ -339,16 +346,14 @@ export class BidiSurface {
     );
   }
 
-  /** Hands a user prompt to the attempt's dialog router; one outside any attempt is dismissed. */
+  /** Hands a user prompt in one of the attempt's contexts to its dialog router. */
   private onPrompt(connection: BidiConnection, prompt: { context: string; message: string; type: string }): void {
     const answer = (accept: boolean, userText?: string): Promise<void> =>
       connection
         .send('browsingContext.handleUserPrompt', { context: prompt.context, accept, ...(userText === undefined ? {} : { userText }) })
         .then(() => undefined);
-    if (!this.ours(prompt.context) || this.attempt === undefined) {
-      void answer(false).catch(() => undefined);
-      return;
-    }
+    // A prompt in another session's context (a browser shared over CDP) is that session's to answer.
+    if (!this.ours(prompt.context) || this.attempt === undefined) return;
     const dialog: NativeDialog = {
       type: () => prompt.type,
       message: () => prompt.message,
@@ -376,10 +381,11 @@ export class BidiSurface {
       addedScripts: [],
       refs: new BidiRefs(),
       frames: new FrameRegistry(),
-      network: new AttemptNetwork(connection, () => attempt.userContext, {
+      network: new AttemptNetwork(connection, {
         siteHeaders: (url) => siteHeadersFor(url, this.site, headers),
         credentials,
         ours: (event) => this.ours(event.context),
+        holdAll: headers !== undefined,
       }),
       downloads: new AttemptDownloads(connection),
       dialogs: new DialogRouter(latch),
@@ -420,7 +426,7 @@ export class BidiSurface {
       locale === undefined ? undefined : connection.send('network.setExtraHeaders', { headers: [{ name: 'accept-language', value: { type: 'string', value: locale } }], ...scoped }),
       timezoneId === undefined ? undefined : connection.send('emulation.setTimezoneOverride', { timezone: timezoneId, ...scoped }),
       this.applyMedia(attempt),
-      attempt.network.start(this.options.headers !== undefined || attempt.credentials !== undefined),
+      attempt.network.bind(userContext),
     ]);
     attempt.preloads = preloads;
   }
@@ -509,6 +515,7 @@ export class BidiSurface {
       userContext: attempt.userContext,
     });
     this.contexts.set(context, attempt.userContext);
+    await attempt.network.addContext(context);
     if (this.options.viewport !== null) {
       await connection.send('browsingContext.setViewport', { context, viewport: this.options.viewport });
     }
@@ -629,7 +636,9 @@ export class BidiSurface {
       attempt.context = undefined;
       attempt.refs.clear();
       attempt.frames.clear();
-      if (context !== undefined) await this.requireBrowser().connection.send('browsingContext.close', { context });
+      if (context === undefined) return;
+      await attempt.network.removeContext(context);
+      await this.requireBrowser().connection.send('browsingContext.close', { context });
     });
   }
 
@@ -1123,7 +1132,7 @@ export class BidiSurface {
       const attempt = this.requireAttempt();
       const context = await this.ensureContext();
       await this.grantPermissions(url);
-      if (waitUntil === 'networkidle') await attempt.network.start(false);
+      if (waitUntil === 'networkidle') await attempt.network.track();
       const wait = waitUntil === 'load' || waitUntil === 'networkidle' ? 'complete' : waitUntil === 'domcontentloaded' ? 'interactive' : 'none';
       await this.requireBrowser().connection.send('browsingContext.navigate', { context, url, wait });
       if (waitUntil === 'networkidle') await attempt.network.waitForIdle(budget.signal);

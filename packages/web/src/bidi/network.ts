@@ -86,6 +86,11 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
 
 export class AttemptNetwork {
   private routes: NetworkRoute[] = [];
+  private userContext: string | undefined;
+  /** The attempt's top-level tabs; intercepts cover exactly these, so a browser shared with other sessions keeps its own requests. */
+  private readonly tops = new Set<string>();
+  /** Whether every request is held: site headers to add, or a route registered. */
+  private holding: boolean;
   private intercept: string | undefined;
   private authIntercept: string | undefined;
   private subscription: string | undefined;
@@ -95,61 +100,120 @@ export class AttemptNetwork {
   private lastSettled = Date.now();
   private readonly answered = new Set<string>();
   private readonly listeners: (() => void)[] = [];
-  private ready: Promise<void> | undefined;
+  /** Serializes changes to the intercepts and subscriptions, which each take round trips. */
+  private changes: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly connection: BidiConnection,
-    private readonly userContext: () => string,
-    private readonly options: AttemptNetworkOptions,
-  ) {}
-
-  /**
-   * Starts what the attempt needs from the first request on: interception
-   * for site headers, the basic-auth answer, and the request events every
-   * later wait and route reads. Without headers, credentials, or routes,
-   * nothing is intercepted.
-   */
-  start(interceptAll: boolean): Promise<void> {
-    this.ready ??= this.subscribe(interceptAll);
-    return this.ready;
+    private readonly options: AttemptNetworkOptions & { readonly holdAll: boolean },
+  ) {
+    this.holding = options.holdAll;
   }
 
-  private async subscribe(interceptAll: boolean): Promise<void> {
+  private get needsEvents(): boolean {
+    return this.holding || this.options.credentials !== undefined || this.listeners.length > 0;
+  }
+
+  private change(work: () => Promise<void>): Promise<void> {
+    const next = this.changes.then(work);
+    this.changes = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * Binds the network to a fresh user context (the attempt's first, or the
+   * one a reset or restore replaced it with): its subscription and request
+   * collector follow it, and its tabs start empty.
+   */
+  bind(userContext: string): Promise<void> {
+    return this.change(async () => {
+      await this.release();
+      this.userContext = userContext;
+      this.tops.clear();
+      if (this.needsEvents) await this.subscribe();
+    });
+  }
+
+  /** A top-level tab of the attempt opened: the intercepts cover it from now on. */
+  addContext(context: string): Promise<void> {
+    return this.change(async () => {
+      this.tops.add(context);
+      await this.refreshIntercepts();
+    });
+  }
+
+  /** A top-level tab of the attempt closed. */
+  removeContext(context: string): Promise<void> {
+    if (!this.tops.delete(context)) return Promise.resolve();
+    return this.change(() => this.refreshIntercepts());
+  }
+
+  /** Subscribes to the request events of the bound user context, and collects request bodies while requests are held. */
+  private async subscribe(): Promise<void> {
     const connection = this.connection;
-    this.listeners.push(
-      connection.on('network.beforeRequestSent', (event) => this.onRequest(event)),
-      connection.on('network.responseCompleted', (event) => this.settle(event)),
-      connection.on('network.fetchError', (event) => this.settle(event)),
-      connection.on('network.authRequired', (event) => this.onAuth(event)),
-    );
+    const userContext = this.userContext;
+    if (userContext === undefined || this.subscription !== undefined) return;
+    if (this.listeners.length === 0) {
+      this.listeners.push(
+        connection.on('network.beforeRequestSent', (event) => this.onRequest(event)),
+        connection.on('network.responseCompleted', (event) => this.settle(event)),
+        connection.on('network.fetchError', (event) => this.settle(event)),
+        connection.on('network.authRequired', (event) => this.onAuth(event)),
+      );
+    }
     const { subscription } = await connection.send('session.subscribe', {
       events: ['network.beforeRequestSent', 'network.authRequired'],
-      userContexts: [this.userContext()],
+      userContexts: [userContext],
     });
     this.subscription = subscription;
-    if (interceptAll) await this.interceptRequests();
-    if (this.options.credentials !== undefined) {
-      this.authIntercept = (await connection.send('network.addIntercept', { phases: ['authRequired'] })).intercept;
+    if (this.holding && this.requestCollector === undefined) {
+      this.requestCollector = (await connection.send('network.addDataCollector', {
+        dataTypes: ['request'],
+        maxEncodedDataSize: MAX_COLLECTED_BODY,
+        userContexts: [userContext],
+      })).collector;
     }
   }
 
-  /** Holds every request for the routes, collecting request bodies for `postData`. */
-  private async interceptRequests(): Promise<void> {
-    if (this.intercept !== undefined) return;
+  /** Replaces the intercepts with ones over the current tabs; with no tab, none. A new one is in place before the old goes. */
+  private async refreshIntercepts(): Promise<void> {
     const connection = this.connection;
-    const [{ intercept }, { collector }] = await Promise.all([
-      connection.send('network.addIntercept', { phases: ['beforeRequestSent'] }),
-      connection.send('network.addDataCollector', { dataTypes: ['request'], maxEncodedDataSize: MAX_COLLECTED_BODY, userContexts: [this.userContext()] }),
-    ]);
-    this.intercept = intercept;
-    this.requestCollector = collector;
+    const contexts = [...this.tops];
+    const replace = async (wanted: boolean, phase: 'beforeRequestSent' | 'authRequired', old: string | undefined): Promise<string | undefined> => {
+      const next = wanted && contexts.length > 0
+        ? (await connection.send('network.addIntercept', { phases: [phase], contexts: contexts as [string, ...string[]] })).intercept
+        : undefined;
+      if (old !== undefined) await connection.send('network.removeIntercept', { intercept: old }).catch(() => undefined);
+      return next;
+    };
+    this.intercept = await replace(this.holding, 'beforeRequestSent', this.intercept);
+    this.authIntercept = await replace(this.options.credentials !== undefined, 'authRequired', this.authIntercept);
+  }
+
+  /**
+   * Starts counting the attempt's requests in flight, for a `networkidle`
+   * wait. Call it before the navigation the wait follows.
+   */
+  track(): Promise<void> {
+    return this.change(() => this.subscribe());
   }
 
   /** Registers a route for every request from now on; the newest route sees a request first. */
-  async addRoute(route: NetworkRoute): Promise<void> {
-    await this.start(false);
-    await this.interceptRequests();
-    this.routes.push(route);
+  addRoute(route: NetworkRoute): Promise<void> {
+    return this.change(async () => {
+      this.routes.push(route);
+      if (this.holding) return;
+      this.holding = true;
+      await this.subscribe();
+      if (this.requestCollector === undefined && this.userContext !== undefined) {
+        this.requestCollector = (await this.connection.send('network.addDataCollector', {
+          dataTypes: ['request'],
+          maxEncodedDataSize: MAX_COLLECTED_BODY,
+          userContexts: [this.userContext],
+        })).collector;
+      }
+      await this.refreshIntercepts();
+    });
   }
 
   /** Removes the routes `match` selects. */
@@ -260,7 +324,7 @@ export class AttemptNetwork {
 
   /**
    * Resolves once no request has been in flight for 500 ms, Playwright's
-   * `networkidle`. `start` must have run before the navigation it follows,
+   * `networkidle`. `track` must have run before the navigation it follows,
    * so the requests it started were counted.
    */
   async waitForIdle(signal: AbortSignal): Promise<void> {
@@ -308,27 +372,34 @@ export class AttemptNetwork {
   }
 
   private async collectResponses(): Promise<void> {
-    if (this.collector !== undefined) return;
+    if (this.collector !== undefined || this.userContext === undefined) return;
     const { collector } = await this.connection.send('network.addDataCollector', {
       dataTypes: ['response'],
       maxEncodedDataSize: MAX_COLLECTED_BODY,
-      userContexts: [this.userContext()],
+      userContexts: [this.userContext],
     });
     this.collector = collector;
   }
 
-  /** Removes the attempt's intercepts, collectors, and subscription; a request still held is let through. */
+  /** Removes the bound user context's intercepts, collectors, and subscription. */
+  private async release(): Promise<void> {
+    const connection = this.connection;
+    const removals = [
+      this.intercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.intercept }),
+      this.authIntercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.authIntercept }),
+      this.collector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.collector }),
+      this.requestCollector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.requestCollector }),
+      this.subscription === undefined ? undefined : connection.send('session.unsubscribe', { subscriptions: [this.subscription] }),
+    ];
+    this.intercept = this.authIntercept = this.collector = this.requestCollector = this.subscription = undefined;
+    await Promise.all(removals.map((removal) => removal?.catch(() => undefined)));
+  }
+
+  /** Ends the attempt's network: listeners, routes, intercepts, collectors, and subscription. */
   async dispose(): Promise<void> {
     for (const off of this.listeners.splice(0)) off();
     this.routes = [];
-    const connection = this.connection;
-    await Promise.all([
-      this.intercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.intercept }).catch(() => undefined),
-      this.authIntercept === undefined ? undefined : connection.send('network.removeIntercept', { intercept: this.authIntercept }).catch(() => undefined),
-      this.collector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.collector }).catch(() => undefined),
-      this.requestCollector === undefined ? undefined : connection.send('network.removeDataCollector', { collector: this.requestCollector }).catch(() => undefined),
-      this.subscription === undefined ? undefined : connection.send('session.unsubscribe', { subscriptions: [this.subscription] }).catch(() => undefined),
-    ]);
+    await this.change(() => this.release());
   }
 }
 
