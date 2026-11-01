@@ -199,16 +199,18 @@ function isFrameBox(value: unknown): value is FrameStep {
 /**
  * An iframe's content box in its own document's viewport, and the scale its
  * transforms (its own and its ancestors') apply to the document inside it;
- * null for a frame that lays out no box, or one a rotation or skew turns,
- * whose points no scale maps.
+ * null for a frame that lays out no box, or one a rotation, skew,
+ * reflection, or 3D transform (its own or an ancestor's, `transform` or the
+ * `rotate` and `scale` properties) turns, whose points no scale maps.
  */
 const FRAME_BOX = `(element) => {
   if (element.getClientRects().length === 0) return null;
   for (let at = element; at !== null; at = at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? at.getRootNode().host : null)) {
-    const transform = getComputedStyle(at).transform;
-    if (transform !== 'none') {
-      const matrix = new DOMMatrixReadOnly(transform);
-      if (matrix.b !== 0 || matrix.c !== 0) return null;
+    const style = getComputedStyle(at);
+    if (style.rotate !== 'none' || style.scale.includes('-')) return null;
+    if (style.transform !== 'none') {
+      const matrix = new DOMMatrixReadOnly(style.transform);
+      if (!matrix.is2D || matrix.b !== 0 || matrix.c !== 0 || matrix.a <= 0 || matrix.d <= 0) return null;
     }
   }
   const inset = (${frameContentInset.toString()})(element);

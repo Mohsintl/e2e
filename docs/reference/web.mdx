@@ -411,6 +411,7 @@ limits:
 | --- | --- |
 | No `'webkit'` | WebKit has no BiDi endpoint. |
 | `connect` is Chromium only | It attaches over CDP. |
+| Pointer actions in a rotated, skewed, or mirrored iframe throw `NOT_ACTIONABLE` | The driver maps points through a frame's scale only. |
 | Selectors are plain CSS or XPath: no `>>` chains or other Playwright selector engines, and no CSS combinator across a shadow root | The browser runs the selector itself, one shadow root at a time. |
 | `INVALID_CONFIG` for `connect.reconnectEndpoint` or a provider with `scope: 'attempt'` | Each attempt runs in its own user context, not a persistent one. |
 | HTML5 drag and drop drops no data on Firefox | [Firefox bug 1515879](https://bugzilla.mozilla.org/show_bug.cgi?id=1515879). Pointer drags work. |
