@@ -1,4 +1,4 @@
-/** What the parity tests share: the server's two origins, inline pages, and which browser runs. */
+/** What the parity tests share: the server's two origins, inline pages, and which driver and browser run. */
 
 import { test } from '@e2e-dev/web';
 
@@ -10,6 +10,9 @@ export const PREFIX = `http://127.0.0.1:${port}`;
 /** Another origin on the same server, Playwright's `server.CROSS_PROCESS_PREFIX`. */
 export const CROSS = `http://localhost:${port}`;
 
+/** The driver under test. */
+export const driver = (process.env['E2E_WEB_DRIVER'] ?? 'playwright') as 'playwright' | 'bidi';
+
 /** The browser under test. */
 export const browserName = (process.env['BROWSER'] ?? 'chromium') as 'chromium' | 'firefox';
 
@@ -19,9 +22,10 @@ export function content(html: string): string {
 }
 
 /**
- * Skips the running test where e2e itself differs from Playwright, in every
- * browser unless `on.browser` narrows it: `reason` names the difference.
+ * Skips the running test on the BiDi driver in `browser` (both when
+ * omitted) for a gap of the browser or the protocol, never one of ours;
+ * `reason` names it and links the upstream report.
  */
-export function e2eGap(reason: string, on: { readonly browser?: 'chromium' | 'firefox' } = {}): void {
-  test.skip(on.browser === undefined || on.browser === browserName, `e2e: ${reason}`);
+export function bidiGap(reason: string, browser?: 'chromium' | 'firefox'): void {
+  test.skip(driver === 'bidi' && (browser === undefined || browser === browserName), reason);
 }

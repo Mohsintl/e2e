@@ -4,7 +4,8 @@ import { web } from '@e2e-dev/web';
 /**
  * Behavior parity: Playwright's own page tests (microsoft/playwright
  * `tests/page` at v1.64.1, Apache-2.0), rewritten against the public API.
- * Run it on both browsers (`BROWSER=chromium|firefox`); see README.md.
+ * Run it on both drivers (`E2E_WEB_DRIVER=playwright|bidi`) and both
+ * browsers (`BROWSER=chromium|firefox`); see README.md.
  */
 const port = Number(process.env['PARITY_PORT'] ?? 4311);
 if (!Number.isInteger(port) || port <= 0) throw new Error(`PARITY_PORT must be a fixed port, got ${process.env['PARITY_PORT']}`);

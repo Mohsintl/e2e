@@ -1,8 +1,9 @@
 # Behavior parity
 
-Playwright's own page tests, rewritten against the e2e public API, so
-`web()` is held to Playwright's behavior. Adapted from microsoft/playwright
-`tests/page` (and `tests/library/download.spec.ts`) at `v1.64.1`, the version
+Playwright's own page tests, rewritten against the e2e public API, so the
+Playwright and WebDriver BiDi drivers of `web()` can be held to the same
+behavior. Adapted from microsoft/playwright `tests/page` (and
+`tests/library/download.spec.ts`) at `v1.64.1`, the version
 `playwright-core` is pinned to. Copyright Microsoft Corporation, Apache
 License 2.0: see `LICENSE` and `NOTICE`.
 
@@ -15,14 +16,15 @@ License 2.0: see `LICENSE` and `NOTICE`.
   per test as fixed paths. `127.0.0.1` and `localhost` on its port are the two
   origins of the cross-origin cases.
 
-A test that hits a place where e2e differs from Playwright on purpose or
-by a known gap is skipped with `e2eGap(reason)`.
+A test skipped on BiDi names the browser or protocol gap and links it,
+usually to Playwright's own BiDi expectations
+(`tests/bidi/expectations/*.txt` at the same tag).
 
 ```sh
 pnpm build
 cd packages/web/tests/parity
-BROWSER=chromium node ../../node_modules/e2e/dist/cli/bin.js run
-BROWSER=firefox node ../../node_modules/e2e/dist/cli/bin.js run
+E2E_WEB_DRIVER=playwright BROWSER=chromium node ../../node_modules/e2e/dist/cli/bin.js run
+E2E_WEB_DRIVER=bidi BROWSER=firefox node ../../node_modules/e2e/dist/cli/bin.js run
 ```
 
 `PARITY_PORT` (default 4311) moves the server. Parallel runs each need their

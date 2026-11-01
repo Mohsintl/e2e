@@ -6,7 +6,7 @@
 
 import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { content, CROSS } from './helpers.ts';
+import { bidiGap, content, CROSS } from './helpers.ts';
 
 /** Two animation frames and a task, Playwright's `rafraf`, so a pending tap has had its chance. */
 const giveItAChanceToClick = '() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 0))))';
@@ -317,10 +317,10 @@ test.describe('page click', { requires: ['browser'] }, () => {
     ['button', '<button onclick="window.__CLICKED=true;" disabled><span>Click target</span></button>', "document.querySelector('button').removeAttribute('disabled')"],
     ['input', '<input onclick="window.__CLICKED=true;" disabled>', "document.querySelector('input').removeAttribute('disabled')"],
   ] as const) {
-    test(`should wait for ${name} to be enabled`, async ({ browser, screen }) => {
+    test(`should wait for ${name} to be enabled`, async ({ browser }) => {
       await browser.goto(content(html));
       let done = false;
-      const tap = (name === 'button' ? screen.getByText('Click target') : browser.locator(name)).tap({ timeout: 10_000 }).then(() => (done = true));
+      const tap = browser.locator(name).tap({ timeout: 10_000 }).then(() => (done = true));
       await browser.evaluate(giveItAChanceToClick);
       expect(await browser.evaluate('() => window.__CLICKED')).toBeUndefined();
       expect(done).toBe(false);
@@ -454,6 +454,7 @@ test.describe('page click', { requires: ['browser'] }, () => {
   });
 
   test('should click in a transformed iframe', async ({ browser }) => {
+    bidiGap('BiDi places pointer actions in viewport coordinates, and a frame rotated in 3D maps none; Playwright\'s own BiDi backend times out here too (tests/bidi/expectations/bidi-chromium-page.txt, moz-firefox-nightly-page.txt)');
     await browser.goto(content(`
       <style>
         body, html, iframe { margin: 0; padding: 0; border: none; }
