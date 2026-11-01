@@ -65,6 +65,15 @@ function ids(expression: LocatorExpression, nodes: readonly SemanticNode[] = SET
 }
 
 describe('resolveExpression', () => {
+  it('answers a label query through the engine’s label predicate when it gives one', () => {
+    const labels: Record<string, string[]> = { search: ['Find', 'Search'] };
+    const matches = resolveExpression(query('label', 'Find'), SETTINGS, {
+      label: (candidate, pattern) => (labels[candidate.ref.id] ?? []).some((label) => pattern.kind === 'string' && label === pattern.value),
+    });
+    expect(matches.map((match) => match.ref.id)).toEqual(['search']);
+    expect(ids(query('label', 'Find'))).toEqual([]);
+  });
+
   it('answers role queries with name filters and skips hidden nodes', () => {
     expect(ids(query('role', 'button'))).toEqual(['back']);
     expect(ids(query('role', 'button', { name: exact('Back') }))).toEqual(['back']);

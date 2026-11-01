@@ -4,8 +4,10 @@
  * the contract's reference semantics.
  */
 
+import { randomUUID } from 'node:crypto';
 import {
   EngineError,
+  matchesText,
   OBSERVED_NAME_LIMIT,
   OBSERVED_TEXT_LIMIT,
   resolveExpression,
@@ -87,14 +89,13 @@ const TRACE_SCREEN_TIMEOUT_MS = 1_000;
 export async function traceScreen(session: BidiSession, signal: AbortSignal): Promise<void> {
   const sink = session.attempt.screen;
   if (sink === undefined || signal.aborted || session.context === undefined) return;
+  const context = session.context;
+  const read = async (): Promise<EngineSnapshot> => {
+    const captured = await captureTree(session, context, [], MAX_OBSERVED_NODES, Date.now() + TRACE_SCREEN_TIMEOUT_MS);
+    return { location: await session.currentUrl(), root: captured.tree, viewport: await session.viewportSize(), ...(captured.truncated ? { truncated: true } : {}) };
+  };
   try {
-    const deadline = Date.now() + TRACE_SCREEN_TIMEOUT_MS;
-    const captured = await withTimeout(
-      captureTree(session, session.context, [], MAX_OBSERVED_NODES, deadline),
-      TRACE_SCREEN_TIMEOUT_MS,
-      () => new Error('trace screen timed out'),
-    );
-    sink({ location: await session.currentUrl(), root: captured.tree, viewport: await session.viewportSize(), ...(captured.truncated ? { truncated: true } : {}) });
+    sink(await withTimeout(read(), TRACE_SCREEN_TIMEOUT_MS, () => new Error('trace screen timed out')));
   } catch {
     return;
   }
@@ -104,7 +105,8 @@ export async function traceScreen(session: BidiSession, signal: AbortSignal): Pr
  * Resolves one expression with the contract's reference semantics
  * (`resolveExpression`) over node-mode reads of the elements its queries
  * could match, in the document its frame chain names; a `selector` is
- * answered by `browsingContext.locateNodes`.
+ * answered by `browsingContext.locateNodes`, and a label query by any one of
+ * a control's labels, as the Playwright driver's label engine reads them.
  */
 export async function locate(session: BidiSession, expression: LocatorExpression): Promise<SemanticNode[]> {
   const chain = frameSelectors(expression);
@@ -125,7 +127,12 @@ export async function locate(session: BidiSession, expression: LocatorExpression
   const first = session.refs.reserveIds(nodes.length);
   const ids = nodes.map((_node, index) => `n${first + index}`);
   const sharedIds = new Map(ids.map((id, index) => [id, elements[index]!.sharedId]));
+  const labels = new Map(nodes.map((node, index) => [ids[index]!, node.labels ?? []]));
   const matches = resolveExpression(inner, buildForest(nodes, parents, ids), {
+    label: (node, pattern) => {
+      const own = labels.get(node.ref.id) ?? [];
+      return own.length > 0 ? own.some((label) => matchesText(label, pattern)) : node.name !== undefined && matchesText(node.name, pattern);
+    },
     selector: (selector, candidates) => {
       const hits = selected.get(selector) ?? new Set<string>();
       return candidates.filter((node) => hits.has(sharedIds.get(node.ref.id) ?? ''));
@@ -265,15 +272,16 @@ export async function maskedPixels(session: BidiSession, viewport: ViewportSize)
   const context = session.requireContext();
   const documents = await session.documentContexts(context);
   const masked: string[] = [];
+  const token = randomUUID();
   let held = true;
   try {
     let count = 0;
     for (const each of documents) {
-      count += await session.run(maskSecureFields, [SECURE_FIELD_SELECTOR, CLOSED_SHADOW_ROOTS_KEY], each);
+      count += await session.run(maskSecureFields, [SECURE_FIELD_SELECTOR, CLOSED_SHADOW_ROOTS_KEY, token], each);
       masked.push(each);
     }
     const { data } = await session.connection.send('browsingContext.captureScreenshot', { context, origin: 'viewport', format: { type: 'image/png' } });
-    held = (await Promise.all(masked.map((each) => session.run(unmaskSecureFields, [], each)))).every(Boolean);
+    held = (await Promise.all(masked.map((each) => session.run(unmaskSecureFields, [token], each)))).every(Boolean);
     masked.length = 0;
     const after = await session.documentContexts(context);
     if (!held || after.length !== documents.length || after.some((each, index) => each !== documents[index])) {
@@ -286,7 +294,7 @@ export async function maskedPixels(session: BidiSession, viewport: ViewportSize)
       maskedRegionCount: count,
     };
   } finally {
-    await Promise.all(masked.map((each) => releaseQuietly(session.run(unmaskSecureFields, [], each))));
+    await Promise.all(masked.map((each) => releaseQuietly(session.run(unmaskSecureFields, [token], each))));
   }
 }
 

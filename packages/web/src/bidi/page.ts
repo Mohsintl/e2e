@@ -151,16 +151,24 @@ export type ActionPoint =
   | { readonly state: 'ok'; readonly x: number; readonly y: number }
   | { readonly state: 'detached' | 'hidden' | 'disabled' | 'moving' | 'outside' };
 
-/** What `actionPoint` checks: `enabled` for an action a disabled control refuses, `scroll` to bring the element into view first, `key` the closed-roots registry. */
+/**
+ * What `actionPoint` checks: `enabled` for an action a disabled control
+ * refuses, `scroll` to bring the element into view first, `key` the
+ * closed-roots registry. `ariaDisabledRoles` are the roles an inherited
+ * `aria-disabled` reaches, as the shared reader reads it.
+ */
 export interface ActionPointOptions {
   readonly enabled: boolean;
+  readonly ariaDisabledRoles: readonly string[];
   readonly scroll: boolean;
   readonly key: string;
 }
 
 /**
  * The checks Playwright runs before a pointer action, but the hit test:
- * attached, visible, enabled, scrolled into view when its centre is clipped
+ * attached, visible, enabled (`:disabled`, or the nearest `aria-disabled`
+ * across shadow hosts on the element itself or on a widget, as the shared
+ * reader decides), scrolled into view when its centre is clipped
  * by the viewport or a scrolling ancestor, and holding still for a frame.
  * The point is the centre of the element's visible part, in its document's
  * viewport.
@@ -170,8 +178,18 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
   const style = getComputedStyle(element);
   const box = element.getBoundingClientRect();
   if (box.width === 0 || box.height === 0 || style.visibility === 'hidden') return { state: 'hidden' };
-  if (options.enabled && ((element as HTMLButtonElement).disabled === true || element.closest('[aria-disabled="true"], fieldset[disabled]') !== null)) {
-    return { state: 'disabled' };
+  if (options.enabled) {
+    const widget = ['button', 'a', 'input', 'select', 'textarea', 'option'].includes(element.localName) || options.ariaDisabledRoles.includes(element.getAttribute('role') ?? '');
+    let inherited = false;
+    for (let at: Element | null = element; at !== null; at = at.parentElement ?? (at.getRootNode() instanceof ShadowRoot ? (at.getRootNode() as ShadowRoot).host : null)) {
+      const aria = (at.getAttribute('aria-disabled') ?? '').toLowerCase();
+      if (aria === 'false') break;
+      if (aria === 'true') {
+        inherited = at === element || widget;
+        break;
+      }
+    }
+    if (element.matches(':disabled') || inherited) return { state: 'disabled' };
   }
   const visible = (): { left: number; top: number; right: number; bottom: number } | null => {
     const rect = element.getBoundingClientRect();
@@ -256,11 +274,15 @@ export function nextFrame(): Promise<void> | undefined {
   return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
 }
 
-/** Focuses an element; returns whether focus landed on it, or on the editing host that holds it. */
-export function focus(element: Element): boolean {
+/**
+ * Focuses an element; returns whether focus landed on it, or on the editing
+ * host that holds it, followed through open and recorded closed shadow roots.
+ */
+export function focus(element: Element, key: string): boolean {
+  const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
   (element as HTMLElement).focus();
   let active = document.activeElement;
-  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  for (let inner = active && (active.shadowRoot ?? recorded?.get(active))?.activeElement; inner; inner = (inner.shadowRoot ?? recorded?.get(inner))?.activeElement) active = inner;
   return active === element || ((element as HTMLElement).isContentEditable && active !== null && active.contains(element));
 }
 
@@ -281,12 +303,13 @@ export function checkState(element: Element): { checked: boolean | null; radio: 
  * `change`. Nothing changes until the element proved editable and took
  * focus. Returns null once filled, else why the element cannot be.
  */
-export function fill(element: Element, value: string): string | null {
+export function fill(element: Element, value: string, key: string): string | null {
   const typed = ['', 'text', 'password', 'search', 'email', 'tel', 'url', 'number'];
+  const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
   const focused = (): boolean => {
     (element as HTMLElement).focus();
     let active = document.activeElement;
-    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    for (let inner = active && (active.shadowRoot ?? recorded?.get(active))?.activeElement; inner; inner = (inner.shadowRoot ?? recorded?.get(inner))?.activeElement) active = inner;
     return active === element || ((element as HTMLElement).isContentEditable && active !== null && active.contains(element));
   };
   if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
@@ -366,12 +389,14 @@ export function boxSize(element: Element): { width: number; height: number } {
  * closed shadow roots, with an opaque box, and hides the caret, for one
  * screenshot; returns how many fields it covered. The boxes sit in a manual
  * popover, so they paint in the top layer above a modal dialog or popover
- * the app shows. `unmaskSecureFields` takes them away.
+ * the app shows, inside a closed shadow root of a host whose every style is
+ * set inline as `!important`, so no page rule reaches them. `token` names
+ * this masking for `unmaskSecureFields`.
  */
-export function maskSecureFields(selector: string, key: string): number {
+export function maskSecureFields(selector: string, key: string, token: string): number {
   const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
-  const roots: ParentNode[] = [document];
   const fields: Element[] = [];
+  const roots: ParentNode[] = [document];
   for (let index = 0; index < roots.length; index += 1) {
     const root = roots[index]!;
     fields.push(...root.querySelectorAll(selector));
@@ -380,44 +405,78 @@ export function maskSecureFields(selector: string, key: string): number {
       if (shadow) roots.push(shadow);
     }
   }
-  const layer = document.createElement('div');
-  layer.popover = 'manual';
-  layer.style.cssText = 'position:fixed;inset:0;margin:0;padding:0;border:0;width:100vw;height:100vh;max-width:none;max-height:none;background:transparent;overflow:visible;pointer-events:none';
-  const boxes: { field: Element; rect: DOMRect }[] = [];
+  const pin = (element: HTMLElement, styles: Record<string, string>): void => {
+    element.style.setProperty('all', 'initial', 'important');
+    for (const [name, value] of Object.entries(styles)) element.style.setProperty(name, value, 'important');
+  };
+  const host = document.createElement('e2e-mask');
+  host.popover = 'manual';
+  pin(host, {
+    display: 'block', position: 'fixed', inset: '0', width: '100vw', height: '100vh', margin: '0', padding: '0', border: '0',
+    opacity: '1', visibility: 'visible', overflow: 'visible', background: 'transparent', 'pointer-events': 'none', 'z-index': '2147483647',
+  });
+  const layer = host.attachShadow({ mode: 'closed' });
+  const boxes: { field: Element; rect: DOMRect; box: HTMLElement }[] = [];
   for (const field of fields) {
     const rect = field.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
     const box = document.createElement('div');
-    box.style.cssText = `position:fixed;background:#000;left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px`;
+    pin(box, {
+      display: 'block', position: 'fixed', left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px`,
+      background: '#000', opacity: '1', visibility: 'visible',
+    });
     layer.append(box);
-    boxes.push({ field, rect });
+    boxes.push({ field, rect, box });
   }
   const caret = new CSSStyleSheet();
   caret.replaceSync('*, *::before, *::after { caret-color: transparent !important; }');
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, caret];
-  document.documentElement.append(layer);
-  layer.showPopover();
-  Reflect.set(globalThis, Symbol.for('e2e.bidi.mask'), { layer, caret, boxes });
+  document.documentElement.append(host);
+  host.showPopover();
+  Reflect.set(globalThis, Symbol.for('e2e.bidi.mask'), { token, host, caret, boxes, selector, key });
   return boxes.length;
 }
 
 /**
- * Removes what `maskSecureFields` added. Returns whether every covered field
- * is still where its box was, so the screenshot taken between the two showed
- * none of them.
+ * Removes what `maskSecureFields` added. Returns whether the screenshot taken
+ * between the two showed no secure field: this document is the one masked
+ * under `token`, every box still painted opaque in the top layer, every
+ * covered field where its box was, and no visible secure field appeared
+ * that no box covers.
  */
-export function unmaskSecureFields(): boolean {
+export function unmaskSecureFields(token: string): boolean {
   const mask = Reflect.get(globalThis, Symbol.for('e2e.bidi.mask')) as
-    | { layer: HTMLElement; caret: CSSStyleSheet; boxes: { field: Element; rect: DOMRect }[] }
+    | { token: string; host: HTMLElement; caret: CSSStyleSheet; boxes: { field: Element; rect: DOMRect; box: HTMLElement }[]; selector: string; key: string }
     | undefined;
-  if (mask === undefined) return true;
+  if (mask === undefined) return false;
   Reflect.deleteProperty(globalThis, Symbol.for('e2e.bidi.mask'));
-  mask.layer.remove();
+  const painted = (element: HTMLElement): boolean => {
+    const style = getComputedStyle(element);
+    return style.display !== 'none' && style.visibility === 'visible' && style.opacity === '1';
+  };
+  const shown = mask.host.matches(':popover-open') && painted(mask.host) && mask.boxes.every(({ box }) => painted(box));
+  mask.host.remove();
   document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== mask.caret);
-  return mask.boxes.every(({ field, rect }) => {
+  if (mask.token !== token || !shown) return false;
+  const still = mask.boxes.every(({ field, rect }) => {
     const now = field.getBoundingClientRect();
     return now.x === rect.x && now.y === rect.y && now.width === rect.width && now.height === rect.height;
   });
+  const covered = new Set(mask.boxes.map(({ field }) => field));
+  const recorded = Reflect.get(globalThis, Symbol.for(mask.key)) as WeakMap<Element, ShadowRoot> | undefined;
+  const roots: ParentNode[] = [document];
+  for (let index = 0; index < roots.length; index += 1) {
+    const root = roots[index]!;
+    for (const field of root.querySelectorAll(mask.selector)) {
+      const rect = field.getBoundingClientRect();
+      if (!covered.has(field) && rect.width > 0 && rect.height > 0) return false;
+    }
+    for (const element of root.querySelectorAll('*')) {
+      const shadow = element.shadowRoot ?? recorded?.get(element);
+      if (shadow) roots.push(shadow);
+    }
+  }
+  return still;
 }
 
 /**

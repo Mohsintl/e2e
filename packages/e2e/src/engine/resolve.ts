@@ -25,6 +25,12 @@ export interface ResolveExpressionOptions {
    * language of its own.
    */
   readonly selector?: (selector: string, candidates: readonly SemanticNode[]) => readonly SemanticNode[];
+  /**
+   * Whether `node` is labelled by `pattern`, for a platform whose nodes carry
+   * labels beside their name (a control with two `<label>`s answers to each).
+   * Without it a label query matches the name.
+   */
+  readonly label?: (node: SemanticNode, pattern: TextPattern) => boolean;
 }
 
 /**
@@ -89,7 +95,7 @@ function resolve(
         expression.scope === undefined
           ? candidates
           : descendantsOf(resolve(expression.scope, candidates, tree, options), candidates, tree);
-      const matches = pool.filter((node) => matchesQuery(node, expression.query));
+      const matches = pool.filter((node) => matchesQuery(node, expression.query, options));
       return INNERMOST_KINDS.has(expression.query.kind) ? innermostOnly(matches, tree) : matches;
     }
     case 'filter': {
@@ -191,7 +197,7 @@ const STATE_KEYS = ['checked', 'disabled', 'selected', 'expanded', 'pressed'] as
  * leave visibility to the action or assertion, unless the query says
  * `visible`, which drops hidden nodes for every kind.
  */
-function matchesQuery(node: SemanticNode, query: SemanticQuery): boolean {
+function matchesQuery(node: SemanticNode, query: SemanticQuery, options: ResolveExpressionOptions): boolean {
   if (query.visible === true && node.states?.hidden === true) return false;
   switch (query.kind) {
     case 'role': {
@@ -211,6 +217,7 @@ function matchesQuery(node: SemanticNode, query: SemanticQuery): boolean {
       return true;
     }
     case 'label':
+      if (options.label !== undefined) return options.label(node, query.value);
       return node.name !== undefined && matchesText(node.name, query.value);
     case 'placeholder': {
       const placeholder = node.attributes?.['placeholder'];

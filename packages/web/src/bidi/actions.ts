@@ -31,6 +31,15 @@ import type { BidiSession } from './session.ts';
 const DEFAULT_LONG_PRESS_MS = 500;
 /** Pause between actionability checks of an element that is not ready yet. */
 const POLL_MS = 50;
+/** The roles an inherited `aria-disabled` reaches: the shared reader's list (`read-semantics.ts`), which lives inside its serialized function. */
+const ARIA_DISABLED_ROLES = [
+  'application', 'button', 'composite', 'gridcell', 'group', 'input', 'link', 'menuitem', 'scrollbar',
+  'separator', 'tab', 'checkbox', 'columnheader', 'combobox', 'grid', 'listbox', 'menu', 'menubar',
+  'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'radiogroup', 'row', 'rowheader', 'searchbox',
+  'select', 'slider', 'spinbutton', 'switch', 'tablist', 'textbox', 'toolbar', 'tree', 'treegrid', 'treeitem',
+];
+/** What the page's `fill` and `selectOption` refuse for now but may take once the app catches up, polled until the deadline. */
+const NOT_YET = new Set(['element is not editable', 'element is not enabled', 'no option matches']);
 
 /** One action on a located or observed node; a `swipe` on the observation root is the viewport swipe at the pointer. */
 export async function perform(session: BidiSession, ref: NodeRef, action: LocatorAction, timeoutMs: number, signal: AbortSignal): Promise<void> {
@@ -70,11 +79,9 @@ export async function perform(session: BidiSession, ref: NodeRef, action: Locato
     case 'uncheck':
       return setChecked(session, target, action.kind === 'check', deadline, signal);
     case 'selectOption': {
+      const by = typeof action.value === 'string' ? { label: action.value } : action.value;
       await settledPoint(session, target, deadline, { enabled: true, scroll: true }, signal);
-      session.mutated();
-      const problem = await session.run(selectOption, [target.element, typeof action.value === 'string' ? { label: action.value } : action.value], target.context);
-      if (problem !== null) throw new EngineError('NOT_ACTIONABLE', `selectOption: ${problem}`, { retryable: false });
-      return;
+      return mutateWhenReady(session, deadline, signal, 'selectOption: ', () => session.run(selectOption, [target.element, by], target.context));
     }
     case 'setInputFiles':
       return setInputFiles(session, target, action.paths, deadline, signal);
@@ -138,7 +145,7 @@ async function click(session: BidiSession, target: NodeTarget, deadline: Deadlin
 
 /** Focuses the element, refusing when focus does not land on it. */
 async function focusOn(session: BidiSession, target: NodeTarget): Promise<void> {
-  if (!(await session.run(focus, [target.element], target.context))) throw new EngineError('NOT_ACTIONABLE', 'element could not be focused', { retryable: false });
+  if (!(await session.run(focus, [target.element, CLOSED_SHADOW_ROOTS_KEY], target.context))) throw new EngineError('NOT_ACTIONABLE', 'element could not be focused', { retryable: false });
 }
 
 /**
@@ -155,12 +162,12 @@ async function settledPoint(
 ): Promise<{ x: number; y: number }> {
   if (checks.scroll) {
     for (const frame of session.frames.chain(target.context)) {
-      await session.run(readActionPoint, [frame.element, { enabled: false, scroll: true, key: CLOSED_SHADOW_ROOTS_KEY }], frame.context);
+      await session.run(readActionPoint, [frame.element, { enabled: false, scroll: true, key: CLOSED_SHADOW_ROOTS_KEY, ariaDisabledRoles: ARIA_DISABLED_ROLES }], frame.context);
     }
   }
   for (;;) {
     signal.throwIfAborted();
-    const point = await session.run(readActionPoint, [target.element, { ...checks, key: CLOSED_SHADOW_ROOTS_KEY }], target.context);
+    const point = await session.run(readActionPoint, [target.element, { ...checks, key: CLOSED_SHADOW_ROOTS_KEY, ariaDisabledRoles: ARIA_DISABLED_ROLES }], target.context);
     if (point.state === 'ok') return point;
     if (point.state === 'detached') throw new EngineError('NODE_STALE', 'element is not attached to the DOM', { retryable: true });
     if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${blocker(point)}`, { retryable: false });
@@ -210,13 +217,30 @@ function blocker(point: Exclude<ActionPoint, { state: 'ok' }>): string {
   }
 }
 
-/** Replaces the field's content with `value` in one edit, as a paste would, once it is visible and enabled; see the page's `fill`. */
+/** Replaces the field's content with `value` in one edit, as a paste would, once it is visible, enabled, and editable; see the page's `fill`. */
 async function fill(session: BidiSession, target: NodeTarget, value: string, deadline: Deadline, signal: AbortSignal): Promise<void> {
   await settledPoint(session, target, deadline, { enabled: true, scroll: true }, signal);
-  signal.throwIfAborted();
-  session.mutated();
-  const problem = await session.run(fillElement, [target.element, value], target.context);
-  if (problem !== null) throw new EngineError('NOT_ACTIONABLE', problem, { retryable: false });
+  return mutateWhenReady(session, deadline, signal, '', () => session.run(fillElement, [target.element, value, CLOSED_SHADOW_ROOTS_KEY], target.context));
+}
+
+/**
+ * Runs a page mutation that reports why it refused, polling while the
+ * refusal is one the app may lift (`NOT_YET`): such a refusal changed
+ * nothing, so it does not count as dispatched. Nothing runs once `signal`
+ * aborted.
+ */
+async function mutateWhenReady(session: BidiSession, deadline: Deadline, signal: AbortSignal, prefix: string, mutate: () => Promise<string | null>): Promise<void> {
+  for (;;) {
+    signal.throwIfAborted();
+    const dispatched = session.dispatches;
+    session.mutated();
+    const problem = await mutate();
+    if (problem === null) return;
+    if (!NOT_YET.has(problem)) throw new EngineError('NOT_ACTIONABLE', `${prefix}${problem}`, { retryable: false });
+    session.dispatches = dispatched;
+    if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `${prefix}${problem}`, { retryable: false });
+    await sleep(POLL_MS, undefined, { signal });
+  }
 }
 
 /**
@@ -232,9 +256,13 @@ async function setChecked(session: BidiSession, target: NodeTarget, checked: boo
     throw new EngineError('NOT_ACTIONABLE', 'uncheck cannot clear a radio button; select another radio in its group', { retryable: false });
   }
   await click(session, target, deadline, {}, signal);
-  for (;;) {
+  for (let first = true; ; first = false) {
     const after = await unlessStale(session.run(checkState, [target.element], target.context), undefined);
-    if (after === undefined || after.checked === checked) return;
+    if (after === undefined) {
+      if (first) return;
+      throw new EngineError('NOT_ACTIONABLE', `${checked ? 'check' : 'uncheck'} clicked the control but its checked state did not change before the control was replaced`, { retryable: false });
+    }
+    if (after.checked === checked) return;
     if (deadline.remaining() <= POLL_MS) {
       throw new EngineError('NOT_ACTIONABLE', `${checked ? 'check' : 'uncheck'} clicked the control but its checked state did not change`, { retryable: false });
     }
@@ -258,6 +286,7 @@ async function setInputFiles(session: BidiSession, target: NodeTarget, paths: re
   const files = paths.map((file) => path.resolve(session.settings.projectRoot, file));
   const input = await session.run(fileInput, [target.element], target.context);
   if (input instanceof ElementRef) {
+    signal.throwIfAborted();
     session.mutated();
     await connection.send('input.setFiles', { context: target.context, element: { sharedId: input.sharedId }, files });
     return;
@@ -297,7 +326,7 @@ async function setInputFiles(session: BidiSession, target: NodeTarget, paths: re
 async function dragTo(session: BidiSession, source: NodeTarget, target: NodeTarget, deadline: Deadline, signal: AbortSignal): Promise<void> {
   await pointerPoint(session, target, deadline, false, signal);
   const from = await pointerPoint(session, source, deadline, true, signal);
-  const local = await session.run(readActionPoint, [target.element, { enabled: false, scroll: false, key: CLOSED_SHADOW_ROOTS_KEY }], target.context);
+  const local = await session.run(readActionPoint, [target.element, { enabled: false, scroll: false, key: CLOSED_SHADOW_ROOTS_KEY, ariaDisabledRoles: ARIA_DISABLED_ROLES }], target.context);
   if (local.state !== 'ok') throw new EngineError('NOT_ACTIONABLE', `dragTo: the target cannot be shown with the source: ${blocker(local)}`, { retryable: false });
   const box = await session.frames.viewportBox(session.connection, target.context);
   if (box === null) throw new EngineError('NOT_ACTIONABLE', 'dragTo: the target is in a frame that lays out no box', { retryable: false });
@@ -321,7 +350,7 @@ async function drag(session: BidiSession, from: ViewportPoint, to: ViewportPoint
   const documents = await session.documentContexts(context);
   signal.throwIfAborted();
   session.mutated();
-  await chromiumDrag(session.connection, context, documents, dragPath(from, to), dragStepMs(durationMs));
+  await chromiumDrag(session.connection, context, documents, dragPath(from, to), dragStepMs(durationMs), signal);
   session.pointer = { x: to.x, y: to.y };
 }
 
