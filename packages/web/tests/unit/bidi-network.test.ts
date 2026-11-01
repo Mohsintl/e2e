@@ -326,4 +326,21 @@ describe('AttemptNetwork', () => {
     await net.waitForIdle(AbortSignal.timeout(5_000));
     expect(Date.now() - started).toBeLessThan(1_000);
   });
+
+  it('reports a removal the browser refused, and takes one it no longer has as done', async () => {
+    const fake = new FakeBidi();
+    const { net } = network(fake, { holdAll: true, exclusive: true });
+    fake.on('network.addIntercept', { result: { intercept: 'global' } });
+    await net.bind('user-1');
+    await net.addContext('tab');
+    fake.on('network.removeIntercept', { error: 'unknown error', message: 'refused' });
+    await expect(net.dispose()).rejects.toThrow('refused');
+    const again = new FakeBidi();
+    const second = network(again, { holdAll: true, exclusive: true }).net;
+    again.on('network.addIntercept', { result: { intercept: 'global' } });
+    await second.bind('user-1');
+    await second.addContext('tab');
+    again.on('network.removeIntercept', { error: 'no such intercept', message: 'gone' });
+    await expect(second.dispose()).resolves.toBeUndefined();
+  });
 });

@@ -58,6 +58,8 @@ import { goto, reload, reset, restart, traverse, type WaitUntil } from './steeri
 
 /** Browser launch budget when the harness init budget is not otherwise expressed. */
 const BROWSER_LAUNCH_TIMEOUT_MS = 60_000;
+/** How long closing an attempt whose setup failed may take before the browser is retired instead. */
+const SETUP_CLEANUP_MS = 15_000;
 
 /** What a BiDi surface is configured with, from `web()`. */
 export interface BidiSurfaceOptions {
@@ -187,7 +189,13 @@ export class BidiSurface {
     return launchBidiBrowser(this.options.browser, { headed: this.headed, timeoutMs: BROWSER_LAUNCH_TIMEOUT_MS, firefoxPrefs: firefoxMediaPrefs(this.options.media) });
   }
 
-  /** Opens the attempt's session: its user context, network, downloads, and emulation. */
+  /**
+   * Opens the attempt's session: its user context, network, downloads, and
+   * emulation. A setup that fails or is cancelled is closed at once, without
+   * waiting for a command that may never answer (a user context that lands
+   * later removes itself), and the browser is retired when that close cannot
+   * finish.
+   */
   async startAttempt(context: EngineAttemptContext): Promise<void> {
     if (this.session !== undefined) throw invalidState('an attempt is already running');
     if (this.settings === undefined) throw invalidState('the engine is not initialized');
@@ -202,11 +210,15 @@ export class BidiSurface {
       { attemptId: context.attemptId, artifactsDir: context.artifactsDir, appLog: context.appLog, navigation: context.navigation, screen: context.screen, credentials },
       this.owners,
     );
-    const setup = session.openUserContext();
     try {
-      await raceAbort(setup, context.signal, 'attempt setup');
+      await raceAbort(session.openUserContext(), context.signal, 'attempt setup');
     } catch (cause) {
-      void releaseQuietly(setup.finally(() => session.close()));
+      const budget = { signal: AbortSignal.timeout(SETUP_CLEANUP_MS), timeoutMs: SETUP_CLEANUP_MS };
+      try {
+        await boundedCleanup(session.close(), budget, 'attempt setup cleanup');
+      } catch {
+        await this.retireBrowser(budget);
+      }
       throw cause;
     }
     this.session = session;
@@ -428,10 +440,10 @@ export class BidiSurface {
       latch: session.latch,
       credentials: session.attempt.credentials,
       lifetime: session.lifetime,
-      storeCookies: async (cookies) => {
+      storeCookies: async (cookies, signal) => {
+        const bound = AbortSignal.any([signal, session.lifetime]);
         for (const cookie of cookies) {
-          session.lifetime.throwIfAborted();
-          await session.connection.send('storage.setCookie', { cookie, partition: session.partition() });
+          await raceAbort(session.connection.send('storage.setCookie', { cookie, partition: session.partition() }), bound, 'route.fetch cookies');
         }
       },
     };
@@ -539,7 +551,8 @@ export interface AttemptScope {
   readonly credentials: { readonly username: string; readonly password: string } | undefined;
   /** Aborts when the attempt closes. */
   readonly lifetime: AbortSignal;
-  storeCookies(cookies: readonly Storage.PartialCookie[]): Promise<void>;
+  /** Stores cookies in the attempt's jar, giving up once `signal` aborts or the attempt closes. */
+  storeCookies(cookies: readonly Storage.PartialCookie[], signal: AbortSignal): Promise<void>;
 }
 
 /**

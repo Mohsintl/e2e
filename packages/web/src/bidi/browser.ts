@@ -197,7 +197,7 @@ function routeAdapter(surface: BidiSurface, scope: AttemptScope, context: Engine
         fetched = await send({ authorization: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}` });
       }
       const cookies = fetched.headers.getSetCookie().flatMap((header) => setCookieOf(header, new URL(request.url)) ?? []);
-      if (cookies.length > 0) await scope.storeCookies(cookies);
+      if (cookies.length > 0) await scope.storeCookies(cookies, signal);
       const text = await readResponseBody('route.fetch', async () => Buffer.from(await fetched.arrayBuffer()));
       // oxlint-disable-next-line e2e/no-unchecked-json -- public API: the caller names T, unknown by default
       return { url: request.url, status: fetched.status, headers: Object.fromEntries(fetched.headers), json: async <T = unknown>() => JSON.parse(await text()) as T, text };

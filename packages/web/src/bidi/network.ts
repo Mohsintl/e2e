@@ -247,7 +247,7 @@ export class AttemptNetwork {
     const replace = async (wanted: boolean, phase: 'beforeRequestSent' | 'authRequired', old: string | undefined): Promise<string | undefined> => {
       if (this.options.exclusive) return wanted ? (old ?? (await add(phase))) : old;
       const next = wanted && live().length > 0 ? await add(phase) : undefined;
-      if (old !== undefined) await releaseQuietly(connection.send('network.removeIntercept', { intercept: old }));
+      if (old !== undefined) await alreadyGone(connection.send('network.removeIntercept', { intercept: old }), connection);
       return next;
     };
     this.intercept = await replace(this.holds, 'beforeRequestSent', this.intercept);
@@ -547,7 +547,12 @@ export class AttemptNetwork {
     return pending;
   }
 
-  /** Removes the bound user context's intercepts, collectors, and subscription. */
+  /**
+   * Removes the bound user context's intercepts, collectors, and
+   * subscription, every one attempted; one the browser no longer has is
+   * done, any other failure is thrown so the attempt's close reports it and
+   * the browser is retired rather than reused with it in place.
+   */
   private async release(): Promise<void> {
     const connection = this.connection;
     const removals = [
@@ -560,7 +565,9 @@ export class AttemptNetwork {
     this.intercept = this.authIntercept = this.collector = this.requestCollector = this.subscription = undefined;
     this.intercepts.clear();
     this.blank.clear();
-    await Promise.all(removals.map(releaseQuietly));
+    const results = await Promise.allSettled(removals.map((removal) => alreadyGone(removal, connection)));
+    const failed = results.find((result) => result.status === 'rejected');
+    if (failed !== undefined) throw failed.reason;
   }
 
   /** Ends the attempt's network: listeners, routes, intercepts, collectors, and subscription. */
@@ -581,6 +588,19 @@ function headerRecord(headers: readonly Network.Header[]): Record<string, string
     out[name] = out[name] === undefined ? value : `${out[name]}, ${value}`;
   }
   return out;
+}
+
+/** Errors that mean what a removal removes is already gone: the browser dropped it, or the browser itself is gone. */
+const GONE = new Set(['no such intercept', 'no such network collector', 'no such network data', 'invalid argument']);
+
+/** Waits for a removal, taking a resource the browser no longer has (or a browser that is gone) as removed. */
+async function alreadyGone(removal: Promise<unknown> | undefined, connection: BidiConnection): Promise<void> {
+  try {
+    await removal;
+  } catch (cause) {
+    if (connection.isClosed || (cause instanceof BidiError && GONE.has(cause.error))) return;
+    throw cause;
+  }
 }
 
 /** A BiDi bytes value as text. */
