@@ -42,7 +42,7 @@ import { httpCredentials, lowercaseNames, siteHeadersFor } from '../protected-ap
 import type { LeasedBrowsers } from '../provider.ts';
 import { cancelled, invalidState } from '../support.ts';
 import type { WebBasicAuth, WebScreencastOptions } from '../surface.ts';
-import { perform, performAt, typeText } from './actions.ts';
+import { perform, performAt, typeInto, typeText } from './actions.ts';
 import { screenshot, startVideo, stopVideo } from './artifacts.ts';
 import { afterDispatch, classify, releaseQuietly } from './errors.ts';
 import { routeEvents, SESSION_EVENTS } from './events.ts';
@@ -380,6 +380,11 @@ export class BidiSurface {
   /** Runs raw input sources from the `browser` fixture; a key or button they press without releasing stays held. */
   input(label: string, actions: Input.SourceActions[], operation: OperationContext): Promise<void> {
     return this.guard(operation, label, (session, budget) => session.sendInput(actions, budget.signal), { input: true });
+  }
+
+  /** Types `text` into whatever holds focus, inserting what no key types (`typeInto`). */
+  typeKeys(text: string, operation: OperationContext): Promise<void> {
+    return this.guard(operation, 'keyboard.type', (session, budget) => typeInto(session, text, budget.signal), { input: true });
   }
 
   /** Where the mouse last moved in the attempt's tab. */

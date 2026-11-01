@@ -141,8 +141,10 @@ export const LOCATE_READ = `(options, wants, key, structured) => {
  * so an action refuses exactly what an observation reports disabled. The
  * element is first retargeted as Playwright's enabled check does: to the
  * button, checkbox, or radio that holds it, or the control its label names.
+ * Null for a detached element, which a locate must find again.
  */
 export const ELEMENT_DISABLED = `(target, options) => {
+  if (!target.isConnected) return null;
   let element = target;
   if (!element.matches('input, textarea, select') && !element.isContentEditable) {
     element = element.closest('button, [role=button], [role=checkbox], [role=radio]') ?? element;
@@ -434,12 +436,14 @@ export function focus(element: Element, key: string): boolean {
   return active === element || ((element as HTMLElement).isContentEditable && active !== null && active.contains(element));
 }
 
-/** A checkable's state and kind: `checked` is null for an element with no checked state. */
+/** A checkable's state and kind, as Playwright reads it: a checkable role without `aria-checked` is unchecked; `checked` is null for an element with no checked state. */
 export function checkState(element: Element): { checked: boolean | null; radio: boolean } {
-  const radio = (element instanceof HTMLInputElement && element.type === 'radio') || element.getAttribute('role') === 'radio';
-  if (element instanceof HTMLInputElement && (element.type === 'checkbox' || element.type === 'radio')) return { checked: element.checked, radio };
-  const aria = element.getAttribute('aria-checked');
-  return { checked: aria === 'true' ? true : aria === 'false' ? false : null, radio };
+  const role = (element.getAttribute('role') ?? '').trim().split(/\s+/)[0] ?? '';
+  const input = element.nodeName === 'INPUT' ? (element as HTMLInputElement) : null;
+  const radio = input?.type === 'radio' || role === 'radio' || role === 'menuitemradio';
+  if (input !== null && (input.type === 'checkbox' || input.type === 'radio')) return { checked: input.checked, radio };
+  if (['checkbox', 'menuitemcheckbox', 'option', 'radio', 'switch', 'menuitemradio', 'treeitem'].includes(role)) return { checked: element.getAttribute('aria-checked') === 'true', radio };
+  return { checked: null, radio };
 }
 
 /**
@@ -454,28 +458,33 @@ export function checkState(element: Element): { checked: boolean | null; radio: 
 export function fill(element: Element, value: string, key: string): string | null {
   const typed = ['', 'text', 'password', 'search', 'email', 'tel', 'url', 'number'];
   const recorded = Reflect.get(globalThis, Symbol.for(key)) as WeakMap<Element, ShadowRoot> | undefined;
+  const EventClass = (Reflect.get(globalThis, Symbol.for('e2e.bidi.Event')) as typeof Event | undefined) ?? Event;
+  const fire = (target: Element): void => {
+    target.dispatchEvent(new EventClass('input', { bubbles: true, composed: true }));
+    target.dispatchEvent(new EventClass('change', { bubbles: true }));
+  };
   const focused = (): boolean => {
     (element as HTMLElement).focus();
     let active = document.activeElement;
     for (let inner = active && (active.shadowRoot ?? recorded?.get(active))?.activeElement; inner; inner = (inner.shadowRoot ?? recorded?.get(inner))?.activeElement) active = inner;
     return active === element || ((element as HTMLElement).isContentEditable && active !== null && active.contains(element));
   };
-  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-    if (element instanceof HTMLInputElement && ['checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'image'].includes(element.type)) {
-      return `input of type "${element.type}" cannot be filled`;
-    }
-    if (element.disabled || element.readOnly) return 'element is not editable';
-    if (element instanceof HTMLInputElement && element.type === 'number' && Number.isNaN(Number(value))) return 'cannot type text into input[type=number]';
+  const field = element.nodeName === 'INPUT' || element.nodeName === 'TEXTAREA' ? (element as HTMLInputElement | HTMLTextAreaElement) : null;
+  if (field !== null) {
+    const type = field.nodeName === 'INPUT' ? (field as HTMLInputElement).type.toLowerCase() : 'textarea';
+    if (['checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'image'].includes(type)) return `Input of type "${type}" cannot be filled`;
+    if (field.disabled || field.readOnly) return 'element is not editable';
+    if (type === 'number' && Number.isNaN(Number(value.trim()))) return 'Cannot type text into input[type=number]';
     if (!focused()) return 'element could not be focused';
-    if (element instanceof HTMLInputElement && !typed.includes(element.type)) {
-      element.value = value;
-      if (element.value !== value) return `malformed value for input of type "${element.type}"`;
-      element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-      element.dispatchEvent(new Event('change', { bubbles: true }));
+    if (type !== 'textarea' && !typed.includes(type)) {
+      const wanted = value.trim();
+      field.value = wanted;
+      if (type === 'color' ? field.value.toLowerCase() !== wanted.toLowerCase() : field.value !== wanted) return 'Malformed value';
+      fire(field);
       return null;
     }
-    element.select();
-  } else if (element instanceof HTMLElement && element.isContentEditable) {
+    field.select();
+  } else if ((element as HTMLElement).isContentEditable) {
     if (!focused()) return 'element could not be focused';
     const range = document.createRange();
     range.selectNodeContents(element);
@@ -483,16 +492,15 @@ export function fill(element: Element, value: string, key: string): string | nul
     selection?.removeAllRanges();
     selection?.addRange(range);
   } else {
-    return 'element is not an <input>, <textarea> or [contenteditable] element';
+    return 'Element is not an <input>, <textarea> or [contenteditable] element';
   }
   const edited = value === '' ? document.execCommand('delete') : document.execCommand('insertText', false, value);
-  const number = element instanceof HTMLInputElement && element.type === 'number';
-  if ((!edited || (number && (element as HTMLInputElement).value !== value)) && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
-    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value')?.set?.call(element, value);
-    element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-    element.dispatchEvent(new Event('change', { bubbles: true }));
+  const number = field !== null && field.nodeName === 'INPUT' && (field as HTMLInputElement).type === 'number';
+  if (field !== null && (!edited || (number && field.value !== value))) {
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(field), 'value')?.set?.call(field, value);
+    fire(field);
   }
-  if (number && (element as HTMLInputElement).value !== value) return 'malformed value for input of type "number"';
+  if (number && field.value !== value) return 'Malformed value';
   return null;
 }
 
@@ -509,17 +517,20 @@ export interface OptionChoice {
  * else why it cannot be.
  */
 export function selectOption(element: Element, by: OptionChoice): string | null {
-  if (!(element instanceof HTMLSelectElement)) return 'element is not a <select> element';
-  if (element.disabled) return 'element is not enabled';
-  const options = [...element.options];
+  if (element.nodeName !== 'SELECT') return 'Element is not a <select> element';
+  const select = element as HTMLSelectElement;
+  if (select.disabled) return 'element is not enabled';
+  const options = [...select.options];
   const option = by.index !== undefined ? options[by.index]
     : by.value !== undefined ? options.find((each) => each.value === by.value)
     : options.find((each) => each.label === by.label || each.textContent?.trim() === by.label);
   if (option === undefined) return 'no option matches';
-  element.focus();
+  if (option.disabled || option.closest('optgroup')?.disabled === true) return 'option being selected is not enabled';
+  const EventClass = (Reflect.get(globalThis, Symbol.for('e2e.bidi.Event')) as typeof Event | undefined) ?? Event;
+  select.focus();
   for (const each of options) each.selected = each === option;
-  element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-  element.dispatchEvent(new Event('change', { bubbles: true }));
+  select.dispatchEvent(new EventClass('input', { bubbles: true, composed: true }));
+  select.dispatchEvent(new EventClass('change', { bubbles: true }));
   return null;
 }
 
@@ -527,6 +538,11 @@ export function selectOption(element: Element, by: OptionChoice): string | null 
 export function fileInput(element: Element): HTMLInputElement | null {
   const control = element instanceof HTMLInputElement ? element : element.closest('label')?.control;
   return control instanceof HTMLInputElement && control.type === 'file' ? control : null;
+}
+
+/** Whether a file input takes a directory (`webkitdirectory`). */
+export function directoryInput(element: Element): boolean {
+  return (element as HTMLInputElement).webkitdirectory === true;
 }
 
 /** An element's box size, which a swipe on it spans. */
@@ -712,9 +728,12 @@ export function documentTitle(): string {
 /**
  * Installs, before the page's own scripts, the capture listeners the click
  * watch (`armHitInterceptor`) decides through, so no listener of the app
- * runs ahead of them. They do nothing until a watch is armed.
+ * runs ahead of them (they do nothing until a watch is armed), and keeps the
+ * page's own `Event` constructor for the driver's edits, which a page may
+ * replace later.
  */
 export const HIT_INTERCEPTOR_INIT_SCRIPT = `(() => {
+  Reflect.set(globalThis, Symbol.for('e2e.bidi.Event'), Event);
   const active = Symbol.for('e2e.bidi.hit.active');
   const recorded = () => Reflect.get(globalThis, Symbol.for('e2e.closedShadowRoots'));
   const contains = (target, x, y) => {
@@ -810,4 +829,18 @@ export async function scrollIntoViewIfNeeded(element: Element): Promise<'detache
     target?.scrollIntoView({ block: align, inline: align, behavior: 'instant' });
   }
   return 'ok';
+}
+
+/**
+ * Inserts `text` where focus is in this document, as an IME would commit it
+ * (Playwright's `insertText`): for a character no key of the keyboard types.
+ * Returns false when this document does not hold focus, or its focus is an
+ * iframe whose own document does.
+ */
+export function insertFocusedText(text: string): boolean {
+  if (!document.hasFocus()) return false;
+  let active = document.activeElement;
+  while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+  if (active === null || active.nodeName === 'IFRAME' || active.nodeName === 'FRAME') return false;
+  return document.execCommand('insertText', false, text);
 }

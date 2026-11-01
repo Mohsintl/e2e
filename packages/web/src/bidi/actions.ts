@@ -4,11 +4,13 @@
  * checks Playwright runs, with points placed in the top-level viewport.
  */
 
+import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   Deadline,
   EngineError,
+  TestError,
   type LocatorAction,
   type NodeRef,
   type PointerAction,
@@ -24,7 +26,7 @@ import { chromiumDrag } from './drag.ts';
 import { unlessStale } from './errors.ts';
 import type { NodeTarget } from './frames.ts';
 import { clickSources, dragPath, dragSources, dragStepMs, moveSources, pressSource, typeSource, wheelSources, type ClickOptions } from './input.ts';
-import { actionPoint as readActionPoint, armHitInterceptor, ELEMENT_DISABLED, hitInterceptorResult, scrollIntoViewIfNeeded, boxSize, checkState, fileInput, fill as fillElement, focus, hitBlocker, nextFrame, selectOption, type ActionPoint } from './page.ts';
+import { actionPoint as readActionPoint, armHitInterceptor, ELEMENT_DISABLED, hitInterceptorResult, scrollIntoViewIfNeeded, boxSize, checkState, fileInput, fill as fillElement, focus, directoryInput, hitBlocker, insertFocusedText, nextFrame, selectOption, type ActionPoint } from './page.ts';
 import { ElementRef } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -40,7 +42,7 @@ const SCROLL_ALIGNMENTS = [
   { block: 'start', inline: 'start' },
 ] as const;
 /** What the page's `fill` and `selectOption` refuse for now but may take once the app catches up, polled until the deadline. */
-const NOT_YET = new Set(['element is not editable', 'element is not enabled', 'no option matches']);
+const NOT_YET = new Set(['element is not editable', 'element is not enabled', 'no option matches', 'option being selected is not enabled']);
 
 /** One action on a located or observed node; a `swipe` on the observation root is the viewport swipe at the pointer. */
 export async function perform(session: BidiSession, ref: NodeRef, action: LocatorAction, timeoutMs: number, signal: AbortSignal): Promise<void> {
@@ -134,7 +136,35 @@ export async function typeText(session: BidiSession, text: string, replace: bool
     await session.sendInput([pressSource('ControlOrMeta+a')], signal);
     await session.sendInput([pressSource('Delete')], signal);
   }
-  await session.sendInput([typeSource(text)], signal);
+  await typeInto(session, text, signal);
+}
+
+/**
+ * Types `text` into whatever holds focus, as Playwright's `keyboard.type`
+ * does: a character the US keyboard has is a key press, anything else (an
+ * emoji, a letter of another alphabet) is inserted as text in the document
+ * holding focus, since no key types it.
+ */
+export async function typeInto(session: BidiSession, text: string, signal: AbortSignal): Promise<void> {
+  let run = '';
+  const flush = async (): Promise<void> => {
+    if (run === '') return;
+    await session.sendInput([typeSource(run)], signal);
+    run = '';
+  };
+  for (const { segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)) {
+    if (/^[\x20-\x7e]$/.test(segment) || segment === '\n' || segment === '\r\n' || segment === '\t') {
+      run += segment;
+      continue;
+    }
+    await flush();
+    signal.throwIfAborted();
+    session.mutated();
+    for (const context of await session.documentContexts(session.requireContext())) {
+      if (await unlessStale(session.run(insertFocusedText, [segment], context), false)) break;
+    }
+  }
+  await flush();
 }
 
 /**
@@ -178,11 +208,11 @@ async function scrollIntoView(session: BidiSession, target: NodeTarget, deadline
   }
 }
 
-/** Focuses the element, a page change its focus handlers may make, refusing when focus does not land on it. */
+/** Focuses the element, a page change its focus handlers may make; an element that takes no focus keeps the old one, as Playwright's `focus` leaves it. */
 async function focusOn(session: BidiSession, target: NodeTarget, signal: AbortSignal): Promise<void> {
   signal.throwIfAborted();
   session.mutated();
-  if (!(await session.run(focus, [target.element, CLOSED_SHADOW_ROOTS_KEY], target.context))) throw new EngineError('NOT_ACTIONABLE', 'element could not be focused', { retryable: false });
+  await session.run(focus, [target.element, CLOSED_SHADOW_ROOTS_KEY], target.context);
 }
 
 /**
@@ -205,8 +235,8 @@ async function settledPoint(
   for (;;) {
     signal.throwIfAborted();
     const { enabled, ...placing } = checks;
-    const disabled = enabled && (await session.read<boolean>(ELEMENT_DISABLED, [target.element, readerOptions(session)], undefined, target.context));
-    const point: ActionPoint = disabled ? { state: 'disabled' } : await session.run(readActionPoint, [target.element, { ...placing, key: CLOSED_SHADOW_ROOTS_KEY }], target.context);
+    const disabled = enabled ? await session.read<boolean | null>(ELEMENT_DISABLED, [target.element, readerOptions(session)], undefined, target.context) : false;
+    const point: ActionPoint = disabled === null ? { state: 'detached' } : disabled ? { state: 'disabled' } : await session.run(readActionPoint, [target.element, { ...placing, key: CLOSED_SHADOW_ROOTS_KEY }], target.context);
     if (point.state === 'ok') return point;
     if (point.state === 'detached') throw new EngineError('NODE_STALE', 'element is not attached to the DOM', { retryable: true });
     if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${blocker(point)}`, { retryable: false });
@@ -307,7 +337,7 @@ async function mutateWhenReady(session: BidiSession, deadline: Deadline, signal:
  */
 async function setChecked(session: BidiSession, target: NodeTarget, checked: boolean, deadline: Deadline, signal: AbortSignal): Promise<void> {
   const before = await session.run(checkState, [target.element], target.context);
-  if (before.checked === null) throw new EngineError('NOT_ACTIONABLE', 'element is not a checkbox or radio button', { retryable: false });
+  if (before.checked === null) throw new EngineError('NOT_ACTIONABLE', 'Not a checkbox or radio button', { retryable: false });
   if (before.checked === checked) return;
   if (!checked && before.radio) {
     throw new EngineError('NOT_ACTIONABLE', 'uncheck cannot clear a radio button; select another radio in its group', { retryable: false });
@@ -328,6 +358,25 @@ async function setChecked(session: BidiSession, target: NodeTarget, checked: boo
 }
 
 /**
+ * Whether `files` name one directory (else only files), refusing what
+ * Playwright's upload refuses before it reaches the page: a path that does
+ * not exist, more than one directory, and a directory beside files.
+ */
+async function uploadKind(files: readonly string[]): Promise<boolean> {
+  const kinds = await Promise.all(files.map(async (file) => {
+    try {
+      return (await stat(file)).isDirectory();
+    } catch (cause) {
+      throw new TestError('INVALID_ARGUMENT', cause instanceof Error ? cause.message : String(cause));
+    }
+  }));
+  const directories = kinds.filter(Boolean).length;
+  if (directories > 1) throw new TestError('INVALID_ARGUMENT', 'Multiple directories are not supported');
+  if (directories === 1 && files.length > 1) throw new TestError('INVALID_ARGUMENT', 'File paths must be all files or a single directory');
+  return directories === 1;
+}
+
+/**
  * Attaches files to a file input or one a `<label>` names directly; any
  * other control is clicked with the file chooser awaited
  * (`input.fileDialogOpened`), and the input that chooser serves takes the
@@ -341,11 +390,18 @@ async function setInputFiles(session: BidiSession, target: NodeTarget, paths: re
   }
   const connection = session.connection;
   const files = paths.map((file) => path.resolve(session.settings.projectRoot, file));
-  const input = await session.run(fileInput, [target.element], target.context);
-  if (input instanceof ElementRef) {
+  const directory = await uploadKind(files);
+  const send = async (context: string, element: ElementRef): Promise<void> => {
+    const takesDirectory = await session.run(directoryInput, [element], context);
+    if (directory && !takesDirectory) throw new TestError('INVALID_ARGUMENT', 'File input does not support directories, pass individual files instead');
+    if (!directory && takesDirectory) throw new TestError('INVALID_ARGUMENT', '[webkitdirectory] input requires passing a path to a directory');
     signal.throwIfAborted();
     session.mutated();
-    await connection.send('input.setFiles', { context: target.context, element: { sharedId: input.sharedId }, files });
+    await connection.send('input.setFiles', { context, element: { sharedId: element.sharedId }, files });
+  };
+  const input = await session.run(fileInput, [target.element], target.context);
+  if (input instanceof ElementRef) {
+    await send(target.context, input);
     return;
   }
   const timer = new AbortController();
@@ -366,7 +422,7 @@ async function setInputFiles(session: BidiSession, target: NodeTarget, paths: re
     if (chooser?.element === undefined) {
       throw new EngineError('NOT_ACTIONABLE', 'upload clicked the control but it opened no file chooser', { retryable: false });
     }
-    await connection.send('input.setFiles', { context: chooser.context, element: { sharedId: chooser.element.sharedId }, files });
+    await send(chooser.context, new ElementRef(chooser.element.sharedId));
   } finally {
     clearTimeout(timeout);
     signal.removeEventListener('abort', cancel);

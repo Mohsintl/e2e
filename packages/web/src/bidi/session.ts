@@ -207,6 +207,7 @@ export class BidiSession {
       ours: (event) => this.owns(event.context),
       onPage: (context) => this.onPage(context),
       exclusive: browser.exclusive,
+      browser: settings.browser,
       onFailure: (error) => this.latch.latch(error),
       holdAll: settings.holdRequests,
     });

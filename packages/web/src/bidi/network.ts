@@ -10,6 +10,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { STATUS_CODES } from 'node:http';
 import path from 'node:path';
 import type { Network } from 'webdriver-bidi-protocol';
 import { raceAbort } from 'e2e/engine';
@@ -69,6 +70,8 @@ export interface AttemptNetworkOptions {
   readonly onPage: (context: string | null) => boolean;
   /** Whether no other client drives the browser, so one intercept can cover every tab from its first request. */
   readonly exclusive: boolean;
+  /** The browser, whose request handling differs: Firefox keeps a replaced body's old `content-length` and sends no cookie a continue leaves out. */
+  readonly browser: 'chromium' | 'firefox';
   /** Takes a failure on a path no step awaits (deciding a held request, answering a challenge), for the next step to fail with. */
   readonly onFailure: (error: Error) => void;
 }
@@ -120,6 +123,10 @@ export class AttemptNetwork {
   private requestCollector: string | undefined;
   /** Removals that failed, tried again by the next release so nothing is forgotten while the browser still holds it. */
   private unreleased: (() => Promise<unknown>)[] = [];
+  /** The headers each continued request went on with, and its method, for its redirect hops. */
+  private readonly continuedHeaders = new Map<string, { headers: Record<string, string>; method: string }>();
+  /** Bodies routes fulfilled, which a response wait reads since the browser keeps none of them. */
+  private readonly fulfilledBodies = new Map<string, Buffer>();
   /** Listeners of response bodies still loading, ended with the network. */
   private readonly pendingBodies = new Set<() => void>();
   private readonly inflight = new Set<string>();
@@ -307,23 +314,77 @@ export class AttemptNetwork {
   }
 
   /**
-   * Counts the attempt's request in flight and, when one of this network's
-   * intercepts holds it, decides it; a held request of another user context
-   * goes on untouched.
+   * Counts the attempt's request in flight (an EventSource stream never
+   * settles, so it does not count) and, when one of this network's
+   * intercepts holds it, decides it as Playwright does: a held request of
+   * another user context or of no frame goes on untouched, a site icon is
+   * aborted, a redirect hop goes on with what its first hop was continued
+   * with, a CORS preflight is answered while routes are set, and the rest
+   * go through the routes.
    */
   private onRequest(event: BidiEventParams<'network.beforeRequestSent'>): void {
+    const request = event.request.request;
     const blocked = event.isBlocked && (event.intercepts ?? []).some((intercept) => this.intercepts.has(intercept));
+    const pass = (overrides: Partial<Network.ContinueRequestParameters> = {}): void => {
+      void this.connection.send('network.continueRequest', { request, ...overrides }).catch((cause: unknown) => this.fail(cause));
+    };
     if (!this.options.ours(event)) {
-      if (blocked) void this.connection.send('network.continueRequest', { request: event.request.request }).catch((cause: unknown) => this.fail(cause));
+      if (blocked) pass();
       return;
     }
-    if (this.options.onPage(event.context)) this.inflight.add(event.request.request);
+    const headers = headerRecord(event.request.headers);
+    if (this.options.onPage(event.context) && headers['accept'] !== 'text/event-stream') this.inflight.add(request);
     if (!blocked) return;
-    const decide = event.context !== null && this.blank.has(event.context) ? this.answerBlank(event) : this.route(event);
+    if (event.context === null) {
+      pass();
+      return;
+    }
+    if (stripHash(event.request.url).endsWith('/favicon.ico')) {
+      void unlessCancelled(this.connection.send('network.failRequest', { request })).catch((cause: unknown) => this.fail(cause));
+      return;
+    }
+    if (event.redirectCount > 0) {
+      pass(this.redirectHeaders(event, headers));
+      return;
+    }
+    if (event.request.method === 'OPTIONS' && headers['access-control-request-method'] !== undefined && this.routes.length > 0) {
+      void this.answerPreflight(request, headers).catch((cause: unknown) => this.fail(cause));
+      return;
+    }
+    const decide = this.blank.has(event.context) ? this.answerBlank(event) : this.route(event);
     void decide.catch(async (cause: unknown) => {
-      await releaseQuietly(this.connection.send('network.failRequest', { request: event.request.request }));
+      await releaseQuietly(this.connection.send('network.failRequest', { request }));
       this.fail(cause);
     });
+  }
+
+  /**
+   * The headers a redirect hop of a request a route continued goes on with:
+   * the route's overrides applied again to the hop's own headers, as
+   * Playwright does (a redirect is never routed again), without the body's
+   * headers when the redirect turned a POST into a GET; the site headers
+   * otherwise.
+   */
+  private redirectHeaders(event: BidiEventParams<'network.beforeRequestSent'>, headers: Record<string, string>): Partial<Network.ContinueRequestParameters> {
+    const continued = this.continuedHeaders.get(event.request.request);
+    const site = this.options.siteHeaders(stripHash(event.request.url));
+    if (continued === undefined) return site === undefined ? {} : { headers: wireHeaders({ ...headers, ...site }) };
+    const applied = { ...applyHeaderOverrides(headers, continued.headers, this.options.browser === 'chromium'), ...site };
+    if (continued.method === 'POST' && event.request.method === 'GET') {
+      for (const name of REQUEST_BODY_HEADERS) delete applied[name];
+    }
+    return { headers: wireHeaders(applied) };
+  }
+
+  /** Answers a CORS preflight while routes are set, accepting it as Playwright does: a route on the URL means the test meant the request to go. */
+  private async answerPreflight(request: string, headers: Record<string, string>): Promise<void> {
+    const answer: Record<string, string> = {
+      'access-control-allow-origin': headers['origin'] ?? '*',
+      'access-control-allow-methods': headers['access-control-request-method'] ?? '',
+      'access-control-allow-credentials': 'true',
+      ...(headers['access-control-request-headers'] === undefined ? {} : { 'access-control-allow-headers': headers['access-control-request-headers'] }),
+    };
+    await this.connection.send('network.provideResponse', { request, statusCode: 204, reasonPhrase: 'No Content', headers: wireHeaders(answer) });
   }
 
   /** Answers a document request with an empty page; any other request of a blank-served tab fails. */
@@ -343,21 +404,23 @@ export class AttemptNetwork {
 
   /**
    * Hands a failure of an unawaited path to the attempt. A request the
-   * browser already let go (the page navigated away under it) is no failure.
+   * browser already let go (the page navigated away under it, or cancelled
+   * it) is no failure.
    */
   private fail(cause: unknown): void {
-    if (cause instanceof BidiError && cause.error === 'no such request') return;
+    if (cancelledRequest(cause)) return;
     this.options.onFailure(cause instanceof Error ? cause : new Error(String(cause)));
   }
 
   /** Runs the matching routes newest first, then lets the request through with the site headers. */
   private async route(event: BidiEventParams<'network.beforeRequestSent'>): Promise<void> {
     const request = event.request;
-    const url = URL.canParse(request.url) ? new URL(request.url) : undefined;
+    const address = stripHash(request.url);
+    const url = URL.canParse(address) ? new URL(address) : undefined;
     const matching = url === undefined ? [] : this.routes.filter((route) => route.predicate(url)).toReversed();
     const intercepted: InterceptedRequest = {
       id: request.request,
-      url: request.url,
+      url: address,
       method: request.method,
       headers: headerRecord(request.headers),
       ...(request.cookies.length === 0 ? {} : { cookie: request.cookies.map((cookie) => `${cookie.name}=${bytesText(cookie.value)}`).join('; ') }),
@@ -366,18 +429,16 @@ export class AttemptNetwork {
     for (const route of matching) {
       let passed = false;
       await route.handle(intercepted, {
-        continue: (overrides) => this.continue(intercepted, overrides),
-        fulfill: (response) => this.fulfill(intercepted.id, response),
-        abort: async () => {
-          await this.connection.send('network.failRequest', { request: intercepted.id });
-        },
+        continue: (overrides) => unlessCancelled(this.continue(intercepted, overrides)),
+        fulfill: (response) => unlessCancelled(this.fulfill(intercepted, response)),
+        abort: () => unlessCancelled(this.connection.send('network.failRequest', { request: intercepted.id })),
         fallback: async () => {
           passed = true;
         },
       });
       if (!passed) return;
     }
-    await this.continue(intercepted);
+    await unlessCancelled(this.continue(intercepted));
   }
 
   /** The request's body when the collector kept one, as text and bytes; a body it did not keep (too large, a stream) is marked unavailable. */
@@ -394,13 +455,23 @@ export class AttemptNetwork {
     }
   }
 
-  /** Lets a held request go on, with its overrides and, for the app's site, the configured headers. */
+  /**
+   * Lets a held request go on, with its overrides and, for the app's site,
+   * the configured headers. Header overrides follow Playwright's rules: a
+   * header the browser owns (cookie, host, origin, content-length, `sec-*`
+   * and the like) keeps the browser's value, and a new body sets its own
+   * `content-length` on a browser that would keep the old one. The headers sent are kept for the request's redirect
+   * hops (`redirectHeaders`).
+   */
   private async continue(
     request: InterceptedRequest,
     overrides: { url?: string; method?: string; headers?: Record<string, string>; postData?: string } = {},
   ): Promise<void> {
     const site = this.options.siteHeaders(overrides.url ?? request.url);
-    const headers = overrides.headers === undefined && site === undefined ? undefined : { ...lowercaseNames(overrides.headers ?? request.headers), ...site };
+    let headers = overrides.headers === undefined ? undefined : applyHeaderOverrides(request.headers, lowercaseNames(overrides.headers), this.options.browser === 'chromium');
+    if (overrides.postData !== undefined && this.options.browser === 'firefox') headers = { ...(headers ?? request.headers), 'content-length': String(Buffer.byteLength(overrides.postData)) };
+    if (site !== undefined) headers = { ...(headers ?? request.headers), ...site };
+    if (headers !== undefined) this.continuedHeaders.set(request.id, { headers, method: overrides.method ?? request.method });
     await this.connection.send('network.continueRequest', {
       request: request.id,
       ...(overrides.url === undefined ? {} : { url: overrides.url }),
@@ -410,25 +481,44 @@ export class AttemptNetwork {
     });
   }
 
-  /** Answers a held request with a response the test wrote; a `path` body's type follows its extension. */
+  /**
+   * Answers a held request with a response the test wrote; a `path` body's
+   * type follows its extension. As Playwright's fulfill: the status carries
+   * its reason phrase, a cross-origin request gets CORS headers unless the
+   * response sets its own, and the body is kept for a response wait to read,
+   * since a browser keeps no body it did not load.
+   */
   private async fulfill(
-    request: string,
+    request: InterceptedRequest,
     response: { status: number; headers: Record<string, string>; contentType?: string; body?: string; json?: unknown; path?: string },
   ): Promise<void> {
     const headers = { ...lowercaseNames(response.headers) };
-    let body: Network.BytesValue;
+    let body: Buffer;
     if (response.json !== undefined) {
-      body = { type: 'string', value: JSON.stringify(response.json) };
+      body = Buffer.from(JSON.stringify(response.json));
       headers['content-type'] ??= 'application/json';
     } else if (response.path !== undefined) {
-      body = { type: 'base64', value: (await readFile(response.path)).toString('base64') };
+      body = await readFile(response.path);
       const type = CONTENT_TYPES[path.extname(response.path).toLowerCase()];
       if (type !== undefined) headers['content-type'] ??= type;
     } else {
-      body = { type: 'string', value: response.body ?? '' };
+      body = Buffer.from(response.body ?? '');
     }
     if (response.contentType !== undefined) headers['content-type'] = response.contentType;
-    await this.connection.send('network.provideResponse', { request, statusCode: response.status, headers: wireHeaders(headers), body });
+    const origin = request.headers['origin'];
+    if (origin !== undefined && URL.canParse(request.url) && new URL(request.url).origin !== origin.trim() && headers['access-control-allow-origin'] === undefined) {
+      headers['access-control-allow-origin'] = origin;
+      headers['access-control-allow-credentials'] = 'true';
+      headers['vary'] = 'Origin';
+    }
+    this.fulfilledBodies.set(request.id, body);
+    await this.connection.send('network.provideResponse', {
+      request: request.id,
+      statusCode: response.status,
+      reasonPhrase: STATUS_CODES[response.status] ?? 'Unknown',
+      headers: wireHeaders(headers),
+      body: { type: 'base64', value: body.toString('base64') },
+    });
   }
 
   /** Answers the attempt's basic-auth challenge with the credentials once; a second one for the same request means they were refused, and lets the 401 through. */
@@ -446,7 +536,9 @@ export class AttemptNetwork {
   }
 
   /** A request finished: once none is in flight, the idle window starts. */
-  private settle(event: { readonly request: Network.RequestData; readonly userContext?: string | null; readonly context: string | null }): void {
+  private settle(event: { readonly request: Network.RequestData; readonly userContext?: string | null; readonly context: string | null; readonly response?: Network.ResponseData }): void {
+    const status = event.response?.status ?? 0;
+    if (status < 300 || status >= 400) this.continuedHeaders.delete(event.request.request);
     if (!this.inflight.delete(event.request.request)) return;
     if (this.inflight.size === 0) this.lastSettled = Date.now();
   }
@@ -478,7 +570,7 @@ export class AttemptNetwork {
   async waitForResponse(matches: (url: string) => boolean, signal: AbortSignal): Promise<ObservedResponse> {
     const connection = this.connection;
     const wanted = (event: { readonly context: string | null; readonly request: Network.RequestData }): boolean =>
-      this.options.onPage(event.context) && matches(event.request.url);
+      this.options.onPage(event.context) && matches(stripHash(event.request.url));
     const finished = new Map<string, string | null>();
     let matched: string | undefined;
     let settled: () => void = () => undefined;
@@ -499,7 +591,7 @@ export class AttemptNetwork {
     let started: (event: BidiEventParams<'network.responseStarted'>) => void = () => undefined;
     const first = new Promise<BidiEventParams<'network.responseStarted'>>((resolve) => (started = resolve));
     const offStart = connection.on('network.responseStarted', (event) => {
-      if (this.options.onPage(event.context) && matches(event.response.url)) started(event);
+      if (this.options.onPage(event.context) && matches(stripHash(event.response.url))) started(event);
     });
     try {
       const collector = await this.collectResponses();
@@ -519,11 +611,13 @@ export class AttemptNetwork {
       });
       loaded.catch(() => undefined);
       return {
-        url: event.response.url,
+        url: stripHash(event.response.url),
         status: event.response.status,
         headers: headerRecord(event.response.headers),
         body: async () => {
           await loaded;
+          const fulfilled = this.fulfilledBodies.get(request);
+          if (fulfilled !== undefined) return fulfilled;
           const data = await connection.send('network.getData', { dataType: 'response', request, collector });
           return data.bytes.type === 'string' ? Buffer.from(data.bytes.value) : Buffer.from(data.bytes.value, 'base64');
         },
@@ -596,6 +690,56 @@ function headerRecord(headers: readonly Network.Header[]): Record<string, string
     out[name] = out[name] === undefined ? value : `${out[name]}, ${value}`;
   }
   return out;
+}
+
+/** Headers a route may not override, as Playwright's `isForbiddenHeader` names them: the browser's value stands. */
+const FORBIDDEN_HEADERS = new Set([
+  'accept-charset', 'accept-encoding', 'access-control-request-headers', 'access-control-request-method', 'connection',
+  'content-length', 'cookie', 'date', 'dnt', 'expect', 'host', 'keep-alive', 'origin', 'referer', 'set-cookie', 'te',
+  'trailer', 'transfer-encoding', 'upgrade', 'via',
+]);
+
+/** The headers of a request body, which a redirect from a POST to a GET drops. */
+const REQUEST_BODY_HEADERS = ['content-encoding', 'content-language', 'content-location', 'content-type'];
+
+/** Whether a route may not override header `name` (with `value`), Playwright's rule. */
+function isForbiddenHeader(name: string, value: string): boolean {
+  if (FORBIDDEN_HEADERS.has(name) || name.startsWith('proxy-') || name.startsWith('sec-')) return true;
+  return ['x-http-method', 'x-http-method-override', 'x-method-override'].includes(name) && ['CONNECT', 'TRACE', 'TRACK'].includes(value.toUpperCase());
+}
+
+/**
+ * A route's header overrides applied to the request's own headers, as
+ * Playwright's `applyHeadersOverrides`: the browser's forbidden headers stay,
+ * the route's others replace the rest. With `freshCookies` (Chromium, which
+ * adds them itself) the cookie header is left out, so the browser sends the
+ * cookies its store holds when the request goes, not the ones it held when it
+ * was held.
+ */
+function applyHeaderOverrides(original: Readonly<Record<string, string>>, overrides: Readonly<Record<string, string>>, freshCookies: boolean): Record<string, string> {
+  const kept = Object.entries(original).filter(([name, value]) => isForbiddenHeader(name, value) && !(freshCookies && name === 'cookie'));
+  const allowed = Object.entries(overrides).filter(([name, value]) => !isForbiddenHeader(name, value));
+  return Object.fromEntries([...allowed, ...kept]);
+}
+
+/** Whether a decision failed because the page already cancelled the request it decides: no failure, as Playwright sends such decisions "may fail". */
+function cancelledRequest(cause: unknown): boolean {
+  return cause instanceof BidiError && (cause.error === 'no such request' || /Invalid InterceptionId/i.test(cause.message));
+}
+
+/** Waits for a decision on a held request, taking one the page already cancelled as made. */
+async function unlessCancelled(decision: Promise<unknown>): Promise<void> {
+  try {
+    await decision;
+  } catch (cause) {
+    if (!cancelledRequest(cause)) throw cause;
+  }
+}
+
+/** A URL without its fragment, which no request carries to the server and Playwright never reports. */
+function stripHash(url: string): string {
+  const hash = url.indexOf('#');
+  return hash === -1 ? url : url.slice(0, hash);
 }
 
 /** Errors that mean what a removal removes is already gone: the browser dropped it, or the browser itself is gone. */

@@ -27,6 +27,7 @@ function network(
     ours: (event) => options.ours?.(event.context) ?? true,
     onPage: (context) => options.onPage?.(context) ?? true,
     exclusive: options.exclusive ?? false,
+    browser: 'chromium',
     onFailure: (error) => failures.push(error),
     holdAll: options.holdAll ?? false,
   });
@@ -90,8 +91,9 @@ describe('AttemptNetwork', () => {
     expect(fake.commands('network.provideResponse')[0]?.params).toEqual({
       request: 'r1',
       statusCode: 201,
+      reasonPhrase: 'Created',
       headers: [{ name: 'content-type', value: { type: 'string', value: 'application/json' } }],
-      body: { type: 'string', value: '[{"name":"Stubbed"}]' },
+      body: { type: 'base64', value: Buffer.from('[{"name":"Stubbed"}]').toString('base64') },
     });
   });
 

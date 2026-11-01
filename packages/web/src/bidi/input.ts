@@ -5,7 +5,7 @@ import { EngineError, parseKey, TestError, type KeyModifier, type KeyName } from
 
 /** WebDriver's code points for the named keys (WebDriver spec, "Keyboard actions"). */
 const KEY_CODES: Readonly<Record<KeyName, string>> = {
-  Enter: '',
+  Enter: '',
   Escape: '',
   Tab: '',
   Backspace: '',
@@ -161,10 +161,39 @@ function isModifier(name: string): name is KeyModifier {
   return name === 'ControlOrMeta' || Object.hasOwn(MODIFIER_CODES, name);
 }
 
+/** Playwright key names for keys of the right-hand side and the numpad, as WebDriver code points. */
+const LOCATED_KEYS: Readonly<Record<string, string>> = {
+  ShiftLeft: '\uE008',
+  ControlLeft: '\uE009',
+  AltLeft: '\uE00A',
+  MetaLeft: '\uE03D',
+  ShiftRight: '\uE050',
+  ControlRight: '\uE051',
+  AltRight: '\uE052',
+  MetaRight: '\uE053',
+  NumpadEnter: '\uE007',
+  Numpad0: '\uE01A',
+  Numpad1: '\uE01B',
+  Numpad2: '\uE01C',
+  Numpad3: '\uE01D',
+  Numpad4: '\uE01E',
+  Numpad5: '\uE01F',
+  Numpad6: '\uE020',
+  Numpad7: '\uE021',
+  Numpad8: '\uE022',
+  Numpad9: '\uE023',
+  NumpadMultiply: '\uE024',
+  NumpadAdd: '\uE025',
+  NumpadSubtract: '\uE027',
+  NumpadDecimal: '\uE028',
+  NumpadDivide: '\uE029',
+};
+
 /** One Playwright key name as a WebDriver key value. */
 function fixtureKeyValue(name: string, shifted: boolean): string {
   if (isModifier(name)) return modifierCode(name);
   if (Object.hasOwn(KEY_CODES, name)) return KEY_CODES[name as KeyName];
+  if (Object.hasOwn(LOCATED_KEYS, name)) return LOCATED_KEYS[name]!;
   const physical = /^Key([A-Z])$/.exec(name)?.[1];
   if (physical !== undefined) return shifted ? physical : physical.toLowerCase();
   if (/^[a-z]$/.test(name) && shifted) return name.toUpperCase();

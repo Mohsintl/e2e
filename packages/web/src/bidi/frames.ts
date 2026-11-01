@@ -81,28 +81,99 @@ export interface SelectedElement {
 }
 
 /**
- * The elements of `selector` in document order, through open shadow roots
- * for CSS (`querySelectorAll` in the document and in each open root), as
- * Playwright's CSS engine reaches into them; a selector the page cannot
+ * The elements of `selector` in document order, through open shadow roots,
+ * as Playwright's CSS engine reads it: each compound is matched with the
+ * browser's own `matches`, and the combinators between compounds walk the
+ * composed tree, so a shadow host is the parent of its shadow root's
+ * children and `my-host .inner` reaches into it. A selector the page cannot
  * parse is `INVALID_LOCATOR`. Runs in the page.
  */
 function cssSelectAll(selector: string): { element: Element; localName: string }[] | string {
-  const out: { element: Element; localName: string }[] = [];
-  const roots: ParentNode[] = [document];
-  try {
-    for (let index = 0; index < roots.length; index += 1) {
-      for (const element of roots[index]!.querySelectorAll(selector)) out.push({ element, localName: element.localName });
-      for (const element of roots[index]!.querySelectorAll('*')) if (element.shadowRoot !== null) roots.push(element.shadowRoot);
+  type Step = { compound: string; combinator: ' ' | '>' | '+' | '~' | null };
+  const split = (text: string, at: (char: string) => boolean): { parts: string[]; separators: string[] } => {
+    const parts: string[] = [];
+    const separators: string[] = [];
+    let depth = 0;
+    let quote = '';
+    let current = '';
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index]!;
+      if (quote !== '') {
+        if (char === '\\') current += char + (text[++index] ?? '');
+        else {
+          if (char === quote) quote = '';
+          current += char;
+        }
+        continue;
+      }
+      if (char === '"' || char === "'") quote = char;
+      else if (char === '(' || char === '[') depth += 1;
+      else if (char === ')' || char === ']') depth -= 1;
+      else if (depth === 0 && at(char)) {
+        parts.push(current);
+        separators.push(char);
+        current = '';
+        continue;
+      }
+      current += char;
     }
+    parts.push(current);
+    return { parts, separators };
+  };
+  const steps = (complex: string): Step[] => {
+    const { parts, separators } = split(complex.trim(), (char) => char === '>' || char === '+' || char === '~');
+    const out: Step[] = [];
+    parts.forEach((part, index) => {
+      const compounds = split(part, (char) => /\s/.test(char)).parts.filter((compound) => compound !== '');
+      compounds.forEach((compound, inner) => {
+        out.push({ compound, combinator: inner > 0 ? ' ' : index > 0 ? (separators[index - 1] as '>' | '+' | '~') : null });
+      });
+    });
+    return out;
+  };
+  const parentOf = (element: Element): Element | null =>
+    element.parentElement ?? (element.parentNode !== null && element.parentNode.nodeType === 11 ? (element.parentNode as ShadowRoot).host : null);
+  const matchesFrom = (element: Element, chain: Step[], index: number): boolean => {
+    const step = chain[index]!;
+    if (!element.matches(step.compound)) return false;
+    if (index === 0) return true;
+    switch (step.combinator) {
+      case '>': {
+        const parent = parentOf(element);
+        return parent !== null && matchesFrom(parent, chain, index - 1);
+      }
+      case '+': {
+        const previous = element.previousElementSibling;
+        return previous !== null && matchesFrom(previous, chain, index - 1);
+      }
+      case '~':
+        for (let previous = element.previousElementSibling; previous !== null; previous = previous.previousElementSibling) if (matchesFrom(previous, chain, index - 1)) return true;
+        return false;
+      default:
+        for (let ancestor = parentOf(element); ancestor !== null; ancestor = parentOf(ancestor)) if (matchesFrom(ancestor, chain, index - 1)) return true;
+        return false;
+    }
+  };
+  try {
+    document.querySelector(selector);
+    const chains = split(selector, (char) => char === ',').parts.map(steps);
+    const out: { element: Element; localName: string }[] = [];
+    const visit = (root: Document | ShadowRoot): void => {
+      for (const element of root.querySelectorAll('*')) {
+        if (chains.some((chain) => matchesFrom(element, chain, chain.length - 1))) out.push({ element, localName: element.localName });
+        if (element.shadowRoot !== null) visit(element.shadowRoot);
+      }
+    };
+    visit(document);
+    return out;
   } catch (cause) {
     return cause instanceof Error ? cause.message : String(cause);
   }
-  return out;
 }
 
 /**
  * The elements `selector` matches in `context`'s document (see
- * `selectorLocator`): CSS through open shadow roots, as Playwright reads it,
+ * `selectorLocator`): CSS across open shadow roots, as Playwright reads it,
  * XPath through `browsingContext.locateNodes`, which stays in the light DOM
  * as Playwright's XPath does.
  */

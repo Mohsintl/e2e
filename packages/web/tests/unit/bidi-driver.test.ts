@@ -61,7 +61,7 @@ describe('BiDi input sources', () => {
 
   it('types one grapheme per key, a newline as Enter', () => {
     expect(typeSource('a👍🏽\n').actions.map((action) => (action.type === 'pause' ? '' : action.value))).toEqual([
-      'a', 'a', '👍🏽', '👍🏽', '', '',
+      'a', 'a', '👍🏽', '👍🏽', '', '',
     ]);
   });
 
