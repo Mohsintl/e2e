@@ -46,7 +46,7 @@ Experimental BiDi driver for `@e2e-dev/web` (`web({ driver: 'bidi' })` or `E2E_W
 
 ## Correctness
 
-Built packages, real CLI, after the last review round (c6fcde8f8). Testbed: 83 tests; web benchmark `tests/`: 91 tests.
+Built packages, real CLI, at 30f1ce3b4 (after review round 9 and the parity fixes). Testbed: 83 tests; web benchmark `tests/`: 91 tests.
 
 | Suite | PW chromium | BiDi chromium | PW firefox | BiDi firefox |
 | --- | --- | --- | --- | --- |
@@ -60,6 +60,23 @@ Every remaining failure, justified:
 - **Playwright Firefox, raw mouse drag on the pad** (testbed): fails on `main` too (3 of 3 runs at 1d671f678); Firefox reports `y` 19 for a fractional box where Chromium reports 20. Not this branch.
 - **BiDi Firefox, HTML5 drag and drop** (2 testbed, 2 benchmark): Firefox's remote agent ends the drag session on pointer up without synthesizing `drop` (its `EventUtils.js`: "TODO: This should synthesize drop"). `dragstart`, `dragenter`, `dragover` fire; `drop` and `dragend` never do. Same on stock Firefox 156, headed and headless, any move timing. Upstream: [bug 1515879](https://bugzilla.mozilla.org/show_bug.cgi?id=1515879) (NEW), fix path [bug 2051461](https://bugzilla.mozilla.org/show_bug.cgi?id=2051461) (ASSIGNED), [w3c/webdriver#1488](https://github.com/w3c/webdriver/issues/1488). Pointer-event drags (the kanban board) pass. A synthesized in-page `DragEvent` sequence would pass the tests with untrusted events, so it is left out.
 - **BiDi Firefox, `browser.emulateMedia`** (1 testbed): Firefox 157 does not implement `emulation.setMediaFeaturesOverride`; `prefers-color-scheme` landed in Firefox 159 ([bug 2064354](https://bugzilla.mozilla.org/show_bug.cgi?id=2064354), meta [bug 2064352](https://bugzilla.mozilla.org/show_bug.cgi?id=2064352)). Configured `colorScheme` / `reducedMotion` apply as launch prefs; a mid-test change refuses with that reason.
+
+## Parity with Playwright's own tests
+
+`packages/web/tests/parity` (landed separately in #1505, on the Playwright driver): 33 of Playwright's `tests/page` specs (plus `library/download.spec.ts`) at v1.64.1, 511 tests rewritten against the public API, run on all four combos. Playwright driver results are the baseline; a BiDi-only failure is our bug unless Playwright's own BiDi expectations (`tests/bidi/expectations/*.txt`) or the protocol show a browser gap.
+
+| Driver | Chromium | Firefox |
+| --- | --- | --- |
+| Playwright | 486 pass, 25 skip | 477 pass, 34 skip |
+| BiDi | **473 pass, 38 skip** | **470 pass, 41 skip** |
+
+No failures. Skips on both drivers are e2e gaps (`e2eGap`, listed in #1505) or Playwright's own platform skips. BiDi-only skips (`bidiGap`), each with its upstream reference:
+
+- Chromium: `continueRequest` headers replace cookies; ACAO default, non-preflight OPTIONS, three CORS cases, unsafe header override; a child frame navigating its parent ("navigation canceled by concurrent navigation"); a frame rotated in 3D; Shift+Digit not shifted; navigation downloads reject with `net::ERR_ABORTED` before `downloadWillBegin`, so `goto` cannot say "Download is starting" (all listed in `bidi-chromium-page.txt` / `bidi-chromium-library.txt`); macOS editing key bindings (BiDi key actions carry no editing commands; macOS-only test).
+- Firefox: fresh cookie from the store, both EventSource network-idle tests, folder upload, 3D frame (`moz-firefox-nightly-page.txt`); Shift+numpad reads NumLock off; Alt types the Option layer on macOS.
+- Both: NumpadDecimal types "." (WebDriver numpad values are NumLock-on; Playwright's BiDi backend sends the same); media keys (WebDriver has no values; Playwright's BiDi backend throws "Unknown key").
+
+BiDi bugs the suite found and fixed here: Playwright's text, label, role, and hidden rules in locate; `hasText` on the whole node text; aria checked/pressed/expanded tri-state; scrollIntoView for zero-size, `visibility: hidden`, `display: contents`, partly clipped, quirks-mode, and oversized elements (Chromium's center-if-needed); classic scrollbars on Firefox; caret hidden in every shadow root; Playwright's fill, select, check, and key error messages; numpad, located, and `\n`/`\r` keys, Enter's code; non-ASCII typed as text; CSS combinators across shadow roots; focus that does not land is no error; a page's own `Event` replaced; disabled options and optgroups; a swapped `<select>` re-resolved; header overrides with Playwright's forbidden list; redirect hops reusing the continued headers; CORS preflights answered while routing; fulfill with a reason phrase, ACAO, and bodies served back to response waits; URL hashes stripped; requests with no frame let through; "Invalid InterceptionId" after a cancel; EventSource out of network idle; upload validation (missing files, directories); a held Chromium navigation POST no longer hangs on its body (Chrome never answers it, as [puppeteer#15607](https://github.com/puppeteer/puppeteer/pull/15607) found over CDP); Firefox `goto` fails with "Download is starting".
 
 ## Methodology
 
@@ -79,70 +96,69 @@ Every remaining failure, justified:
 
 | Scenario (ms) | playwright p50 / p95 / mean | bidi p50 / p95 / mean | BiDi vs PW (p50, 95% CI) |
 | --- | --- | --- | --- |
-| cold launch (init) | 58.1 / 66.5 / 60.0 | 79.8 / 88.1 / 80.6 | 1.37x (1.28-1.40) |
-| cold first page (startAttempt → open /forms → observe) | 49.8 / 59.3 / 51.0 | 48.2 / 50.0 / 48.7 | 0.97x (0.94-0.99) |
-| new context + page (startAttempt → first open) | 38.9 / 41.2 / 38.5 | 34.8 / 39.0 / 35.7 | 0.89x (0.86-0.93) |
-| navigate: testbed /forms | 7.4 / 7.6 / 7.4 | 6.6 / 6.9 / 6.5 | 0.90x (0.87-0.93) |
-| observe: testbed /forms | 10.3 / 10.9 / 10.4 | 7.8 / 8.4 / 7.9 | 0.75x (0.74-0.76) |
-| locate role+name: testbed /forms | 14.4 / 15.7 / 14.4 | 4.7 / 6.1 / 5.0 | 0.33x (0.32-0.33) |
-| click/type sequence: forms (5 actions) | 108 / 125 / 111 | 71.3 / 88.0 / 75.6 | 0.66x (0.65-0.67) |
-| screenshot: testbed /forms | 24.4 / 25.5 / 24.5 | 25.3 / 41.6 / 29.3 | 1.04x (1.03-1.05) |
-| navigate: testbed /scroll (8k px) | 3.9 / 4.2 / 3.9 | 4.1 / 4.7 / 4.2 | 1.06x (1.04-1.08) |
-| navigate: heavy page (9k elements) | 15.1 / 15.6 / 15.2 | 15.3 / 15.6 / 15.3 | 1.01x (1.00-1.02) |
-| observe: heavy page | 162 / 167 / 163 | 173 / 175 / 173 | 1.07x (1.05-1.07) |
-| observe + pixels: heavy page | 350 / 370 / 353 | 110 / 114 / 110 | 0.31x (0.31-0.32) |
-| locate role+name: heavy page | 192 / 222 / 196 | 103 / 106 / 103 | 0.54x (0.53-0.55) |
-| locate + fill + tap: heavy page | 74.3 / 83.5 / 75.1 | 39.2 / 44.2 / 38.9 | 0.53x (0.48-0.56) |
-| screenshot: heavy page | 36.1 / 36.5 / 36.0 | 53.9 / 55.4 / 53.9 | 1.49x (1.48-1.51) |
-| observe: /forms right after a heavy observation | 76.6 / 78.6 / 76.5 | 5.5 / 5.7 / 5.6 | 0.07x (0.07-0.07) |
-| agent flow: todos (open, 7 actions, 8 observations) | 257 / 274 / 263 | 192 / 193 / 192 | 0.75x (0.70-0.75) |
-| peak RSS, node + browser (MB) | 1371 | 1503 | |
-| node CPU, warm loop (s) | 17.6 | 1.3 | |
-| node + browser CPU, warm loop (s, floor) | 49.9 | 20.1 | |
+| cold launch (init) | 66.3 / 90.6 / 69.8 | 91.6 / 197 / 111 | 1.38x (1.20-1.74) |
+| cold first page (startAttempt → open /forms → observe) | 57.2 / 73.8 / 58.5 | 52.4 / 78.2 / 57.7 | 0.92x (0.86-1.08) |
+| new context + page (startAttempt → first open) | 39.7 / 46.5 / 40.4 | 36.7 / 40.8 / 37.0 | 0.92x (0.87-0.95) |
+| navigate: testbed /forms | 7.4 / 8.1 / 7.6 | 6.7 / 7.3 / 6.7 | 0.90x (0.88-0.93) |
+| observe: testbed /forms | 10.4 / 11.4 / 10.6 | 7.9 / 8.6 / 8.0 | 0.76x (0.74-0.78) |
+| locate role+name: testbed /forms | 14.3 / 15.4 / 14.5 | 5.0 / 6.6 / 5.3 | 0.35x (0.34-0.37) |
+| click/type sequence: forms (5 actions) | 109 / 125 / 112 | 71.6 / 87.7 / 76.8 | 0.66x (0.65-0.67) |
+| screenshot: testbed /forms | 24.4 / 25.6 / 24.3 | 24.4 / 39.1 / 25.6 | 1.00x (0.99-1.01) |
+| navigate: testbed /scroll (8k px) | 3.9 / 4.2 / 4.0 | 4.2 / 4.8 / 4.3 | 1.07x (1.04-1.09) |
+| navigate: heavy page (9k elements) | 15.4 / 16.3 / 15.5 | 15.5 / 16.1 / 15.6 | 1.00x (0.99-1.02) |
+| observe: heavy page | 163 / 175 / 165 | 174 / 183 / 176 | 1.07x (1.05-1.08) |
+| observe + pixels: heavy page | 358 / 391 / 365 | 124 / 140 / 127 | 0.35x (0.33-0.36) |
+| locate role+name: heavy page | 200 / 233 / 207 | 98.6 / 101 / 98.2 | 0.49x (0.45-0.52) |
+| locate + fill + tap: heavy page | 76.8 / 83.7 / 76.9 | 39.7 / 44.6 / 40.0 | 0.52x (0.50-0.55) |
+| screenshot: heavy page | 36.1 / 53.4 / 39.4 | 45.2 / 51.7 / 45.3 | 1.25x (1.21-1.31) |
+| observe: /forms right after a heavy observation | 77.6 / 93.0 / 81.2 | 6.4 / 7.6 / 6.7 | 0.08x (0.08-0.09) |
+| agent flow: todos (open, 7 actions, 8 observations) | 273 / 295 / 273 | 177 / 196 / 180 | 0.65x (0.64-0.71) |
+| peak RSS, node + browser (MB) | 1405 | 1542 | |
+| node CPU, warm loop (s) | 18.5 | 1.4 | |
+| node + browser CPU, warm loop (s, floor) | 51.7 | 20.3 | |
 
 ### firefox
 
 | Scenario (ms) | playwright p50 / p95 / mean | bidi p50 / p95 / mean | BiDi vs PW (p50, 95% CI) |
 | --- | --- | --- | --- |
-| cold launch (init) | 310 / 334 / 314 | 912 / 939 / 914 | 2.94x (2.84-2.99) |
-| cold first page (startAttempt → open /forms → observe) | 485 / 494 / 485 | 152 / 170 / 153 | 0.31x (0.30-0.32) |
-| new context + page (startAttempt → first open) | 110 / 313 / 150 | 126 / 141 / 130 | 1.15x (1.10-1.26) |
-| navigate: testbed /forms | 17.5 / 48.6 / 20.5 | 13.9 / 23.2 / 16.3 | 0.79x (0.76-1.08) |
-| observe: testbed /forms | 12.1 / 47.5 / 17.8 | 12.3 / 36.7 / 15.8 | 1.02x (0.88-1.05) |
-| locate role+name: testbed /forms | 17.8 / 24.2 / 18.9 | 6.8 / 7.9 / 6.1 | 0.38x (0.23-0.43) |
-| click/type sequence: forms (5 actions) | 172 / 266 / 188 | 79.5 / 92.0 / 82.7 | 0.46x (0.44-0.52) |
-| screenshot: testbed /forms | 12.5 / 19.3 / 14.1 | 11.8 / 17.5 / 13.2 | 0.95x (0.83-1.02) |
-| navigate: testbed /scroll (8k px) | 6.4 / 6.9 / 6.5 | 7.8 / 8.9 / 8.1 | 1.21x (1.16-1.33) |
-| navigate: heavy page (9k elements) | 50.1 / 51.3 / 50.3 | 50.9 / 53.6 / 51.5 | 1.02x (1.01-1.04) |
-| observe: heavy page | 146 / 154 / 148 | 166 / 179 / 168 | 1.14x (1.11-1.16) |
-| observe + pixels: heavy page | 476 / 491 / 477 | 105 / 111 / 104 | 0.22x (0.21-0.22) |
-| locate role+name: heavy page | 175 / 209 / 180 | 111 / 115 / 111 | 0.63x (0.62-0.64) |
-| locate + fill + tap: heavy page | 93.6 / 108 / 94.3 | 52.2 / 58.8 / 52.9 | 0.56x (0.53-0.62) |
-| screenshot: heavy page | 26.7 / 28.1 / 26.9 | 21.6 / 29.3 / 22.8 | 0.81x (0.77-0.83) |
-| observe: /forms right after a heavy observation | 83.0 / 85.3 / 83.0 | 8.4 / 9.1 / 8.5 | 0.10x (0.10-0.10) |
-| agent flow: todos (open, 7 actions, 8 observations) | 418 / 438 / 421 | 275 / 298 / 276 | 0.66x (0.63-0.68) |
-| peak RSS, node + browser (MB) | 2327 | 2579 | |
-| node CPU, warm loop (s) | 17.7 | 2.1 | |
-| node + browser CPU, warm loop (s, floor) | 77.0 | 32.9 | |
-
-"observe: /forms right after a heavy observation" isolates a Playwright cost: the next observation releases the previous generation's ~3k element handles, one protocol call each. BiDi shared ids need no release. The agent flow no longer follows that row's release directly (attempt setup now sits between them, untimed), so its gap is the steady per-step cost.
+| cold launch (init) | 314 / 324 / 316 | 925 / 960 / 929 | 2.95x (2.91-2.97) |
+| cold first page (startAttempt → open /forms → observe) | 488 / 501 / 489 | 145 / 168 / 150 | 0.30x (0.29-0.32) |
+| new context + page (startAttempt → first open) | 111 / 316 / 152 | 135 / 146 / 132 | 1.22x (1.08-1.27) |
+| navigate: testbed /forms | 17.6 / 43.8 / 20.4 | 14.3 / 25.1 / 16.9 | 0.81x (0.77-1.12) |
+| observe: testbed /forms | 12.7 / 34.6 / 17.6 | 11.5 / 27.2 / 13.2 | 0.91x (0.67-1.03) |
+| locate role+name: testbed /forms | 18.2 / 23.7 / 19.9 | 7.3 / 7.9 / 6.4 | 0.40x (0.24-0.43) |
+| click/type sequence: forms (5 actions) | 171 / 191 / 174 | 76.8 / 87.5 / 77.9 | 0.45x (0.44-0.46) |
+| screenshot: testbed /forms | 14.1 / 19.0 / 15.4 | 12.1 / 17.4 / 13.2 | 0.86x (0.78-0.95) |
+| navigate: testbed /scroll (8k px) | 6.5 / 8.0 / 6.7 | 8.0 / 9.2 / 8.0 | 1.23x (1.18-1.29) |
+| navigate: heavy page (9k elements) | 50.5 / 54.1 / 51.3 | 51.3 / 54.9 / 51.6 | 1.02x (0.98-1.04) |
+| observe: heavy page | 149 / 153 / 149 | 165 / 173 / 166 | 1.11x (1.10-1.12) |
+| observe + pixels: heavy page | 471 / 496 / 478 | 110 / 116 / 111 | 0.23x (0.22-0.24) |
+| locate role+name: heavy page | 178 / 195 / 180 | 110 / 116 / 111 | 0.62x (0.60-0.64) |
+| locate + fill + tap: heavy page | 91.4 / 102 / 93.8 | 46.5 / 52.6 / 47.5 | 0.51x (0.49-0.52) |
+| screenshot: heavy page | 27.1 / 31.4 / 28.0 | 20.7 / 28.7 / 22.3 | 0.77x (0.75-0.81) |
+| observe: /forms right after a heavy observation | 83.5 / 86.5 / 83.5 | 8.3 / 10.1 / 9.0 | 0.10x (0.10-0.11) |
+| agent flow: todos (open, 7 actions, 8 observations) | 418 / 458 / 421 | 269 / 293 / 271 | 0.64x (0.62-0.66) |
+| peak RSS, node + browser (MB) | 2351 | 2644 | |
+| node CPU, warm loop (s) | 18.0 | 2.4 | |
+| node + browser CPU, warm loop (s, floor) | 77.7 | 33.7 | |
 
 ## Totals
 
 | Total | playwright chromium | bidi chromium | playwright firefox | bidi firefox | BiDi vs PW chromium | BiDi vs PW firefox |
 | --- | --- | --- | --- | --- | --- | --- |
-| sum of p50s, every scenario (ms) | 1479 | 974 | 2611 | 2112 | -34% | -19% |
-| sum of means, every scenario (ms) | 1499 | 985 | 2696 | 2133 | -34% | -21% |
-| realistic test: cold launch + new page + 6 agent steps (ms) | 311 | 273 | 762 | 1262 | -12% | +65% |
-| testbed wall clock, median of 3 (ms) | 17563 | 16885 | 21120 | 21036 | -4% | -0% |
-| node CPU, warm loop (s) | 17.6 | 1.3 | 17.7 | 2.1 | -93% | -88% |
-| node + browser CPU, warm loop (s, floor) | 49.9 | 20.1 | 77.0 | 32.9 | -60% | -57% |
-| peak RSS, node + browser (MB) | 1371 | 1503 | 2327 | 2579 | +10% | +11% |
+| sum of p50s, every scenario (ms) | 1534 | 981 | 2623 | 2116 | -36% | -19% |
+| sum of means, every scenario (ms) | 1566 | 1021 | 2697 | 2135 | -35% | -21% |
+| realistic test: cold launch + new page + 6 agent steps (ms) | 334 | 274 | 768 | 1279 | -18% | +66% |
+| testbed wall clock, median of 3 (ms) | 17525 | 16895 | 21102 | 20980 | -4% | -1% |
+| node CPU, warm loop (s) | 18.5 | 1.4 | 18.0 | 2.4 | -92% | -87% |
+| node + browser CPU, warm loop (s, floor) | 51.7 | 20.3 | 77.7 | 33.7 | -61% | -57% |
+| peak RSS, node + browser (MB) | 1405 | 1542 | 2351 | 2644 | +10% | +12% |
 
 - **Sum of p50s / means:** every scenario of the tables above added up, cold rows included.
 - **Realistic test:** one cold launch, one new context and page, and N agent steps, with N = 6: the testbed averages 6.25 steps per test (79 tests, `.e2e/report.json`, median 5). An agent step is the agent flow's p50, less one navigation, over its 7 actions (each with the observation before it). Firefox's BiDi cold launch (~0.9 s, inherent to the Remote Agent, below) dominates its row: it is paid once per worker, not per test.
 - **Testbed wall clock:** the whole testbed through the CLI, same machine, the testbed's own concurrency, median of 3 interleaved runs per driver. All 12 runs passed; on Firefox both drivers leave out the same 4 tests (BiDi's 3 upstream gaps and the pad drag Playwright's Firefox fails on main).
-- **Overall:** on Chromium BiDi is 34% faster summed over scenarios, 12% faster on a realistic test, and 4% faster on the whole testbed, with 93% less node CPU and 10% more memory. On Firefox it is 19-21% faster summed over scenarios and level on the testbed, but 65% slower on a single realistic test because of the cold launch, with 11% more memory.
+- **Overall:** on Chromium BiDi is 35-36% faster summed over scenarios, 18% faster on a realistic test, and 4% faster on the whole testbed, with 92% less node CPU and 10% more memory. On Firefox it is 19-21% faster summed over scenarios and level on the testbed (-1%), but 66% slower on a single realistic test because of the cold launch, with 12% more memory.
+- **After the parity fixes** (30f1ce3b4) against the totals before them (c6fcde8f8): every total within noise or better (sum of p50s 974 → 981 ms Chromium, 2112 → 2116 ms Firefox; testbed 16885 → 16895 ms and 21036 → 20980 ms). The hit interceptor, Playwright-rule locate, and reader-based disabled check cost no measurable time.
 
 ## What changed since the first pass, and why
 
@@ -155,7 +171,7 @@ Every remaining failure, justified:
 
 ## Review rounds
 
-Six rounds of line-by-line review of the full diff (an independent reviewer model, read-only), each fixed in focused commits before the next:
+Nine rounds of line-by-line review of the full diff (an independent reviewer model, read-only), each fixed in focused commits before the next:
 
 | Round | Critical | Important | Nit | Resolution |
 | --- | --- | --- | --- | --- |
@@ -164,7 +180,10 @@ Six rounds of line-by-line review of the full diff (an independent reviewer mode
 | 3 | 0 | 15 | 1 | all fixed |
 | 4 | 0 | 10 | 3 | all fixed |
 | 5 | 0 | 6 | 0 | all fixed |
-| 6 | 1 | 4 | 0 | all fixed and verified in both browsers; the cap of 6 rounds left no seventh review of these fixes |
+| 6 | 1 | 4 | 0 | all fixed and verified in both browsers |
+| 7 | 0 | 7 | 0 | all fixed (slotted mask placement, mirrored slotted frames, cleanup that retires the browser, owned setup, bounded cookie writes, masks out of the tree, reader-based disabled check) |
+| 8 | 0 | 8 | 1 | all fixed (disabled descendants retargeted, event-time hit interceptor, exact projected click point, containing-block clipping, fill/select without pointer stability, replacement intercepts owned, late setup cleanup, cancellation before cookie writes); benchmark refreshed |
+| 9 | 0 | 7 | 0 | all fixed (unseen click may have committed, interceptor preloaded before app scripts, closed shadow roots, setup rejection observed at once, failed removals kept owed, user contexts retried, fixed elements clipped by a transformed containing block); the cap of 3 more rounds left no tenth review of these fixes |
 
 What the rounds changed most: screenshot masking fails closed (top layer, page CSS, scaled dialogs, coverage proven after capture); retry safety (`ACTION_MAY_HAVE_COMMITTED` after any dispatch, cancellation checked before every dispatch); ownership of every browser-side resource (launches, user contexts, intercepts, collectors, preload scripts, ffmpeg, scratch tabs) through cancellation and cleanup; saved sessions with every origin's localStorage and IndexedDB; locator parity (labels, display values, shadow roots, frames, transforms).
 
@@ -172,23 +191,23 @@ What the rounds changed most: screenshot masking fails closed (top layer, page C
 
 **Faster on BiDi:**
 
-- The agent step is 1.3-1.5x faster (agent flow p50 0.66-0.75x).
-- Observing with pixels is 3.2-4.5x faster.
-- Locate is 1.6-3x faster on small and heavy pages; locate plus actions about 1.8-1.9x.
-- Summed over every scenario, 34% (Chromium) and 19% (Firefox) less time.
-- Node CPU in the warm loop is 8-14x lower.
+- The agent step is 1.5-1.6x faster (agent flow p50 0.64-0.65x).
+- Observing with pixels is 2.9-4.3x faster.
+- Locate is 1.6-3x faster on small and heavy pages; locate plus actions about 1.9-2x.
+- Summed over every scenario, 36% (Chromium) and 19% (Firefox) less time.
+- Node CPU in the warm loop is 7-13x lower.
 
 **Slower or heavier on BiDi:**
 
-- Firefox cold launch is about 3x slower (912 vs 310 ms), inherent to the Remote Agent and paid once per worker.
-- Chromium cold launch is +22 ms (the mapper process).
-- Chromium full-viewport screenshots of the heavy page are 1.5x slower.
-- 10-11% more peak memory.
+- Firefox cold launch is about 3x slower (925 vs 314 ms), inherent to the Remote Agent and paid once per worker.
+- Chromium cold launch is +25 ms (the mapper process).
+- Chromium full-viewport screenshots of the heavy page are 1.25x slower.
+- 10-12% more peak memory.
 
-**Worth switching?** On Chromium, plausibly: parity on both suites, a CI gate on the testbed, and a faster agent loop and testbed. Not yet the default, because:
+**Worth switching?** On Chromium, plausibly: parity on both suites and on Playwright's own tests, a CI gate on the testbed and the parity suite, and a faster agent loop and testbed. Not yet the default, because:
 
 - the persistent remote context mode is not built;
-- a few documented limits remain (Playwright selector chains, CSS combinators across shadow roots, rotated or mirrored frames);
+- a few documented limits remain (Playwright selector chains, rotated or mirrored frames, the BiDi-only parity skips above);
 - Firefox waits on two upstream items (HTML5 drag-and-drop, media emulation in 159).
 
 Next steps: run BiDi Chromium beside Playwright in CI for a while, build the persistent context mode, then decide on the default.
