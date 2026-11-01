@@ -16,6 +16,7 @@ import { EngineError } from 'e2e/engine';
 import { browserType } from '../browser-connection.ts';
 import { headlessShellExecutable } from '../install.ts';
 import { BidiConnection, webSocketTransport, type BidiTransport } from './connection.ts';
+import { releaseQuietly } from './errors.ts';
 import { MAPPER_READY } from './mapper-process.ts';
 
 /** The browsers the BiDi driver launches. WebKit has no BiDi endpoint yet. */
@@ -199,7 +200,7 @@ export async function launchBidiBrowser(name: BidiBrowserName, options: BidiLaun
       connection,
       close: async () => {
         await Promise.race([
-          connection.send('browser.close', {}).catch(() => undefined),
+          releaseQuietly(connection.send('browser.close', {})),
           new Promise((resolve) => setTimeout(resolve, 2_000)),
         ]);
         connection.close();
@@ -234,7 +235,7 @@ export async function connectBidiOverCdp(endpoint: string, timeoutMs: number): P
       version,
       connection,
       close: async () => {
-        await Promise.race([connection.send('session.end', {}).catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+        await Promise.race([releaseQuietly(connection.send('session.end', {})), new Promise((resolve) => setTimeout(resolve, 2_000))]);
         connection.close();
       },
     };

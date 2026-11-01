@@ -38,6 +38,7 @@ import { MEDIA_KEYS, mediaProblem } from '../media.ts';
 import { parseContinue, parseFulfill, requireNoArguments } from '../route-options.ts';
 import { routePatternMatches, routePatternsEqual } from '../route-pattern.ts';
 import { isClassified, message as causeMessage } from '../support.ts';
+import { releaseQuietly } from './errors.ts';
 import type { InterceptedRequest, NetworkRoute, ObservedResponse, RouteDecisions } from './network.ts';
 import { clickSources, moveSources, pressSource, typeSource, wheelSources } from './input.ts';
 import type { PageArgument } from './script.ts';
@@ -145,7 +146,6 @@ export function createBidiBrowserFixture(surface: BidiSurface, context: EngineFi
         const filter = Object.fromEntries(fields.flatMap((field) => (options?.[field] === undefined ? [] : [[field, options[field]]])));
         return surface.deleteCookies([filter], operation);
       }
-      // A RegExp filter is matched here, and each cookie it selects deleted by its exact identity.
       const matches = (await surface.cookies(operation)).filter((cookie) =>
         fields.every((field) => {
           const wanted = options?.[field];
@@ -231,7 +231,7 @@ async function handleRoute(
     try {
       await act();
     } catch (cause) {
-      await decisions.abort().catch(() => undefined);
+      await releaseQuietly(decisions.abort());
       throw cause;
     }
   };
@@ -279,7 +279,7 @@ async function handleRoute(
     if (!decided) throw new TestError('ACTION_FAILED', 'route handler returned without calling fulfill, continue, fallback, or abort');
   } catch (cause) {
     surface.latchFailure(isClassified(cause) || cause instanceof Error ? cause : new TestError('ACTION_FAILED', `route handler failed: ${causeMessage(cause)}`));
-    if (!decided) await decisions.abort().catch(() => undefined);
+    if (!decided) await releaseQuietly(decisions.abort());
   }
 }
 

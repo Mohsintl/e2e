@@ -71,6 +71,12 @@ export class BidiConnection {
     return this.send(method as BidiMethod, params as never);
   }
 
+  /** Subscribes to browser-specific extension events in `contexts`, which the spec's event names do not list; resolves with the subscription. */
+  async subscribeExtension(events: readonly `${string}:${string}`[], contexts: [string, ...string[]]): Promise<string> {
+    const { subscription } = await this.send('session.subscribe', { events: events as never, contexts });
+    return subscription;
+  }
+
   /** Listens for a browser-specific extension event, such as `goog:cdp.Page.screencastFrame`; returns the unsubscribe. */
   onExtension(event: `${string}:${string}`, handler: (params: Record<string, unknown>) => void): () => void {
     return this.on(event as BidiEventName, handler as never);

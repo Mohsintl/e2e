@@ -10,6 +10,7 @@
 
 import type { Input } from 'webdriver-bidi-protocol';
 import type { BidiConnection } from './connection.ts';
+import { releaseQuietly, unlessStale } from './errors.ts';
 import { callFunction } from './script.ts';
 
 type Point = { readonly x: number; readonly y: number };
@@ -61,17 +62,15 @@ export async function chromiumDrag(
   const off = connection.onExtension('goog:cdp.Input.dragIntercepted', (event) => {
     if (event['session'] === session) intercepted((event['params'] as { data: unknown }).data);
   });
-  // An extension event the spec's event names do not list.
-  const extensionEvent = 'goog:cdp.Input.dragIntercepted' as 'browsingContext.load';
-  const { subscription } = await connection.send('session.subscribe', { events: [extensionEvent], contexts: [context] });
+  const subscription = await connection.subscribeExtension(['goog:cdp.Input.dragIntercepted'], [context]);
   let data: unknown;
   try {
     await connection.send('input.performActions', {
       context,
       actions: [mouse([{ type: 'pointerMove', x: from.x, y: from.y, origin: 'viewport' }, { type: 'pointerDown', button: 0 }])],
     });
-    // Armed after the press, so the watcher sees the move that can start the drag, not the move to the press point.
-    await Promise.all(documents.map((each) => callFunction(connection, each, WATCH_DRAG).catch(() => undefined)));
+    // Armed after the press: armed before, it latches onto the move to the press point and misses the drag.
+    await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, WATCH_DRAG), undefined)));
     await cdp('Input.setInterceptDrags', { enabled: true });
     try {
       await connection.send('input.performActions', {
@@ -79,10 +78,10 @@ export async function chromiumDrag(
         // One discrete move, as Playwright's: an interpolated one would be checked before it passed the drag threshold.
         actions: [mouse([{ type: 'pointerMove', x: first.x, y: first.y, origin: 'viewport' }])],
       });
-      const started = await Promise.all(documents.map((each) => callFunction(connection, each, DRAG_STARTED, [], { awaitPromise: true }).catch(() => false)));
+      const started = await Promise.all(documents.map((each) => unlessStale(callFunction(connection, each, DRAG_STARTED, [], { awaitPromise: true }), false)));
       if (started.includes(true)) data = await dragData;
     } finally {
-      await cdp('Input.setInterceptDrags', { enabled: false }).catch(() => undefined);
+      await releaseQuietly(cdp('Input.setInterceptDrags', { enabled: false }));
     }
     if (data === undefined) {
       await connection.send('input.performActions', {
@@ -100,7 +99,7 @@ export async function chromiumDrag(
     await cdp('Input.dispatchDragEvent', { type: 'drop', x: last.x, y: last.y, data });
   } finally {
     off();
-    await connection.send('session.unsubscribe', { subscriptions: [subscription] }).catch(() => undefined);
-    await connection.send('input.releaseActions', { context }).catch(() => undefined);
+    await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
+    await releaseQuietly(connection.send('input.releaseActions', { context }));
   }
 }

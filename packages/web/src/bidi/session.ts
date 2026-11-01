@@ -148,6 +148,7 @@ export class BidiSession {
       siteHeaders: settings.siteHeaders,
       credentials: attempt.credentials,
       ours: (event) => this.owns(event.context),
+      onFailure: (error) => this.latch.latch(error),
       holdAll: settings.holdRequests,
     });
     this.downloads = new AttemptDownloads(browser.connection);

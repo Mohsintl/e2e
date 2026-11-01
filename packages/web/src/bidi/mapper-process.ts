@@ -15,11 +15,10 @@ import { pathToFileURL } from 'node:url';
 /** First line on stdout once the mapper serves, so the parent knows when to send. */
 export const MAPPER_READY = '{"e2e":"ready"}';
 
-/** Loads the mapper, then serves the CDP URL the first stdin line names until the parent or the browser goes away. */
+/** Loads the mapper (here, so the driver importing `MAPPER_READY` never does), then serves the CDP URL the first stdin line names until the parent or the browser goes away. */
 async function serve(): Promise<void> {
   // The mapper's own faults are logged and survived, never thrown: this process exists to absorb them.
   process.on('unhandledRejection', (reason) => process.stderr.write(`chromium-bidi: ${String(reason)}\n`));
-  // Loaded here, so the driver importing this module for `MAPPER_READY` never loads the mapper itself.
   const loading = Promise.all([
     import('chromium-bidi/out/Default/gen/src/bidiMapper/BidiMapper.js'),
     import('chromium-bidi/out/Default/gen/src/cdp/CdpConnection.js'),

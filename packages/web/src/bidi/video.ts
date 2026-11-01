@@ -15,6 +15,7 @@ import path from 'node:path';
 import { EngineError, type VideoFile } from 'e2e/engine';
 import { ffmpegExecutable } from '../install.ts';
 import type { BidiConnection } from './connection.ts';
+import { classify, isStale, releaseQuietly, unlessStale } from './errors.ts';
 import type { BidiBrowserName } from './launch.ts';
 
 /** Frames a second of the encoded video. */
@@ -105,12 +106,12 @@ export class BidiVideo {
       video: { width: size.width, height: size.height, frameRate: FPS },
     });
     return async () => {
-      const stopped = await this.connection.send('browsingContext.stopScreencast', { screencast }).catch(() => undefined);
-      if (stopped === undefined || !existsSync(stopped.path)) return;
+      const stopped = await this.connection.send('browsingContext.stopScreencast', { screencast });
+      if (stopped.error !== undefined) throw new EngineError('ENGINE_FAILURE', `video segment could not be finalized: ${stopped.error}`, { retryable: false });
+      if (!existsSync(stopped.path)) return;
       try {
         renameSync(stopped.path, absolute);
       } catch {
-        // A rename across volumes fails; the file is copied instead.
         copyFileSync(stopped.path, absolute);
         rmSync(stopped.path, { force: true });
       }
@@ -130,15 +131,16 @@ export class BidiVideo {
     const connection = this.connection;
     const { session } = (await connection.sendExtension('goog:cdp.getSession', { context })) as { session: string };
     const encoder = new FrameEncoder(ffmpeg, size, absolute);
+    let unacknowledged: unknown;
     const off = connection.onExtension('goog:cdp.Page.screencastFrame', (event) => {
       if (event['session'] !== session) return;
       const params = event['params'] as { data: string; sessionId: number };
       encoder.frame(Buffer.from(params.data, 'base64'));
-      void connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.screencastFrameAck', params: { sessionId: params.sessionId }, session }).catch(() => undefined);
+      connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.screencastFrameAck', params: { sessionId: params.sessionId }, session }).catch((cause: unknown) => {
+        unacknowledged ??= cause;
+      });
     });
-    // An extension event the spec's event names do not list.
-    const extensionEvent = 'goog:cdp.Page.screencastFrame' as 'browsingContext.load';
-    const { subscription } = await connection.send('session.subscribe', { events: [extensionEvent], contexts: [context] });
+    const subscription = await connection.subscribeExtension(['goog:cdp.Page.screencastFrame'], [context]);
     await connection.sendExtension('goog:cdp.sendCommand', {
       method: 'Page.startScreencast',
       params: { format: 'jpeg', quality: this.options.quality ?? 90, maxWidth: size.width, maxHeight: size.height },
@@ -146,9 +148,10 @@ export class BidiVideo {
     });
     return async () => {
       off();
-      await connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.stopScreencast', params: {}, session }).catch(() => undefined);
-      await connection.send('session.unsubscribe', { subscriptions: [subscription] }).catch(() => undefined);
+      await unlessStale(connection.sendExtension('goog:cdp.sendCommand', { method: 'Page.stopScreencast', params: {}, session }), undefined);
+      await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
       await encoder.close();
+      if (unacknowledged !== undefined && !isStale(unacknowledged)) throw classify(unacknowledged, 'video');
     };
   }
 }

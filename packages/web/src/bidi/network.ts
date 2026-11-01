@@ -13,7 +13,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Network } from 'webdriver-bidi-protocol';
 import { raceAbort } from 'e2e/engine';
-import type { BidiConnection, BidiEventParams } from './connection.ts';
+import { BidiError, type BidiConnection, type BidiEventParams } from './connection.ts';
+import { releaseQuietly } from './errors.ts';
 
 /** A request the browser holds for a route to decide. */
 export interface InterceptedRequest {
@@ -56,6 +57,8 @@ export interface AttemptNetworkOptions {
   readonly credentials: { readonly username: string; readonly password: string } | undefined;
   /** Whether an event belongs to the attempt. */
   readonly ours: (event: { readonly userContext?: string | null; readonly context: string | null }) => boolean;
+  /** Takes a failure on a path no step awaits (deciding a held request, answering a challenge), for the next step to fail with. */
+  readonly onFailure: (error: Error) => void;
 }
 
 /** The window of no requests in flight Playwright's `networkidle` waits for. */
@@ -116,7 +119,7 @@ export class AttemptNetwork {
 
   private change(work: () => Promise<void>): Promise<void> {
     const next = this.changes.then(work);
-    this.changes = next.catch(() => undefined);
+    this.changes = releaseQuietly(next);
     return next;
   }
 
@@ -183,7 +186,7 @@ export class AttemptNetwork {
       const next = wanted && contexts.length > 0
         ? (await connection.send('network.addIntercept', { phases: [phase], contexts: contexts as [string, ...string[]] })).intercept
         : undefined;
-      if (old !== undefined) await connection.send('network.removeIntercept', { intercept: old }).catch(() => undefined);
+      if (old !== undefined) await releaseQuietly(connection.send('network.removeIntercept', { intercept: old }));
       return next;
     };
     this.intercept = await replace(this.holding, 'beforeRequestSent', this.intercept);
@@ -226,7 +229,19 @@ export class AttemptNetwork {
     this.inflight.add(event.request.request);
     const intercepts: readonly string[] = event.intercepts ?? [];
     if (!event.isBlocked || this.intercept === undefined || !intercepts.includes(this.intercept)) return;
-    void this.route(event).catch(() => undefined);
+    void this.route(event).catch(async (cause: unknown) => {
+      await releaseQuietly(this.connection.send('network.failRequest', { request: event.request.request }));
+      this.fail(cause);
+    });
+  }
+
+  /**
+   * Hands a failure of an unawaited path to the attempt. A request the
+   * browser already let go (the page navigated away under it) is no failure.
+   */
+  private fail(cause: unknown): void {
+    if (cause instanceof BidiError && cause.error === 'no such request') return;
+    this.options.onFailure(cause instanceof Error ? cause : new Error(String(cause)));
   }
 
   /** Runs the matching routes newest first, then lets the request through with the site headers. */
@@ -258,13 +273,16 @@ export class AttemptNetwork {
     await this.continue(intercepted);
   }
 
+  /** The request's body when the collector kept one; a body it did not keep (too large, a stream) is none. */
   private async postData(request: Network.RequestData): Promise<{ postData?: string }> {
     if (this.requestCollector === undefined || (request.bodySize ?? 0) === 0) return {};
-    const data = await this.connection
-      .send('network.getData', { dataType: 'request', request: request.request, collector: this.requestCollector })
-      .catch(() => undefined);
-    if (data === undefined) return {};
-    return { postData: data.bytes.type === 'string' ? data.bytes.value : Buffer.from(data.bytes.value, 'base64').toString() };
+    try {
+      const { bytes } = await this.connection.send('network.getData', { dataType: 'request', request: request.request, collector: this.requestCollector });
+      return { postData: bytes.type === 'string' ? bytes.value : Buffer.from(bytes.value, 'base64').toString() };
+    } catch (cause) {
+      if (cause instanceof BidiError && cause.error === 'no such network data') return {};
+      throw cause;
+    }
   }
 
   /** Lets a held request go on, with its overrides and, for the app's site, the configured headers. */
@@ -314,7 +332,7 @@ export class AttemptNetwork {
       .send('network.continueWithAuth', retry
         ? { request: event.request.request, action: 'cancel' }
         : { request: event.request.request, action: 'provideCredentials', credentials: { type: 'password', ...credentials } })
-      .catch(() => undefined);
+      .catch((cause: unknown) => this.fail(cause));
   }
 
   private settle(event: { readonly request: Network.RequestData; readonly userContext?: string | null; readonly context: string | null }): void {
@@ -392,7 +410,7 @@ export class AttemptNetwork {
       this.subscription === undefined ? undefined : connection.send('session.unsubscribe', { subscriptions: [this.subscription] }),
     ];
     this.intercept = this.authIntercept = this.collector = this.requestCollector = this.subscription = undefined;
-    await Promise.all(removals.map((removal) => removal?.catch(() => undefined)));
+    await Promise.all(removals.map(releaseQuietly));
   }
 
   /** Ends the attempt's network: listeners, routes, intercepts, collectors, and subscription. */
