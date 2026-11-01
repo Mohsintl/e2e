@@ -48,8 +48,10 @@ function dragStarted(): Promise<boolean> | boolean {
  * Presses at the path's first point, moves through the rest, and releases
  * at the last; a drag the page starts on the first move carries its data to
  * the drop. `stepMs` paces each move. Once `signal` aborts, nothing more is
- * dispatched; however it ends, interception is off and the button is up,
- * and only the mouse is released, so keys the test holds stay held.
+ * dispatched; however it ends, interception is off and the button is up
+ * where the mouse last was, so a drag that failed midway drops nothing at
+ * the target, and only the mouse is released, so keys the test holds stay
+ * held.
  */
 export async function chromiumDrag(
   connection: BidiConnection,
@@ -81,6 +83,7 @@ export async function chromiumDrag(
   let intercepting = false;
   try {
     subscription = await connection.subscribeExtension(['goog:cdp.Input.dragIntercepted'], [context]);
+    signal.throwIfAborted();
     pressed = true;
     await pointer([{ type: 'pointerMove', x: from.x, y: from.y, origin: 'viewport' }, { type: 'pointerDown', button: 0 }]);
     // Armed after the press: armed before, it latches onto the move to the press point and misses the drag.
@@ -107,7 +110,7 @@ export async function chromiumDrag(
   } finally {
     off();
     if (intercepting) await releaseQuietly(connection.sendExtension('goog:cdp.sendCommand', { method: 'Input.setInterceptDrags', params: { enabled: false }, session }));
-    if (pressed) await releaseQuietly(connection.send('input.performActions', { context, actions: [mouse([{ type: 'pointerMove', x: last.x, y: last.y, origin: 'viewport' }, { type: 'pointerUp', button: 0 }])] }));
+    if (pressed) await releaseQuietly(connection.send('input.performActions', { context, actions: [mouse([{ type: 'pointerUp', button: 0 }])] }));
     if (subscription !== undefined) await releaseQuietly(connection.send('session.unsubscribe', { subscriptions: [subscription] }));
   }
 }

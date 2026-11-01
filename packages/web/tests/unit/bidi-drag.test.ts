@@ -45,4 +45,18 @@ describe('chromiumDrag', () => {
     await expect(chromiumDrag(fake.connection, 'tab', ['tab'], PATH, 0, AbortSignal.timeout(500))).rejects.toThrow();
     expect(pointerEnds(fake)).toEqual(['pointerDown', 'pointerUp']);
   });
+
+  it('releases where the mouse was when the drag failed midway, never at the target', async () => {
+    const fake = peer((method) => method === 'Input.setInterceptDrags');
+    await expect(chromiumDrag(fake.connection, 'tab', ['tab'], PATH, 0, AbortSignal.timeout(500))).rejects.toThrow();
+    const sent = fake.commands('input.performActions').map((command) => (command.params['actions'] as { actions: { type: string; x?: number }[] }[])[0]!.actions);
+    expect(sent.at(-1)).toEqual([{ type: 'pointerUp', button: 0 }]);
+    expect(sent.flat().some((action) => action.type === 'pointerMove' && action.x === 9)).toBe(false);
+  });
+
+  it('sends nothing when cancelled before the press', async () => {
+    const fake = peer(() => false);
+    await expect(chromiumDrag(fake.connection, 'tab', ['tab'], PATH, 0, AbortSignal.abort())).rejects.toThrow();
+    expect(fake.commands('input.performActions')).toEqual([]);
+  });
 });

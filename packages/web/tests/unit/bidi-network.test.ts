@@ -296,14 +296,24 @@ describe('AttemptNetwork', () => {
     expect(seen).toMatchObject({ bodyUnavailable: true });
   });
 
-  it('never covers a tab that opened and closed in the same burst', async () => {
+  it('never covers a tab that opened and closed in the same burst, nor one that closed while its intercept was added', async () => {
     const fake = new FakeBidi();
     const { net } = network(fake, { holdAll: true });
+    let intercepts = 0;
+    fake.on('network.addIntercept', (params) => {
+      if ((params['contexts'] as string[]).includes('popup')) {
+        void net.removeContext('popup');
+        return { error: 'no such frame', message: 'gone' };
+      }
+      return { result: { intercept: `intercept-${(intercepts += 1)}` } };
+    });
     await net.bind('user-1');
     void net.addContext('flash');
     await net.removeContext('flash');
+    expect(fake.commands('network.addIntercept')).toEqual([]);
     await net.addContext('tab');
-    expect(fake.commands('network.addIntercept').at(-1)?.params).toEqual({ phases: ['beforeRequestSent'], contexts: ['tab'] });
+    await net.addContext('popup');
+    expect(fake.commands('network.addIntercept').map((command) => command.params['contexts'])).toEqual([['tab'], ['tab', 'popup'], ['tab']]);
   });
 
   it('calls the network idle while a tab the app opened is still busy', async () => {

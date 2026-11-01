@@ -105,6 +105,8 @@ export class AttemptNetwork {
   private userContext: string | undefined;
   /** The attempt's top-level tabs; intercepts cover exactly these, so a browser shared with other sessions keeps its own requests. */
   private readonly tops = new Set<string>();
+  /** Tabs that closed, as their events said, before the queue caught up. */
+  private readonly closedTabs = new Set<string>();
   /** Whether every request is held: site headers to add, or a route registered. */
   private holding: boolean;
   /** Top-level tabs whose every document request is answered with a blank page (`serveBlank`), before any route. */
@@ -161,6 +163,7 @@ export class AttemptNetwork {
       await this.release();
       this.userContext = userContext;
       this.tops.clear();
+      this.closedTabs.clear();
       if (this.needsEvents) await this.subscribe();
       await this.collectResponses();
     });
@@ -168,14 +171,21 @@ export class AttemptNetwork {
 
   /** A top-level tab of the attempt opened: the intercepts cover it from now on. */
   addContext(context: string): Promise<void> {
+    this.closedTabs.delete(context);
     return this.change(async () => {
+      if (this.closedTabs.has(context)) return;
       this.tops.add(context);
       await this.refreshIntercepts();
     });
   }
 
-  /** A top-level tab of the attempt closed; queued behind its own addition, so a tab that opened and closed at once is never covered. */
+  /**
+   * A top-level tab of the attempt closed. It is marked closed at once, so a
+   * queued addition or intercept refresh leaves it out instead of covering a
+   * tab that no longer exists.
+   */
   removeContext(context: string): Promise<void> {
+    this.closedTabs.add(context);
     return this.change(async () => {
       if (this.tops.delete(context)) await this.refreshIntercepts();
     });
@@ -213,22 +223,30 @@ export class AttemptNetwork {
    * no other client drives, one intercept covers every tab, so a tab the app
    * opens is held from its first request; otherwise each covers the current
    * tabs exactly, so other clients keep their own requests, and is replaced,
-   * the new one in place before the old goes.
+   * the new one in place before the old goes. A tab that closes while its
+   * intercept is being added is left out and the intercept added again.
    */
   private async refreshIntercepts(): Promise<void> {
     const connection = this.connection;
-    const contexts = [...this.tops];
+    const live = (): string[] => [...this.tops].filter((context) => !this.closedTabs.has(context));
     const add = async (phase: 'beforeRequestSent' | 'authRequired'): Promise<string> => {
-      const { intercept } = await connection.send('network.addIntercept', {
-        phases: [phase],
-        ...(this.options.exclusive ? {} : { contexts: contexts as [string, ...string[]] }),
-      });
-      this.intercepts.add(intercept);
-      return intercept;
+      for (;;) {
+        const contexts = live();
+        try {
+          const { intercept } = await connection.send('network.addIntercept', {
+            phases: [phase],
+            ...(this.options.exclusive ? {} : { contexts: contexts as [string, ...string[]] }),
+          });
+          this.intercepts.add(intercept);
+          return intercept;
+        } catch (cause) {
+          if (live().length === contexts.length) throw cause;
+        }
+      }
     };
     const replace = async (wanted: boolean, phase: 'beforeRequestSent' | 'authRequired', old: string | undefined): Promise<string | undefined> => {
       if (this.options.exclusive) return wanted ? (old ?? (await add(phase))) : old;
-      const next = wanted && contexts.length > 0 ? await add(phase) : undefined;
+      const next = wanted && live().length > 0 ? await add(phase) : undefined;
       if (old !== undefined) await releaseQuietly(connection.send('network.removeIntercept', { intercept: old }));
       return next;
     };
