@@ -137,9 +137,19 @@ export const LOCATE_READ = `(options, wants, key, structured) => {
 /**
  * Whether an element is disabled as the shared reader decides it (its
  * `:disabled` state, and `aria-disabled` on it or inherited by its role),
- * so an action refuses exactly what an observation reports disabled.
+ * so an action refuses exactly what an observation reports disabled. The
+ * element is first retargeted as Playwright's enabled check does: to the
+ * button, checkbox, or radio that holds it, or the control its label names.
  */
-export const ELEMENT_DISABLED = `(element, options) => {
+export const ELEMENT_DISABLED = `(target, options) => {
+  let element = target;
+  if (!element.matches('input, textarea, select') && !element.isContentEditable) {
+    element = element.closest('button, [role=button], [role=checkbox], [role=radio]') ?? element;
+    if (!element.matches('a, input, textarea, button, select, [role=link], [role=button], [role=checkbox], [role=radio]')) {
+      const control = element.closest('label')?.control;
+      if (control) element = control;
+    }
+  }
   const read = (${readSemanticsFunction.toString()});
   const [node] = read(document.documentElement, { ...options, mode: { kind: 'nodes', elements: [element] } });
   return node === undefined ? false : node.states.disabled === true;
@@ -167,6 +177,8 @@ export type ActionPoint =
 /** What `actionPoint` checks: `scroll` to bring the element into view first; `key` names the closed-roots registry. */
 export interface ActionPointOptions {
   readonly scroll: boolean;
+  /** False for an action that types or selects rather than points: then only visibility counts, not stability or a point in view. */
+  readonly pointer?: boolean;
   /** How to scroll the element into view, for a retry after an overlay covered it; unset, only when its point is clipped. */
   readonly align?: { readonly block: ScrollLogicalPosition; readonly inline: ScrollLogicalPosition };
   readonly key: string;
@@ -186,10 +198,11 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
   const style = getComputedStyle(element);
   const box = element.getBoundingClientRect();
   if (box.width === 0 || box.height === 0 || style.visibility === 'hidden') return { state: 'hidden' };
+  if (options.pointer === false) return { state: 'ok', x: 0, y: 0 };
   type Area = { left: number; top: number; right: number; bottom: number };
   const viewport = (): { width: number; height: number } => ({
-    width: document.documentElement.clientWidth || innerWidth,
-    height: document.documentElement.clientHeight || innerHeight,
+    width: visualViewport?.width || innerWidth,
+    height: visualViewport?.height || innerHeight,
   });
   const clipped = (rect: DOMRect): Area | null => {
     const { width, height } = viewport();
@@ -198,11 +211,15 @@ export async function actionPoint(element: Element, options: ActionPointOptions)
     let right = Math.min(rect.right, width);
     let bottom = Math.min(rect.bottom, height);
     let at: Element | null = element;
-    while (at !== null && getComputedStyle(at).position !== 'fixed') {
+    let position = getComputedStyle(element).position;
+    while (at !== null && position !== 'fixed') {
       const parent: Node | null = at.parentNode;
       at = parent instanceof ShadowRoot ? parent.host : parent instanceof Element ? parent : null;
       if (at === null || at === document.documentElement) break;
       const clip = getComputedStyle(at);
+      const containing = clip.position !== 'static' || clip.transform !== 'none' || clip.filter !== 'none' || clip.contain.includes('paint');
+      if (position === 'absolute' && !containing) continue;
+      position = clip.position;
       const bounds = at.getBoundingClientRect();
       if (clip.overflowX !== 'visible') {
         left = Math.max(left, bounds.left);
@@ -575,4 +592,45 @@ export function historyEntry(): string | null {
 /** The document's title. */
 export function documentTitle(): string {
   return document.title;
+}
+
+/**
+ * Watches the pointer input about to reach an element, as Playwright's hit
+ * target interceptor does: the first press, release, or click event decides
+ * whether the input reaches the element (retargeted to its button or link,
+ * through slots and shadow hosts), and every later one is suppressed when it
+ * did not, so a page that raised an overlay as the pointer arrived takes
+ * nothing. `hitInterceptorResult` reads the decision under `token`.
+ */
+export function armHitInterceptor(element: Element, token: string): void {
+  const target = element.matches('input, textarea, select') || (element as HTMLElement).isContentEditable
+    ? element
+    : (element.closest('button, [role=button], a, [role=link]') ?? element);
+  const state: { verdict: string | null | undefined } = { verdict: undefined };
+  const listener = (event: Event): void => {
+    if (state.verdict === undefined) {
+      const reached = event.composedPath().includes(target);
+      const hit = event.composedPath()[0];
+      state.verdict = reached ? null : `${hit instanceof Element ? `<${hit.localName}${hit.id === '' ? '' : `#${hit.id}`}>` : 'another element'} intercepts pointer events`;
+    }
+    if (state.verdict !== null) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  };
+  const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'auxclick', 'dblclick', 'contextmenu'];
+  for (const type of types) window.addEventListener(type, listener, { capture: true });
+  const interceptors = (Reflect.get(globalThis, Symbol.for('e2e.bidi.hit')) as Map<string, unknown> | undefined) ?? new Map<string, unknown>();
+  interceptors.set(token, { state, remove: () => { for (const type of types) window.removeEventListener(type, listener, { capture: true }); } });
+  Reflect.set(globalThis, Symbol.for('e2e.bidi.hit'), interceptors);
+}
+
+/** Ends the watch `armHitInterceptor` started: null when the input reached the element, why not when it did not, `unseen` when no input arrived. */
+export function hitInterceptorResult(token: string): string | null {
+  const interceptors = Reflect.get(globalThis, Symbol.for('e2e.bidi.hit')) as Map<string, { state: { verdict: string | null | undefined }; remove: () => void }> | undefined;
+  const watch = interceptors?.get(token);
+  if (interceptors === undefined || watch === undefined) return 'unseen';
+  interceptors.delete(token);
+  watch.remove();
+  return watch.state.verdict === undefined ? 'unseen' : watch.state.verdict;
 }

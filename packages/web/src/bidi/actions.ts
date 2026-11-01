@@ -4,6 +4,7 @@
  * checks Playwright runs, with points placed in the top-level viewport.
  */
 
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
@@ -24,7 +25,7 @@ import { chromiumDrag } from './drag.ts';
 import { unlessStale } from './errors.ts';
 import type { NodeTarget } from './frames.ts';
 import { clickSources, dragPath, dragSources, dragStepMs, moveSources, pressSource, typeSource, wheelSources, type ClickOptions } from './input.ts';
-import { actionPoint as readActionPoint, ELEMENT_DISABLED, boxSize, checkState, fileInput, fill as fillElement, focus, hitBlocker, nextFrame, selectOption, type ActionPoint } from './page.ts';
+import { actionPoint as readActionPoint, armHitInterceptor, ELEMENT_DISABLED, hitInterceptorResult, boxSize, checkState, fileInput, fill as fillElement, focus, hitBlocker, nextFrame, selectOption, type ActionPoint } from './page.ts';
 import { ElementRef } from './script.ts';
 import type { BidiSession } from './session.ts';
 
@@ -81,7 +82,7 @@ export async function perform(session: BidiSession, ref: NodeRef, action: Locato
       return setChecked(session, target, action.kind === 'check', deadline, signal);
     case 'selectOption': {
       const by = typeof action.value === 'string' ? { label: action.value } : action.value;
-      await settledPoint(session, target, deadline, { enabled: true, scroll: true }, signal);
+      await settledPoint(session, target, deadline, { enabled: true, scroll: false, pointer: false }, signal);
       return mutateWhenReady(session, deadline, signal, 'selectOption: ', () => session.run(selectOption, [target.element, by], target.context));
     }
     case 'setInputFiles':
@@ -138,10 +139,27 @@ export async function typeText(session: BidiSession, text: string, replace: bool
   await session.sendInput([typeSource(text)], signal);
 }
 
-/** Waits until the element can take a pointer action, then clicks it. */
+/**
+ * Waits until the element can take a pointer action, then clicks it with
+ * the page watching where the input lands (`armHitInterceptor`): input an
+ * overlay raised as the pointer arrived is suppressed in the page, counts as
+ * never dispatched, and the click is tried again until the deadline. A page
+ * that went away under the click counts as reached.
+ */
 async function click(session: BidiSession, target: NodeTarget, deadline: Deadline, options: ClickOptions, signal: AbortSignal): Promise<void> {
-  const point = await pointerPoint(session, target, deadline, true, signal);
-  await session.sendInput(clickSources(point.x, point.y, options), signal);
+  for (;;) {
+    const point = await pointerPoint(session, target, deadline, true, signal);
+    const token = randomUUID();
+    await session.run(armHitInterceptor, [target.element, token], target.context);
+    const dispatched = session.dispatches;
+    const sent = await session.sendInput(clickSources(point.x, point.y, options), signal).then(() => undefined, (cause: unknown) => ({ cause }));
+    const verdict = await unlessStale(session.run(hitInterceptorResult, [token], target.context), null);
+    if (sent !== undefined) throw sent.cause;
+    if (verdict === null) return;
+    session.dispatches = dispatched;
+    if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${verdict === 'unseen' ? 'the input reached another document' : verdict}`, { retryable: false });
+    await sleep(POLL_MS, undefined, { signal });
+  }
 }
 
 /** Focuses the element, a page change its focus handlers may make, refusing when focus does not land on it. */
@@ -160,7 +178,7 @@ async function settledPoint(
   session: BidiSession,
   target: NodeTarget,
   deadline: Deadline,
-  checks: { enabled: boolean; scroll: boolean; align?: NonNullable<(typeof SCROLL_ALIGNMENTS)[number]> },
+  checks: { enabled: boolean; scroll: boolean; pointer?: boolean; align?: NonNullable<(typeof SCROLL_ALIGNMENTS)[number]> },
   signal: AbortSignal,
 ): Promise<{ x: number; y: number }> {
   if (checks.scroll) {
@@ -182,8 +200,9 @@ async function settledPoint(
 
 /**
  * The element's actionable point in the top-level viewport, once a pointer
- * event there reaches it: the element itself is hit in its document, and
- * every iframe holding it is hit at the same point in its parent's. A
+ * event there reaches it: the whole-pixel point to be dispatched is projected
+ * back through every frame holding the element, and the element is hit at
+ * that point in its document, every iframe at it in its parent's. A
  * covered element is polled until the deadline, each retry scrolling it into
  * view another way (`SCROLL_ALIGNMENTS`), as Playwright does to get an
  * element out from under a sticky header.
@@ -195,21 +214,24 @@ async function pointerPoint(session: BidiSession, target: NodeTarget, deadline: 
     const chain = session.frames.chain(target.context);
     const steps = await session.frames.frameSteps(session.connection, target.context);
     if (steps === null) throw new EngineError('NOT_ACTIONABLE', 'element is in a frame that lays out no box, or is rotated', { retryable: false });
-    const points: { x: number; y: number }[] = [];
     let point = { x: local.x, y: local.y };
     for (let index = steps.length - 1; index >= 0; index -= 1) {
       const { content, scale } = steps[index]!;
       point = { x: content.x + point.x * scale.x, y: content.y + point.y * scale.y };
-      points[index] = point;
+    }
+    const top = { x: Math.round(point.x), y: Math.round(point.y) };
+    const inDocuments: { x: number; y: number }[] = [];
+    let projected = top;
+    for (const [index, { content, scale }] of steps.entries()) {
+      inDocuments[index] = projected;
+      projected = { x: (projected.x - content.x) / scale.x, y: (projected.y - content.y) / scale.y };
     }
     const checks = [
-      session.run(hitBlocker, [target.element, local.x, local.y, CLOSED_SHADOW_ROOTS_KEY], target.context),
-      ...chain.map((frame, index) =>
-        session.run(hitBlocker, [frame.element, Math.round(points[index]!.x), Math.round(points[index]!.y), CLOSED_SHADOW_ROOTS_KEY], frame.context)),
+      session.run(hitBlocker, [target.element, projected.x, projected.y, CLOSED_SHADOW_ROOTS_KEY], target.context),
+      ...chain.map((frame, index) => session.run(hitBlocker, [frame.element, inDocuments[index]!.x, inDocuments[index]!.y, CLOSED_SHADOW_ROOTS_KEY], frame.context)),
     ];
     const blocked = (await Promise.all(checks)).find((reason) => reason !== null);
-    const top = points[0] ?? local;
-    if (blocked === undefined) return { x: Math.round(top.x), y: Math.round(top.y) };
+    if (blocked === undefined) return top;
     if (deadline.remaining() <= POLL_MS) throw new EngineError('NOT_ACTIONABLE', `element did not become actionable in time: ${blocked}`, { retryable: false });
     await sleep(POLL_MS, undefined, { signal });
   }
@@ -236,9 +258,9 @@ function blocker(point: Exclude<ActionPoint, { state: 'ok' }>): string {
   }
 }
 
-/** Replaces the field's content with `value` in one edit, as a paste would, once it is visible, enabled, and editable; see the page's `fill`. */
+/** Replaces the field's content with `value` in one edit, as a paste would, once it is visible, enabled, and editable (not still, nor in view: no pointer is involved); see the page's `fill`. */
 async function fill(session: BidiSession, target: NodeTarget, value: string, deadline: Deadline, signal: AbortSignal): Promise<void> {
-  await settledPoint(session, target, deadline, { enabled: true, scroll: true }, signal);
+  await settledPoint(session, target, deadline, { enabled: true, scroll: false, pointer: false }, signal);
   return mutateWhenReady(session, deadline, signal, '', () => session.run(fillElement, [target.element, value, CLOSED_SHADOW_ROOTS_KEY], target.context));
 }
 

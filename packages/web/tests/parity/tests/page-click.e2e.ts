@@ -317,10 +317,10 @@ test.describe('page click', { requires: ['browser'] }, () => {
     ['button', '<button onclick="window.__CLICKED=true;" disabled><span>Click target</span></button>', "document.querySelector('button').removeAttribute('disabled')"],
     ['input', '<input onclick="window.__CLICKED=true;" disabled>', "document.querySelector('input').removeAttribute('disabled')"],
   ] as const) {
-    test(`should wait for ${name} to be enabled`, async ({ browser }) => {
+    test(`should wait for ${name} to be enabled`, async ({ browser, screen }) => {
       await browser.goto(content(html));
       let done = false;
-      const tap = browser.locator(name).tap({ timeout: 10_000 }).then(() => (done = true));
+      const tap = (name === 'button' ? screen.getByText('Click target') : browser.locator(name)).tap({ timeout: 10_000 }).then(() => (done = true));
       await browser.evaluate(giveItAChanceToClick);
       expect(await browser.evaluate('() => window.__CLICKED')).toBeUndefined();
       expect(done).toBe(false);
