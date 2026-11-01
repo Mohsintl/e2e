@@ -119,8 +119,8 @@ jobs:
         run: node scripts/install-smoke.ts ${{ matrix.pnpm }}
 
   # The deterministic testbed on the experimental WebDriver BiDi driver
-  # (packages/web/src/bidi), Chromium and Firefox. Not in the gate while the
-  # driver is opt-in. Firefox leaves out what its remote agent cannot do yet:
+  # (packages/web/src/bidi), Chromium and Firefox. Firefox leaves out what its
+  # remote agent cannot do yet:
   # HTML5 drag and drop (https://bugzilla.mozilla.org/show_bug.cgi?id=1515879)
   # and media emulation before Firefox 159
   # (https://bugzilla.mozilla.org/show_bug.cgi?id=2064354).

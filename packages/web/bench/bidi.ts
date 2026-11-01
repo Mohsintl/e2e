@@ -65,10 +65,12 @@ function heavyPage(): string {
     `<script>document.getElementById('go').onclick = () => { document.querySelector('output').textContent = 'searched ' + document.querySelector('input[placeholder="Search customers"]').value; };</script>`;
 }
 
+/** Starts `server` on `port` of the loopback interface. */
 function listen(server: Server, port: number): Promise<void> {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
 }
 
+/** Resolves once `url` answers with a success status, failing after ten seconds. */
 async function waitForHttp(url: string): Promise<void> {
   for (let poll = 0; poll < 100; poll += 1) {
     if (await fetch(url).then((response) => response.ok, () => false)) return;
@@ -94,10 +96,12 @@ interface Driven {
   close(): Promise<void>;
 }
 
+/** A fresh `web()` engine on `driver` and `browser`. */
 function engineFor(driver: 'playwright' | 'bidi', browser: 'chromium' | 'firefox'): EngineHandle {
   return web({ driver, browser });
 }
 
+/** Launches the engine's browser, as a worker's first test does. */
 async function boot(engine: EngineHandle): Promise<void> {
   await engine.init!({
     app: { site: `http://127.0.0.1:${TESTBED_PORT}` },
@@ -110,6 +114,7 @@ async function boot(engine: EngineHandle): Promise<void> {
 /** Every artifact directory an attempt made, removed when the bench ends however it ends. */
 const tempDirs: string[] = [];
 
+/** Starts an attempt with an artifact directory of its own. */
 async function attempt(engine: EngineHandle): Promise<void> {
   const artifactsDir = mkdtempSync(path.join(os.tmpdir(), 'e2e-bench-'));
   tempDirs.push(artifactsDir);
@@ -144,12 +149,16 @@ async function driven(engine: EngineHandle): Promise<Driven> {
       return nodes[0]!.ref;
     },
     close: async () => {
-      await engine.endAttempt!(cleanup());
-      await engine.dispose!(cleanup());
+      try {
+        await engine.endAttempt!(cleanup());
+      } finally {
+        await engine.dispose!(cleanup());
+      }
     },
   };
 }
 
+/** How many milliseconds `fn` took. */
 async function time(fn: () => Promise<unknown>): Promise<number> {
   const start = performance.now();
   await fn();
@@ -163,6 +172,7 @@ function flatten(node: SemanticNode, out: SemanticNode[] = []): SemanticNode[] {
   return out;
 }
 
+/** The ref of the first node of an observation `predicate` accepts; throws when none does. */
 function find(root: SemanticNode, predicate: (node: SemanticNode) => boolean): NodeRef {
   const node = flatten(root).find(predicate);
   if (node === undefined) throw new Error('node not found in observation');
@@ -219,6 +229,7 @@ class ResourceMeter {
 
 type Samples = Record<string, number[]>;
 
+/** Adds one timing of `name`. */
 function record(samples: Samples, name: string, ms: number): void {
   (samples[name] ??= []).push(ms);
 }
@@ -251,9 +262,10 @@ interface DriverRun {
   peakRssMb: number;
   nodeCpuSeconds: number;
   treeCpuSeconds: number;
-  readonly work: Record<string, number>;
+  readonly work: Record<string, number[]>;
 }
 
+/** An empty measurement of one driver. */
 function driverRun(): DriverRun {
   return { samples: {}, peakRssMb: 0, nodeCpuSeconds: 0, treeCpuSeconds: 0, work: {} };
 }
@@ -279,7 +291,7 @@ async function warmBlock(driver: 'playwright' | 'bidi', browser: 'chromium' | 'f
       record(samples, 'observe: testbed /forms', await time(async () => {
         observed = await engine.observe!(operation());
       }));
-      work['/forms nodes'] = nodes(observed!);
+      (work['/forms nodes'] ??= []).push(nodes(observed!));
       record(samples, 'locate role+name: testbed /forms', await time(() => d.locateOne(role('button', 'Save profile'))));
       record(samples, 'click/type sequence: forms (5 actions)', await time(async () => {
         await engine.perform!(await d.locateOne(label('Full name')), { kind: 'fill', value: 'Ada Lovelace', sensitive: false }, operation());
@@ -294,8 +306,12 @@ async function warmBlock(driver: 'playwright' | 'bidi', browser: 'chromium' | 'f
       record(samples, 'observe: heavy page', await time(async () => {
         observed = await engine.observe!(operation());
       }));
-      work['heavy page nodes'] = nodes(observed!);
-      record(samples, 'observe + pixels: heavy page', await time(() => engine.observe!(operation(), { pixels: true })));
+      (work['heavy page nodes'] ??= []).push(nodes(observed!));
+      let withPixels: { pixels?: unknown } | undefined;
+      record(samples, 'observe + pixels: heavy page', await time(async () => {
+        withPixels = await engine.observe!(operation(), { pixels: true });
+      }));
+      if (withPixels?.pixels === undefined) throw new Error(`${driver}/${browser} observed the heavy page without its pixels`);
       record(samples, 'locate role+name: heavy page', await time(() => d.locateOne(role('button', 'Open 1499'))));
       record(samples, 'locate + fill + tap: heavy page', await time(async () => {
         await engine.perform!(await d.locateOne({ kind: 'query', query: { kind: 'placeholder', value: string('Search customers', true) } }), { kind: 'fill', value: 'acme', sensitive: false }, operation());
@@ -365,6 +381,7 @@ function ratioInterval(pw: number[], bidi: number[]): [number, number] {
   return [ratios[Math.floor(0.025 * ratios.length)]!, ratios[Math.floor(0.975 * ratios.length) - 1]!];
 }
 
+/** The median, 95th percentile, mean, and count of `list`. */
 function stats(list: number[]): { p50: number; p95: number; mean: number; n: number } {
   const sorted = list.toSorted((a, b) => a - b);
   const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)]!;
@@ -381,7 +398,7 @@ const heavy = createServer((_request, response) => {
   response.end(heavyPage());
 });
 await listen(heavy, HEAVY_PORT);
-const results: Record<string, { samples: Record<string, ReturnType<typeof stats>>; raw: Samples; resources: Record<string, number>; work: Record<string, number> }> = {};
+const results: Record<string, { samples: Record<string, ReturnType<typeof stats>>; raw: Samples; resources: Record<string, number>; work: Record<string, number[]> }> = {};
 try {
   await waitForHttp(testbed('/'));
   for (const browser of BROWSERS) {
@@ -466,15 +483,16 @@ const meta = {
   testbedRuns: TESTBED_RUNS,
   stepsPerTest: STEPS_PER_TEST,
 };
+for (const browser of BROWSERS) {
+  const pages = new Set(DRIVERS.flatMap((driver) => Object.keys(results[`${driver}/${browser}`]!.work)));
+  for (const page of pages) {
+    const counts = new Set(DRIVERS.flatMap((driver) => results[`${driver}/${browser}`]!.work[page] ?? []));
+    if (counts.size !== 1) throw new Error(`${browser}: the drivers observed ${page} differently (${[...counts].join(', ')} nodes); the timings are not of equal work`);
+  }
+}
 const summary = Object.fromEntries(Object.keys(results).map((key) => [key, totals(key)]));
 writeFileSync(values.out, JSON.stringify({ meta, results, testbed: testbedTimes, totals: summary }, null, 2));
 
-for (const browser of BROWSERS) {
-  const [first, ...others] = DRIVERS.map((driver) => results[`${driver}/${browser}`]!.work);
-  for (const [page, count] of Object.entries(first ?? {})) {
-    if (others.some((work) => work[page] !== count)) console.log(`\nwarning: ${browser} drivers observed ${page} differently: ${DRIVERS.map((driver) => results[`${driver}/${browser}`]!.work[page]).join(' vs ')}`);
-  }
-}
 
 const fmt = (ms: number) => (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1));
 for (const browser of BROWSERS) {
